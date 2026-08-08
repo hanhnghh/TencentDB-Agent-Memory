@@ -53,7 +53,30 @@ export class TDAMError extends Error {
     this.requestId = requestId;
     this.details = details;
     this.kind = classification.kind ?? "envelope";
-    this.retryable = classification.retryable ?? false;
+    const normalized = normalizeStatusCode(code);
+    this.retryable = classification.retryable
+      ?? (normalized === 408 || normalized === 429 || normalized >= 500);
     this.httpStatus = classification.httpStatus;
+  }
+}
+
+function normalizeStatusCode(code: number): number {
+  const digits = String(Math.abs(Math.trunc(code)));
+  return digits.length > 3 ? Number(digits.slice(0, 3)) : code;
+}
+
+export class TDAMTransportError extends TDAMError {
+  constructor(kind: "network" | "timeout", message: string, options?: ErrorOptions) {
+    super(kind === "timeout" ? 408 : -1, message, "", undefined, { kind, retryable: true });
+    this.name = "TDAMTransportError";
+    if (options?.cause !== undefined) this.cause = options.cause;
+  }
+}
+
+export class TDAMResponseError extends TDAMError {
+  constructor(message: string, requestId = "", options?: ErrorOptions) {
+    super(-1, message, requestId, undefined, { kind: "invalid_response", retryable: false });
+    this.name = "TDAMResponseError";
+    if (options?.cause !== undefined) this.cause = options.cause;
   }
 }

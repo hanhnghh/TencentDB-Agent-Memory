@@ -1,7 +1,13 @@
 /** Strict HTTP transport used exclusively by v3 SDK clients. */
 
 import { Agent } from "undici";
-import { ParamError, TDAMError, type TDAMFailureKind } from "../errors.js";
+import {
+  ParamError,
+  TDAMError,
+  TDAMResponseError,
+  TDAMTransportError,
+  type TDAMFailureKind,
+} from "../errors.js";
 import type { HttpTransportOptions } from "../http.js";
 
 export class V3HttpTransport {
@@ -54,19 +60,7 @@ export class V3HttpTransport {
         signal: controller.signal,
       };
       if (this.dispatcher) fetchOptions.dispatcher = this.dispatcher;
-      let response: Response;
-      try {
-        response = await fetch(`${this.endpoint}${path}`, fetchOptions);
-      } catch (error) {
-        const timeout = error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
-        throw new TDAMError(
-          -1,
-          error instanceof Error ? error.message : String(error),
-          "",
-          undefined,
-          { kind: timeout ? "timeout" : "network", retryable: true },
-        );
-      }
+      const response = await fetch(`${this.endpoint}${path}`, fetchOptions);
       const responseText = await response.text().catch(() => "");
       const headerRequestId =
         response.headers.get("x-qcloud-transaction-id") ??
@@ -76,29 +70,29 @@ export class V3HttpTransport {
       let parsed: unknown;
       try {
         parsed = JSON.parse(responseText);
-      } catch {
-        const classification = classifyFailure(response.status, response.status);
-        throw new TDAMError(
-          response.ok ? -1 : response.status,
+      } catch (err) {
+        if (!response.ok) {
+          throw new TDAMError(
+            response.status,
+            `HTTP ${response.status} returned a non-JSON response`,
+            headerRequestId,
+            undefined,
+            classifyFailure(response.status, response.status),
+          );
+        }
+        throw new TDAMResponseError(
           `HTTP ${response.status} returned a non-JSON response`,
           headerRequestId,
-          undefined,
-          response.ok ? { ...classification, kind: "invalid_response" } : classification,
+          { cause: err },
         );
       }
-      if (!isRecord(parsed)) {
-        const classification = classifyFailure(response.status, response.status);
-        throw new TDAMError(
-          response.ok ? -1 : response.status,
-          "API response must be a JSON object",
-          headerRequestId,
-          undefined,
-          response.ok ? { ...classification, kind: "invalid_response" } : classification,
-        );
+
+      if (!isRecord(parsed) || typeof parsed.code !== "number") {
+        throw new TDAMResponseError("API response must be an envelope with a numeric code", headerRequestId);
       }
       const envelope = parsed;
 
-      const businessCode = typeof envelope.code === "number" ? envelope.code : undefined;
+      const businessCode = envelope.code;
       if (!response.ok || businessCode !== 0) {
         const code = businessCode && businessCode !== 0 ? businessCode : response.status;
         const details =
@@ -113,12 +107,9 @@ export class V3HttpTransport {
       }
 
       if (!isRecord(envelope.data)) {
-        throw new TDAMError(
-          -1,
+        throw new TDAMResponseError(
           "API response data must be a JSON object",
           headerRequestId || readString(envelope.request_id) || "",
-          undefined,
-          { kind: "invalid_response", retryable: false, httpStatus: response.status },
         );
       }
       const result = { ...envelope.data };
@@ -127,6 +118,14 @@ export class V3HttpTransport {
       // `post<T>` is the SDK's low-level generic seam. Public clients with
       // reliability-sensitive payloads validate this record before return.
       return result as T & { trace_id?: string };
+    } catch (err) {
+      if (err instanceof TDAMError) throw err;
+      const timedOut = controller.signal.aborted;
+      throw new TDAMTransportError(
+        timedOut ? "timeout" : "network",
+        timedOut ? `Request timed out after ${this.timeout}ms` : "Network request failed",
+        { cause: err },
+      );
     } finally {
       clearTimeout(timer);
     }

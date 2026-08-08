@@ -18,13 +18,62 @@
  *   - `recordTdaiTurn(client, identity=null | userMessage=null)` 时 client 侧直接
  *     return，本模块不介入。
  *
- * 重复写风险：如果第一次 POST 已到达 tdai kernel 但客户端读 5xx 超时后重试，
- * kernel 可能收到两条同样内容的 L0（tdai `/v3/conversation/add` 目前没有
- * idempotency-key）。可接受：宁可重复也不要丢；且重试的两次 POST payload 完全
- * 一致，L1/L2/L3 蒸馏管线幂等（同一 hash 一条），观测上仅 L0 冗余。
+ * 重试安全：调用方给每个 completed turn 生成稳定 source event ID；TdaiClient
+ * 再派生稳定的 per-batch event ID。MemoryCore 返回 durable receipt，因此首次 POST
+ * 已提交但 acknowledgement 丢失时，重试只会拿到 duplicate receipt，不会重复 L0、
+ * pipeline notification 或 quota usage。
  */
 
 const pendingWrites = new Set<Promise<unknown>>();
+const sessionWriteTails = new Map<string, Promise<void>>();
+
+export interface L0WriteScope {
+  serviceId: string;
+  teamId: string;
+  userId: string;
+  agentId: string;
+  taskId?: string;
+  agentSource: string;
+  sessionId: string;
+}
+
+/** Serialize writes sharing the complete applicable L0 isolation tuple. */
+export async function withL0SessionOrdering<T>(
+  scope: L0WriteScope,
+  write: () => Promise<T>,
+): Promise<T> {
+  const key = JSON.stringify([
+    scope.serviceId,
+    scope.teamId,
+    scope.userId,
+    scope.agentId,
+    scope.taskId ?? "",
+    scope.agentSource,
+    scope.sessionId,
+  ]);
+  const prior = sessionWriteTails.get(key) ?? Promise.resolve();
+  let release = (): void => undefined;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = prior.then(() => current);
+  sessionWriteTails.set(key, tail);
+  await prior;
+  try {
+    return await write();
+  } finally {
+    release();
+    if (sessionWriteTails.get(key) === tail) sessionWriteTails.delete(key);
+  }
+}
+
+/** Reset module-owned ordering state between deterministic tests. */
+export function __resetL0WriteOrderingForTests(): void {
+  if (pendingWrites.size > 0 || sessionWriteTails.size > 0) {
+    throw new Error("Cannot reset while L0 writes are pending");
+  }
+  sessionWriteTails.clear();
+}
 
 /**
  * 注册一个 in-flight 写。返回同一个 promise 便于链式使用。
@@ -93,11 +142,13 @@ export async function withL0Retry<T>(
 
 /**
  * 简单判定：网络错、5xx、408/429 值得重试；其它（400/401/403/404/422）直接放弃。
- * TdaiClient 的错误目前是 `throw new Error(\`tdai POST ... HTTP <code>: <body>\`)`
- * 形式，用正则捞状态码。捞不到（网络断/timeout）默认 retry。
+ * TdaiClient 写路径优先提供带 `retryable` 的 typed error；正则分支保留给旧调用方。
  */
 function isRetryable(err: unknown): boolean {
   if (!err) return false;
+  if (typeof err === "object" && "retryable" in err && typeof err.retryable === "boolean") {
+    return err.retryable;
+  }
   const msg = err instanceof Error ? err.message : String(err);
   // 网络类：AbortError / ENOTFOUND / ECONNRESET / ETIMEDOUT / fetch failed
   if (/abort|econnreset|enotfound|etimedout|fetch failed|network|timeout/i.test(msg)) return true;

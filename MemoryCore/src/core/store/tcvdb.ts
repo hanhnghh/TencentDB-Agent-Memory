@@ -37,6 +37,9 @@ import type {
   ProfileCountFilter,
   IsolationFilter,
   L0Record,
+  L0IngestionCommitResult,
+  L0IngestionInput,
+  L0IngestionReceipt,
   AuditEntry,
   AuditQueryFilter,
   KnowledgeEntity,
@@ -44,6 +47,11 @@ import type {
   KnowledgeListResult,
   BatchDeleteResult,
 } from "./types.js";
+import {
+  parseReceiptStringArray,
+  requireReceiptString,
+  validateAcceptedReceiptArrays,
+} from "./l0-ingestion.js";
 import { DEFAULT_ISOLATION_ID } from "./types.js";
 import { TcvdbClient, TcvdbApiError } from "./tcvdb-client.js";
 import type { BM25LocalEncoder } from "./bm25-local.js";
@@ -70,9 +78,23 @@ export interface TcvdbMemoryStoreConfig {
 
 const TAG = "[memory-tdai][tcvdb]";
 
+function l0IngestionOrderingKey(input: L0IngestionInput): string {
+  const record = input.records[0]?.record;
+  if (!record) return input.receiptKey;
+  return JSON.stringify([
+    record.teamId ?? "",
+    record.userId ?? "",
+    record.agentId ?? "",
+    record.taskId ?? "",
+    record.sessionId,
+    record.sessionKey,
+  ]);
+}
+
 /** Base collection suffixes (prefixed with database name at construction time). */
 const L1_COLLECTION_SUFFIX = "l1_memories";
 const L0_COLLECTION_SUFFIX = "l0_conversations";
+const L0_RECEIPTS_COLLECTION_SUFFIX = "l0_ingestion_receipts";
 const PROFILES_COLLECTION_SUFFIX = "profiles";
 const AUDIT_COLLECTION_SUFFIX = "memory_audit";
 /** entity_knowledge 明细注册表（见 docs/design/vdb-knowledge-collection.md）。 */
@@ -175,6 +197,8 @@ export class TcvdbMemoryStore implements IMemoryStore {
   private readonly bm25Encoder?: BM25LocalEncoder;
   private readonly l1Collection: string;
   private readonly l0Collection: string;
+  private readonly l0ReceiptsCollection: string;
+  private readonly l0IngestionTails = new Map<string, Promise<void>>();
   private readonly profilesCollection: string;
   private readonly auditCollection: string;
   private readonly knowledgeCollection: string;
@@ -201,6 +225,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
     // so prefix with database name to avoid cross-database collisions.
     this.l1Collection = `${config.database}_${L1_COLLECTION_SUFFIX}`;
     this.l0Collection = `${config.database}_${L0_COLLECTION_SUFFIX}`;
+    this.l0ReceiptsCollection = `${config.database}_${L0_RECEIPTS_COLLECTION_SUFFIX}`;
     this.profilesCollection = `${config.database}_${PROFILES_COLLECTION_SUFFIX}`;
     this.auditCollection = `${config.database}_${AUDIT_COLLECTION_SUFFIX}`;
     this.knowledgeCollection = `${config.database}_${KNOWLEDGE_COLLECTION_SUFFIX}`;
@@ -344,6 +369,21 @@ export class TcvdbMemoryStore implements IMemoryStore {
           { fieldName: "memory_type",     fieldType: "string", indexType: "filter" },
         ],
       );
+
+      await this.client.createCollection({
+        collection: this.l0ReceiptsCollection,
+        shardNum: 1,
+        replicaNum: 2,
+        description: "L0 source-event ingestion receipts",
+        embedding: { status: "disabled" },
+        indexes: [
+          { fieldName: "id", fieldType: "string", indexType: "primaryKey" },
+          { fieldName: "vector", fieldType: "vector", indexType: "FLAT", dimension: 1, metricType: "COSINE" },
+          { fieldName: "source_event_id", fieldType: "string", indexType: "filter" },
+          { fieldName: "content_hash", fieldType: "string", indexType: "filter" },
+          { fieldName: "committed_at_ms", fieldType: "uint64", indexType: "filter" },
+        ],
+      });
 
       // Create L0 collection (DISK_FLAT preferred, HNSW fallback)
       await this._createCollectionWithVectorFallback(
@@ -951,6 +991,94 @@ export class TcvdbMemoryStore implements IMemoryStore {
       this.logger?.warn(`${TAG} [L0-upsert] FAILED id=${record.id}: ${err instanceof Error ? err.message : String(err)}`);
       return false;
     }
+  }
+
+  async commitL0Ingestion(input: L0IngestionInput): Promise<L0IngestionCommitResult> {
+    const orderingKey = l0IngestionOrderingKey(input);
+    const prior = this.l0IngestionTails.get(orderingKey) ?? Promise.resolve();
+    let release: () => void = () => undefined;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = prior.then(() => current);
+    this.l0IngestionTails.set(orderingKey, tail);
+    await prior;
+
+    try {
+      await this._ensureInit();
+      if (this.degraded) return { status: "failed" };
+
+      const existing = await this.getL0IngestionReceipt(input.receiptKey);
+      if (existing) {
+        return {
+          status: existing.contentHash === input.contentHash && existing.payloadHash === input.payloadHash
+            ? "duplicate"
+            : "conflict",
+          receipt: existing,
+        };
+      }
+
+      // VectorDB upsert is a batch request. Stable message IDs also make a
+      // retry harmless if the server committed but its acknowledgement was lost.
+      const stored = await this.upsertL0Batch(input.records.map(({ record }) => record));
+      if (stored !== input.records.length) return { status: "failed" };
+
+      const receipt: L0IngestionReceipt = {
+        sourceEventId: input.sourceEventId,
+        contentHash: input.contentHash,
+        payloadHash: input.payloadHash,
+        acceptedIds: input.records.map(({ record }) => record.id),
+        acceptedVersions: input.records.map(() => "v1"),
+        committedAt: new Date().toISOString(),
+      };
+      await this.client.upsert(this.l0ReceiptsCollection, [{
+        id: input.receiptKey,
+        vector: [1],
+        source_event_id: receipt.sourceEventId,
+        content_hash: receipt.contentHash,
+        payload_hash: receipt.payloadHash,
+        accepted_ids_json: JSON.stringify(receipt.acceptedIds),
+        accepted_versions_json: JSON.stringify(receipt.acceptedVersions),
+        committed_at_ms: new Date(receipt.committedAt).getTime(),
+      }]);
+      return { status: "committed", receipt };
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} [L0-ingestion] FAILED event=${input.sourceEventId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return { status: "failed" };
+    } finally {
+      release();
+      if (this.l0IngestionTails.get(orderingKey) === tail) {
+        this.l0IngestionTails.delete(orderingKey);
+      }
+    }
+  }
+
+  async getL0IngestionReceipt(receiptKey: string): Promise<L0IngestionReceipt | undefined> {
+    await this._ensureInit();
+    if (this.degraded) throw new Error("TCVDB store is degraded");
+    const response = await this.client.query(this.l0ReceiptsCollection, {
+      retrieveVector: false,
+      documentIds: [receiptKey],
+    });
+    const doc = response.documents[0];
+    if (!doc) return undefined;
+    const committedAtMs = doc.committed_at_ms;
+    if (typeof committedAtMs !== "number" || !Number.isFinite(committedAtMs)) {
+      throw new Error("Malformed L0 ingestion receipt field: committed_at_ms");
+    }
+    const acceptedIds = parseReceiptStringArray(doc.accepted_ids_json, "accepted_ids_json");
+    const acceptedVersions = parseReceiptStringArray(doc.accepted_versions_json, "accepted_versions_json");
+    validateAcceptedReceiptArrays(acceptedIds, acceptedVersions);
+    return {
+      sourceEventId: requireReceiptString(doc.source_event_id, "source_event_id"),
+      contentHash: requireReceiptString(doc.content_hash, "content_hash"),
+      payloadHash: requireReceiptString(doc.payload_hash, "payload_hash"),
+      acceptedIds,
+      acceptedVersions,
+      committedAt: new Date(committedAtMs).toISOString(),
+    };
   }
 
   private async _upsertL0Async(record: L0Record): Promise<void> {

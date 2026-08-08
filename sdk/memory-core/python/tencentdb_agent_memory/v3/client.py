@@ -34,7 +34,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-from .._http import Stub
+from .._conversation import validate_conversation_add_result
+from .._http import AsyncStub, Stub
 from .._v3_http import AsyncHttpStub, HttpStub
 from ..errors import ParamError
 
@@ -195,16 +196,21 @@ class MemoryClient:
         messages: List[Dict[str, Any]],
         *,
         session_id: Optional[str] = None,
+        source_event_id: Optional[str] = None,
+        content_hash: Optional[str] = None,
     ) -> Dict[str, Any]:
         """``POST /v3/conversation/add`` — 写入必填 session_id（构造或调用二选一）。"""
-        return self._stub.post(
+        data = self._stub.post(
             f"{_V3}/conversation/add",
             _strip_none({
                 **self._iso.base_body(),
                 "session_id": self._iso.resolve_session_for_write(session_id),
+                "source_event_id": source_event_id,
+                "content_hash": content_hash,
                 "messages": messages,
             }),
         )
+        return validate_conversation_add_result(data, source_event_id, content_hash)
 
     def query_conversation(
         self,
@@ -498,7 +504,7 @@ class AsyncMemoryClient:
         task_id: Optional[str] = None,
         timeout: float = 30,
         verify: bool = True,
-        stub: Optional[Stub] = None,
+        stub: Optional[AsyncStub] = None,
     ) -> None:
         _validate_construction(team_id, agent_id, user_id)
         if stub is not None:
@@ -539,16 +545,21 @@ class AsyncMemoryClient:
         messages: List[Dict[str, Any]],
         *,
         session_id: Optional[str] = None,
+        source_event_id: Optional[str] = None,
+        content_hash: Optional[str] = None,
     ) -> Dict[str, Any]:
         """``POST /v3/conversation/add`` — 写入必填 session_id（构造或调用二选一）。"""
-        return await self._stub.post(
+        data = await self._stub.post(
             f"{_V3}/conversation/add",
             _strip_none({
                 **self._iso.base_body(),
                 "session_id": self._iso.resolve_session_for_write(session_id),
+                "source_event_id": source_event_id,
+                "content_hash": content_hash,
                 "messages": messages,
             }),
         )
+        return validate_conversation_add_result(data, source_event_id, content_hash)
 
     async def query_conversation(
         self,

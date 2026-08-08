@@ -9,7 +9,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-from .._http import AsyncHttpStub, HttpStub, Stub
+from .._conversation import validate_conversation_add_result
+from .._http import AsyncHttpStub, AsyncStub, HttpStub, Stub
 from ..cos import AsyncMemoryFileReader, AsyncStsCredentialManager, MemoryFileReader, StsCredentialManager
 
 logger = logging.getLogger(__name__)
@@ -112,16 +113,21 @@ class MemoryClient:
         agent_id: Optional[str] = None,
         user_id: Optional[str] = None,
         task_id: Optional[str] = None,
+        source_event_id: Optional[str] = None,
+        content_hash: Optional[str] = None,
     ) -> Dict[str, Any]:
         """``POST /conversation/add``"""
-        return self._stub.post(
+        data = self._stub.post(
             f"{_V2}/conversation/add",
-            {
+            _strip_none({
                 **_id_fields(team_id, agent_id, user_id, task_id),
                 "session_id": session_id,
+                "source_event_id": source_event_id,
+                "content_hash": content_hash,
                 "messages": messages,
-            },
+            }),
         )
+        return validate_conversation_add_result(data, source_event_id, content_hash)
 
     def query_conversation(
         self,
@@ -582,10 +588,14 @@ class AsyncMemoryClient:
         *,
         timeout: float = 30,
         verify: bool = False,
+        stub: Optional[AsyncStub] = None,
     ) -> None:
-        if not service_id:
-            raise ValueError("service_id must be provided")
-        self._stub = AsyncHttpStub(endpoint, api_key, service_id, timeout=timeout, verify=verify)
+        if stub is not None:
+            self._stub = stub
+        else:
+            if not service_id:
+                raise ValueError("service_id must be provided")
+            self._stub = AsyncHttpStub(endpoint, api_key, service_id, timeout=timeout, verify=verify)
 
         # Memory file reader (lazy init)
         self._cos_reader: Optional[AsyncMemoryFileReader] = None
@@ -598,12 +608,18 @@ class AsyncMemoryClient:
         *,
         team_id: Optional[str] = None, agent_id: Optional[str] = None,
         user_id: Optional[str] = None, task_id: Optional[str] = None,
+        source_event_id: Optional[str] = None,
+        content_hash: Optional[str] = None,
     ) -> Dict[str, Any]:
-        return await self._stub.post(
+        data = await self._stub.post(
             f"{_V2}/conversation/add",
-            {**_id_fields(team_id, agent_id, user_id, task_id),
-             "session_id": session_id, "messages": messages},
+            _strip_none({**_id_fields(team_id, agent_id, user_id, task_id),
+                         "session_id": session_id,
+                         "source_event_id": source_event_id,
+                         "content_hash": content_hash,
+                         "messages": messages}),
         )
+        return validate_conversation_add_result(data, source_event_id, content_hash)
 
     async def query_conversation(
         self, *, session_id: Optional[str] = None, limit: Optional[int] = None,

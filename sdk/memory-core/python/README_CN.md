@@ -31,12 +31,14 @@ client = MemoryClient(
 # L0: 添加对话
 result = client.add_conversation(
     session_id="sess-1",
+    source_event_id="agent:sess-1:turn:7",
     messages=[
         {"role": "user", "content": "Hello"},
         {"role": "assistant", "content": "Hi!"},
     ],
 )
 print(result["accepted_ids"])
+print(result["receipt"])  # 首次为 committed，安全重放为 duplicate
 
 # L1: 搜索结构化记忆
 hits = client.search_atomic(query="user preferences", limit=5)
@@ -240,6 +242,13 @@ meta.delete_knowledge(["wiki-docs", "cg-repo-1"], team_id="team-1")
 
 > 注意：这组接口是**管理面 CRUD**，只管元数据；真正去 wiki/code-graph 里搜内容、读页面、同步仓库是 Knowledge Service 数据面（`service_url` 指向的 `:8421`）的活，不在这个客户端里。
 
+## 可安全重试的对话写入
+
+默认 v2 客户端和严格隔离的 v3 客户端都接受可选的稳定
+`source_event_id` / `content_hash`，并返回持久化 receipt。仅在超时或
+acknowledgement 丢失后重试同一份对话 payload 时复用同一个 event ID。旧调用方省略
+这些字段时，请求与响应形状保持不变。
+
 ## 错误处理
 
 所有非零 `code` 的响应会抛出 `TDAMError`：
@@ -252,6 +261,10 @@ try:
 except TDAMError as e:
     print(f"code={e.code} message={e.message} request_id={e.request_id}")
 ```
+
+`TDAMError.retryable` 对 408、429 和 5xx 为 `True`。网络与超时失败使用
+`TDAMTransportError`，成功 HTTP 响应中的畸形数据使用 `TDAMResponseError`；永久
+4xx 失败不可重试。
 
 ## 构建与打包
 

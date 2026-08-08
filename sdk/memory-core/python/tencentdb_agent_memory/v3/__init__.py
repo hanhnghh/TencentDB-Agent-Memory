@@ -13,6 +13,7 @@ Skill 客户端 :class:`SkillClient` / :class:`AsyncSkillClient` 封装 14 条
 """
 
 from .client import AsyncMemoryClient, MemoryClient
+from ..errors import ParamError, TDAMError, TDAMResponseError, TDAMTransportError
 from .metadata_client import AsyncMetadataClient, MetadataClient
 from .skill_client import (
     SKILL_ERROR_CODE,
@@ -25,6 +26,10 @@ from .skill_client import (
 __all__ = [
     "MemoryClient",
     "AsyncMemoryClient",
+    "ParamError",
+    "TDAMError",
+    "TDAMResponseError",
+    "TDAMTransportError",
     "MetadataClient",
     "AsyncMetadataClient",
     "SkillClient",

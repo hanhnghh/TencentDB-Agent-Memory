@@ -37,7 +37,7 @@ class TDAMError(Exception):
         details: Optional[Mapping[str, Any]] = None,
         *,
         kind: TDAMFailureKind = "envelope",
-        retryable: bool = False,
+        retryable: Optional[bool] = None,
         http_status: Optional[int] = None,
     ) -> None:
         super().__init__()
@@ -46,6 +46,10 @@ class TDAMError(Exception):
         self.request_id = request_id
         self.details = dict(details) if details else None
         self.kind = kind
+        if retryable is None:
+            digits = str(abs(int(code)))
+            normalized = int(digits[:3]) if len(digits) > 3 else code
+            retryable = normalized in (408, 429) or normalized >= 500
         self.retryable = retryable
         self.http_status = http_status
 
@@ -60,3 +64,28 @@ class TDAMError(Exception):
 
 class ParamError(Exception):
     """Raised when caller-supplied parameters are invalid."""
+
+
+class TDAMTransportError(TDAMError):
+    """Typed retryable network/timeout failure."""
+
+    def __init__(self, kind: Literal["network", "timeout"], message: str) -> None:
+        super().__init__(
+            408 if kind == "timeout" else -1,
+            message,
+            kind=kind,
+            retryable=True,
+        )
+
+
+class TDAMResponseError(TDAMError):
+    """Typed permanent malformed-response failure."""
+
+    def __init__(self, message: str, request_id: str = "") -> None:
+        super().__init__(
+            -1,
+            message,
+            request_id,
+            kind="invalid_response",
+            retryable=False,
+        )

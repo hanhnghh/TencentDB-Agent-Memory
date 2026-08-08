@@ -1,4 +1,4 @@
-import { ParamError } from "../errors.js";
+import { ParamError, TDAMResponseError } from "../errors.js";
 import { V3HttpTransport } from "./http.js";
 import type { Transport } from "../client.js";
 import type {
@@ -63,12 +63,12 @@ class IsolationContext {
   }
 
   baseBody(): V3IsolationContext {
-    return stripUndefined({
+    return {
       team_id: this.teamId,
       agent_id: this.agentId,
       user_id: this.userId,
-      task_id: this.taskId,
-    }) as unknown as V3IsolationContext;
+      ...(this.taskId ? { task_id: this.taskId } : {}),
+    };
   }
 
   resolveSession(override?: string): string | undefined {
@@ -159,12 +159,41 @@ export class MemoryClient {
 
   // -- L0 Conversation ---------------------------------------------------
 
-  addConversation(params: V3ConversationAddRequest): Promise<V3ConversationAddData> {
-    return this.http.post(`${V3}/conversation/add`, stripUndefined({
+  async addConversation(params: V3ConversationAddRequest): Promise<V3ConversationAddData> {
+    const data = await this.http.post<V3ConversationAddData>(`${V3}/conversation/add`, stripUndefined({
       ...this.iso.baseBody(),
       session_id: this.iso.resolveSessionForWrite(params.session_id),
+      source_event_id: params.source_event_id,
+      content_hash: params.content_hash,
       messages: params.messages,
     }));
+    if (
+      !data
+      || !Array.isArray(data.accepted_ids)
+      || !data.accepted_ids.every((id) => typeof id === "string")
+      || !Array.isArray(data.accepted_versions)
+      || !data.accepted_versions.every((version) => typeof version === "string")
+      || data.accepted_versions.length !== data.accepted_ids.length
+      || !Number.isInteger(data.total_count)
+      || data.total_count !== data.accepted_ids.length
+    ) {
+      throw new TDAMResponseError("conversation/add returned malformed receipt data");
+    }
+    if (params.source_event_id !== undefined) {
+      const receipt = data.receipt;
+      if (
+        !receipt
+        || receipt.source_event_id !== params.source_event_id
+        || typeof receipt.content_hash !== "string"
+        || (params.content_hash !== undefined && receipt.content_hash !== params.content_hash)
+        || (receipt.status !== "committed" && receipt.status !== "duplicate")
+        || typeof receipt.committed_at !== "string"
+        || !Number.isFinite(Date.parse(receipt.committed_at))
+      ) {
+        throw new TDAMResponseError("conversation/add returned a malformed or mismatched source-event receipt");
+      }
+    }
+    return data;
   }
 
   queryConversation(params: V3ConversationQueryRequest = {}): Promise<V3ConversationQueryData> {
@@ -298,7 +327,7 @@ export class MemoryClient {
   // -- L3 Core ------------------------------------------------------------
 
   readCore(_params: V3CoreReadRequest = {}): Promise<V3CoreFile> {
-    return this.http.post(`${V3}/core/read`, this.iso.baseBody() as unknown as Record<string, unknown>);
+    return this.http.post(`${V3}/core/read`, { ...this.iso.baseBody() });
   }
 
   writeCore(params: V3CoreWriteRequest): Promise<V3CoreWriteData> {
@@ -306,6 +335,6 @@ export class MemoryClient {
   }
 
   countCore(): Promise<V3CountData> {
-    return this.http.post(`${V3}/core/count`, this.iso.baseBody() as unknown as Record<string, unknown>);
+    return this.http.post(`${V3}/core/count`, { ...this.iso.baseBody() });
   }
 }

@@ -31,12 +31,14 @@ client = MemoryClient(
 # L0: append a conversation
 result = client.add_conversation(
     session_id="sess-1",
+    source_event_id="agent:sess-1:turn:7",
     messages=[
         {"role": "user", "content": "Hello"},
         {"role": "assistant", "content": "Hi!"},
     ],
 )
 print(result["accepted_ids"])
+print(result["receipt"])  # committed, or duplicate on a safe replay
 
 # L1: search structured memories
 hits = client.search_atomic(query="user preferences", limit=5)
@@ -202,6 +204,33 @@ meta.delete_knowledge(["wiki-docs", "cg-repo-1"], team_id="team-1")
 
 > Note: these are **management-plane CRUD** (metadata only). Actually searching wiki content, reading pages, or syncing repos is the Knowledge Service data-plane's job (`service_url` → `:8421`), not this client.
 
+## Retry-safe conversation ingestion
+
+Both the default v2 client above and the strict-isolation v3 client accept an
+optional stable source event ID and return a durable receipt. Reuse the same ID
+only when retrying the same conversation payload after a timeout or lost
+acknowledgement. Existing calls that omit source identity keep their prior
+request and response shape.
+
+```python
+from tencentdb_agent_memory.v3 import MemoryClient
+
+client = MemoryClient(
+    endpoint="http://127.0.0.1:8420",
+    api_key="your-api-key",
+    service_id="your-memory-space-id",
+    team_id="team-1",
+    agent_id="agent-1",
+    user_id="user-1",
+    session_id="sess-1",
+)
+write = client.add_conversation(
+    [{"role": "user", "content": "Hello"}],
+    source_event_id="codex:sess-1:turn:7",
+)
+print(write["receipt"])  # committed, or duplicate on a safe replay
+```
+
 ## Error Handling
 
 All non-zero `code` responses raise `TDAMError`:
@@ -214,6 +243,10 @@ try:
 except TDAMError as e:
     print(f"code={e.code} message={e.message} request_id={e.request_id}")
 ```
+
+`TDAMError.retryable` is true for 408, 429, and 5xx failures. Network and
+timeout failures use `TDAMTransportError`; malformed success responses use
+`TDAMResponseError`. Permanent 4xx failures are not retryable.
 
 ## Build & Pack
 

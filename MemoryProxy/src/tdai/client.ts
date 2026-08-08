@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type {
   TdaiAgentCtx,
   TdaiIdentity,
@@ -7,6 +9,8 @@ import type {
   TdaiL3Core,
   TdaiMemoryConfig,
   TdaiMessage,
+  TdaiConversationReceipt,
+  TdaiConversationWriteResult,
 } from "./types.js";
 import { log } from "../report/log.js";
 
@@ -14,6 +18,31 @@ interface TdaiEnvelope<T = unknown> {
   code?: number;
   message?: string;
   data?: T;
+}
+
+export type TdaiWriteErrorKind = "network" | "timeout" | "http" | "envelope" | "malformed";
+
+/** Typed write-path failure; read-path calls intentionally remain fail-soft. */
+export class TdaiWriteError extends Error {
+  constructor(
+    readonly kind: TdaiWriteErrorKind,
+    message: string,
+    readonly retryable: boolean,
+    readonly status?: number,
+    readonly code?: number,
+    readonly requestId?: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "TdaiWriteError";
+  }
+}
+
+interface ConversationAddData {
+  accepted_ids: string[];
+  accepted_versions: string[];
+  total_count: number;
+  receipt?: TdaiConversationReceipt;
 }
 
 const TDAI_MESSAGE_CONTENT_MAX_CHARS = 8192;
@@ -88,8 +117,14 @@ export class TdaiClient {
     return this.config.enabled && !!this.config.endpoint;
   }
 
-  async addConversation(identity: TdaiIdentity, messages: TdaiMessage[]): Promise<void> {
-    if (!this.isEnabled() || !this.config.writeL0 || messages.length === 0) return;
+  async addConversation(
+    identity: TdaiIdentity,
+    messages: TdaiMessage[],
+    options: { sourceEventId?: string; contentHash?: string } = {},
+  ): Promise<TdaiConversationWriteResult> {
+    if (!this.isEnabled() || !this.config.writeL0 || messages.length === 0) {
+      return { acceptedIds: [], totalCount: 0, receipts: [] };
+    }
 
     const chunkedMessages = chunkConversationMessages(messages);
     log.info("tdai-recorder:write-l0", {
@@ -100,9 +135,21 @@ export class TdaiClient {
       userLen: (messages[0]?.content ?? "").length,
     });
 
+    const acceptedIds: string[] = [];
+    const receipts: TdaiConversationReceipt[] = [];
+    const batchCount = Math.ceil(chunkedMessages.length / TDAI_CONVERSATION_MAX_MESSAGES);
     for (let offset = 0; offset < chunkedMessages.length; offset += TDAI_CONVERSATION_MAX_MESSAGES) {
       const batch = chunkedMessages.slice(offset, offset + TDAI_CONVERSATION_MAX_MESSAGES);
-      await this.postForCtx(
+      const batchIndex = Math.floor(offset / TDAI_CONVERSATION_MAX_MESSAGES);
+      const sourceEventId = options.sourceEventId
+        ? `${options.sourceEventId}:batch:${batchIndex}-of-${batchCount}`
+        : undefined;
+      const contentHash = sourceEventId
+        ? createHash("sha256")
+            .update(JSON.stringify([options.contentHash ?? "", batchIndex, batchCount, batch]))
+            .digest("hex")
+        : undefined;
+      const result = await this.postWriteForCtx(
         "/v3/conversation/add",
         { teamId: identity.teamId, userId: identity.userId, agentId: identity.agentId },
         {
@@ -111,13 +158,18 @@ export class TdaiClient {
           agent_id: identity.agentId,
           session_id: identity.sessionId,
           task_id: identity.taskId,
+          source_event_id: sourceEventId,
+          content_hash: contentHash,
           messages: batch,
         },
         identity.sessionId,
         identity.taskId,
         { includeSession: true, includeTask: true },
       );
+      acceptedIds.push(...result.accepted_ids);
+      if (result.receipt) receipts.push(result.receipt);
     }
+    return { acceptedIds, totalCount: acceptedIds.length, receipts };
   }
 
   async searchL1(identity: TdaiIdentity, query: string): Promise<TdaiL1Memory[]> {
@@ -298,10 +350,123 @@ export class TdaiClient {
     }
   }
 
+  private async postWriteForCtx(
+    path: string,
+    ctx: TdaiAgentCtx,
+    body: Record<string, unknown>,
+    sessionId: string,
+    taskId: string | undefined,
+    options: { includeSession: boolean; includeTask: boolean },
+  ): Promise<ConversationAddData> {
+    const base = this.config.endpoint.replace(/\/$/, "");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.config.timeoutMs);
+    try {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${this.config.apiKey || "local-proxy"}`,
+        "x-tdai-service-id": this.config.serviceId || "default",
+        "x-tdai-team-id": ctx.teamId,
+        "x-tdai-user-id": ctx.userId,
+        "x-tdai-agent-id": ctx.agentId,
+      };
+      if (options.includeSession && sessionId) headers["x-tdai-session-id"] = sessionId;
+      if (options.includeTask && taskId) headers["x-tdai-task-id"] = taskId;
+
+      let response: Response;
+      try {
+        response = await fetch(`${base}${path}`, {
+          method: "POST",
+          signal: controller.signal,
+          headers,
+          body: JSON.stringify(stripUndefined(body)),
+        });
+      } catch (err) {
+        const timedOut = controller.signal.aborted;
+        throw new TdaiWriteError(timedOut ? "timeout" : "network", `tdai POST ${path} ${timedOut ? "timed out" : "network failure"}`, true, undefined, undefined, undefined, {
+          cause: err,
+        });
+      }
+
+      const responseText = await response.text().catch(() => "");
+      let envelope: unknown;
+      try {
+        envelope = JSON.parse(responseText);
+      } catch (err) {
+        if (!response.ok) {
+          throw new TdaiWriteError(
+            "http",
+            `tdai POST ${path} HTTP ${response.status} returned a non-JSON response`,
+            isRetryableStatus(response.status),
+            response.status,
+            undefined,
+            undefined,
+            { cause: err },
+          );
+        }
+        throw new TdaiWriteError(
+          "malformed",
+          `tdai POST ${path} returned non-JSON response`,
+          response.status >= 500,
+          response.status,
+          undefined,
+          undefined,
+          { cause: err },
+        );
+      }
+
+      if (!isUnknownRecord(envelope)) {
+        throw new TdaiWriteError("malformed", `tdai POST ${path} response is not an object`, true, response.status);
+      }
+      const responseMessage = typeof envelope.message === "string" ? envelope.message : undefined;
+      const responseCode = typeof envelope.code === "number" ? envelope.code : undefined;
+      const responseRequestId = typeof envelope.request_id === "string" ? envelope.request_id : undefined;
+      if (!response.ok) {
+        throw new TdaiWriteError(
+          "http",
+          `tdai POST ${path} HTTP ${response.status}: ${responseMessage ?? "request failed"}`,
+          isRetryableStatus(response.status),
+          response.status,
+          responseCode,
+          responseRequestId,
+        );
+      }
+      if (responseCode === undefined) {
+        throw new TdaiWriteError("malformed", `tdai POST ${path} response is missing numeric code`, true, response.status);
+      }
+      if (responseCode !== 0) {
+        throw new TdaiWriteError(
+          "envelope",
+          `tdai POST ${path} envelope code=${responseCode}: ${responseMessage ?? "unknown error"}`,
+          isRetryableStatus(responseCode),
+          response.status,
+          responseCode,
+          responseRequestId,
+        );
+      }
+
+      const data = envelope.data;
+      if (!isConversationAddData(data)) {
+        throw new TdaiWriteError("malformed", `tdai POST ${path} response has malformed conversation receipt data`, true, response.status);
+      }
+      const expectedSourceEventId = body.source_event_id;
+      if (
+        expectedSourceEventId !== undefined
+        && !isConversationReceipt(data.receipt, expectedSourceEventId, body.content_hash)
+      ) {
+        throw new TdaiWriteError("malformed", `tdai POST ${path} response has malformed or mismatched receipt`, true, response.status);
+      }
+      return data;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   // ── ACL check ──────────────────────────────────────────────────────────
   //
-  // 与 memory 数据面调用（postForCtx）**语义相反**：
+  // 与 memory 读取调用（postForCtx）**语义相反**：
   //   - postForCtx 网络/HTTP/envelope 错都吞掉返回空 —— 让注入路径静默降级
+  //   - L0 写入走 postWriteForCtx，错误会作为 TdaiWriteError 交给 retry/outbox 层
   //   - checkAcl 网络/HTTP/envelope 错要抛出 —— 让上层 fail-closed 拒绝注入
   //     并打 error 日志（否则 acl 服务挂了会静默变成"全部允许"，越权）
   //
@@ -346,18 +511,23 @@ export class TdaiClient {
         }),
       });
       if (!res.ok) {
-        const body = await res.text().catch(() => "");
-        throw new Error(`acl/check http ${res.status}: ${body.slice(0, 200)}`);
+        throw new Error(`acl/check http ${res.status}`);
       }
-      const envelope = (await res.json()) as TdaiEnvelope<AclCheckResult>;
-      if (typeof envelope.code === "number" && envelope.code !== 0) {
-        throw new Error(`acl/check envelope code=${envelope.code} msg=${envelope.message ?? ""}`);
+      const envelope: unknown = await res.json();
+      if (!isUnknownRecord(envelope) || typeof envelope.code !== "number") {
+        throw new Error("acl/check malformed response envelope");
+      }
+      if (envelope.code !== 0) {
+        throw new Error(`acl/check envelope code=${envelope.code}`);
       }
       const data = envelope.data;
-      if (!data || typeof data.allowed !== "boolean") {
-        throw new Error(`acl/check malformed response: ${JSON.stringify(data).slice(0, 200)}`);
+      if (!isUnknownRecord(data) || typeof data.allowed !== "boolean") {
+        throw new Error("acl/check malformed response data");
       }
-      return data;
+      return {
+        allowed: data.allowed,
+        ...(typeof data.reason === "string" ? { reason: data.reason } : {}),
+      };
     } finally {
       clearTimeout(timer);
     }
@@ -393,6 +563,46 @@ export async function checkAclOrDeny(
 
 function stripUndefined(body: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(body).filter(([, value]) => value !== undefined));
+}
+
+function isRetryableStatus(status: number): boolean {
+  const normalized = normalizeStatusCode(status);
+  return normalized === 408 || normalized === 429 || normalized >= 500;
+}
+
+function normalizeStatusCode(code: number): number {
+  const digits = String(Math.abs(Math.trunc(code)));
+  return digits.length > 3 ? Number(digits.slice(0, 3)) : code;
+}
+
+function isConversationReceipt(
+  value: unknown,
+  sourceEventId: unknown,
+  contentHash: unknown,
+): value is TdaiConversationReceipt {
+  if (!isUnknownRecord(value)) return false;
+  return value.source_event_id === sourceEventId
+    && typeof value.content_hash === "string"
+    && (contentHash === undefined || value.content_hash === contentHash)
+    && (value.status === "committed" || value.status === "duplicate")
+    && typeof value.committed_at === "string"
+    && Number.isFinite(Date.parse(value.committed_at));
+}
+
+function isConversationAddData(value: unknown): value is ConversationAddData {
+  if (!isUnknownRecord(value)) return false;
+  return Array.isArray(value.accepted_ids)
+    && value.accepted_ids.every((id) => typeof id === "string")
+    && Array.isArray(value.accepted_versions)
+    && value.accepted_versions.every((version) => typeof version === "string")
+    && value.accepted_versions.length === value.accepted_ids.length
+    && typeof value.total_count === "number"
+    && Number.isInteger(value.total_count)
+    && value.total_count === value.accepted_ids.length;
+}
+
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** 打印敏感 userKey 时脱敏：只保留前 6 位 + 后 4 位。 */

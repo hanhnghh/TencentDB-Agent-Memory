@@ -17,7 +17,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type http from "node:http";
 import { classifyError } from "./error-handler.js";
-import type { IMemoryStore, L0Record, ProfileSyncRecord } from "../core/store/types.js";
+import type { IMemoryStore, L0IngestionReceipt, L0Record, ProfileSyncRecord } from "../core/store/types.js";
 import type { EmbeddingService } from "../core/store/embedding.js";
 import { createScopedStorageAdapter, type StorageAdapter } from "../core/storage/adapter.js";
 import { StoragePaths } from "../core/storage/types.js";
@@ -647,7 +647,7 @@ export async function handleV2Route(
 async function handleConversationAdd(body: unknown, auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
   const parsed = conversationAddRequestSchema.safeParse(body);
   if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
-  const { session_id, messages } = parsed.data;
+  const { session_id, source_event_id, content_hash, messages } = parsed.data;
 
   // Enforce three-dim isolation. user_id / agent_id come from request body
   // or x-tdai-* headers (resolved in dispatchV2Request).  When the gateway's
@@ -665,6 +665,39 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
 
   const store = deps.getStore();
   if (!store) return errorEnvelope(503, "Store not available", requestId);
+
+  const payloadHash = hashConversationPayload(messages);
+  const effectiveContentHash = content_hash ?? payloadHash;
+  const receiptKey = source_event_id
+    ? hashReceiptKey({
+        serviceId: auth.serviceId,
+        sourceEventId: source_event_id,
+        teamId: iso?.teamId,
+        userId: iso?.userId,
+        agentId: iso?.agentId,
+        taskId: iso?.taskId,
+        sessionId: session_id,
+      })
+    : undefined;
+
+  if (source_event_id && receiptKey) {
+    const existing = await store.getL0IngestionReceipt(receiptKey);
+    if (existing) {
+      if (existing.contentHash !== effectiveContentHash || existing.payloadHash !== payloadHash) {
+        return errorEnvelope(409, "source_event_id was already committed with different content", requestId, {
+          source_event_id,
+          expected_content_hash: existing.contentHash,
+          actual_content_hash: effectiveContentHash,
+        });
+      }
+      return successEnvelope<ConversationAddData>({
+        accepted_ids: existing.acceptedIds,
+        accepted_versions: existing.acceptedVersions,
+        total_count: existing.acceptedIds.length,
+        receipt: toConversationReceipt(existing, "duplicate"),
+      }, requestId);
+    }
+  }
 
   // Quota check: memory limit
   if (deps.quotaManager) {
@@ -694,11 +727,13 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
   }
 
   const embedding = deps.getEmbedding();
-  const acceptedIds: string[] = [];
   const ingestBaseMs = Date.now();
+  const records: Array<{ record: L0Record; embedding?: Float32Array }> = [];
 
   for (const [index, msg] of messages.entries()) {
-    const id = `msg-${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+    const id = receiptKey
+      ? `msg-${createHash("sha256").update(`${receiptKey}:${index}`).digest("hex").slice(0, 24)}`
+      : `msg-${randomUUID().replace(/-/g, "").slice(0, 12)}`;
     const recordedAtMs = ingestBaseMs + index;
     const record: L0Record = {
       id,
@@ -720,8 +755,55 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
       try { emb = await embedding.embed(msg.content); } catch (e) { console.warn(`[v2-router] L0 embedding failed:`, e); }
     }
 
-    await store.upsertL0(record, emb);
-    acceptedIds.push(id);
+    records.push({ record, embedding: emb });
+  }
+
+  let acceptedIds: string[];
+  let acceptedVersions: string[];
+  let receipt: ConversationAddData["receipt"];
+  let committed = true;
+
+  if (source_event_id && receiptKey) {
+    const result = await store.commitL0Ingestion({
+      receiptKey,
+      sourceEventId: source_event_id,
+      contentHash: effectiveContentHash,
+      payloadHash,
+      records,
+    });
+    if (result.status === "failed") {
+      return errorEnvelope(503, "Storage failed to commit L0 ingestion", requestId, { retryable: true });
+    }
+    if (result.status === "conflict") {
+      return errorEnvelope(409, "source_event_id was already committed with different content", requestId, {
+        source_event_id,
+        expected_content_hash: result.receipt.contentHash,
+        actual_content_hash: effectiveContentHash,
+      });
+    }
+    committed = result.status === "committed";
+    acceptedIds = result.receipt.acceptedIds;
+    acceptedVersions = result.receipt.acceptedVersions;
+    receipt = toConversationReceipt(result.receipt, result.status);
+  } else {
+    acceptedIds = [];
+    for (const entry of records) {
+      const stored = await store.upsertL0(entry.record, entry.embedding);
+      if (!stored) {
+        return errorEnvelope(503, "Storage failed to persist L0 message", requestId, { retryable: true });
+      }
+      acceptedIds.push(entry.record.id);
+    }
+    acceptedVersions = acceptedIds.map(() => "v1");
+  }
+
+  // A replay has already produced every downstream effect belonging to this
+  // event. Returning its receipt is the only allowed side effect here.
+  if (!committed) {
+    return successEnvelope<ConversationAddData>(
+      { accepted_ids: acceptedIds, accepted_versions: acceptedVersions, total_count: acceptedIds.length, receipt },
+      requestId,
+    );
   }
 
   // Notify pipeline: trigger async L1 extraction (service mode).
@@ -775,9 +857,46 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
   }
 
   return successEnvelope<ConversationAddData>(
-    { accepted_ids: acceptedIds, accepted_versions: acceptedIds.map(() => "v1"), total_count: acceptedIds.length },
+    { accepted_ids: acceptedIds, accepted_versions: acceptedVersions, total_count: acceptedIds.length, ...(receipt ? { receipt } : {}) },
     requestId,
   );
+}
+
+function hashConversationPayload(messages: Array<{ role: string; content: string; timestamp?: string }>): string {
+  const canonical = messages.map((message) => [message.role, message.content, message.timestamp ?? null]);
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+function hashReceiptKey(input: {
+  serviceId: string;
+  sourceEventId: string;
+  teamId?: string;
+  userId?: string;
+  agentId?: string;
+  taskId?: string;
+  sessionId: string;
+}): string {
+  return createHash("sha256").update(JSON.stringify([
+    input.serviceId,
+    input.teamId ?? "",
+    input.userId ?? "",
+    input.agentId ?? "",
+    input.taskId ?? "",
+    input.sessionId,
+    input.sourceEventId,
+  ])).digest("hex");
+}
+
+function toConversationReceipt(
+  receipt: L0IngestionReceipt,
+  status: "committed" | "duplicate",
+): NonNullable<ConversationAddData["receipt"]> {
+  return {
+    source_event_id: receipt.sourceEventId,
+    content_hash: receipt.contentHash,
+    status,
+    committed_at: receipt.committedAt,
+  };
 }
 
 async function handleConversationQuery(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {

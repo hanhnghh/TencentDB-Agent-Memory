@@ -43,14 +43,16 @@ const client = new MemoryClient({
   sessionId: "sess-1",
 });
 
-// L0: 添加对话
+// L0: 添加对话；稳定 event ID 可安全重试超时或 acknowledgement 丢失
 const added = await client.addConversation({
+  source_event_id: "agent:sess-1:turn:7",
   messages: [
     { role: "user", content: "Hello" },
     { role: "assistant", content: "Hi!" },
   ],
 });
 console.log(added.accepted_ids);
+console.log(added.receipt); // 首次为 committed，安全重放为 duplicate
 
 // L0: 查询当前 session 的原始对话
 const l0 = await client.queryConversation({ limit: 20, offset: 0 });
@@ -246,6 +248,10 @@ try {
   }
 }
 ```
+
+`TDAMError.retryable` 对 408、429 和 5xx 为 `true`。网络与超时失败使用
+`TDAMTransportError`，成功 HTTP 响应中的畸形数据使用 `TDAMResponseError`；永久
+4xx 失败不可重试。
 
 ## 构建与打包
 

@@ -8,7 +8,7 @@ from typing import Dict, Optional
 import httpx
 
 from ._http import Stub
-from .errors import ParamError, TDAMError
+from .errors import ParamError, TDAMError, TDAMResponseError, TDAMTransportError
 
 logger = logging.getLogger(__name__)
 
@@ -64,30 +64,22 @@ def _decode_response(resp: httpx.Response) -> dict:
     try:
         envelope = resp.json()
     except ValueError as exc:
-        code = resp.status_code if resp.is_error else -1
-        classification = _classify_failure(resp.status_code, code)
-        if not resp.is_error:
-            classification["kind"] = "invalid_response"
-        raise TDAMError(
-            code,
-            f"HTTP {resp.status_code} returned a non-JSON response",
-            header_request_id,
-            **classification,
-        ) from exc
+        message = f"HTTP {resp.status_code} returned a non-JSON response"
+        if resp.is_error:
+            raise TDAMError(
+                resp.status_code,
+                message,
+                header_request_id,
+                **_classify_failure(resp.status_code, resp.status_code),
+            ) from exc
+        raise TDAMResponseError(message, header_request_id) from exc
 
     if not isinstance(envelope, dict):
-        code = resp.status_code if resp.is_error else -1
-        classification = _classify_failure(resp.status_code, code)
-        if not resp.is_error:
-            classification["kind"] = "invalid_response"
-        raise TDAMError(
-            code,
-            "API response must be a JSON object",
-            header_request_id,
-            **classification,
-        )
+        raise TDAMResponseError("API response must be a JSON object", header_request_id)
 
     code = envelope.get("code")
+    if isinstance(code, bool) or not isinstance(code, int):
+        raise TDAMResponseError("API response envelope must contain a numeric code", header_request_id)
     if resp.is_error or code != 0:
         effective_code = code if isinstance(code, int) and code != 0 else resp.status_code
         payload = envelope.get("data")
@@ -102,14 +94,7 @@ def _decode_response(resp: httpx.Response) -> dict:
 
     result = envelope.get("data")
     if not isinstance(result, dict):
-        raise TDAMError(
-            -1,
-            "API response data must be a JSON object",
-            header_request_id,
-            kind="invalid_response",
-            retryable=False,
-            http_status=resp.status_code,
-        )
+        raise TDAMResponseError("API response data must be a JSON object", header_request_id)
     trace_id = resp.headers.get("x-trace-id")
     if trace_id:
         result["trace_id"] = trace_id
@@ -148,17 +133,12 @@ class HttpStub(Stub):
                 headers=self.headers,
                 timeout=timeout or self.client.timeout,
             )
+        except httpx.TimeoutException as exc:
+            raise TDAMTransportError("timeout", f"POST {path} timed out") from exc
         except httpx.RequestError as exc:
-            is_timeout = isinstance(exc, httpx.TimeoutException)
-            raise TDAMError(
-                -1,
-                str(exc),
-                kind="timeout" if is_timeout else "network",
-                retryable=True,
-            ) from exc
-        result = _decode_response(resp)
+            raise TDAMTransportError("network", f"POST {path} network failure") from exc
         logger.debug("Response %s status=%s", path, resp.status_code)
-        return result
+        return _decode_response(resp)
 
     def close(self) -> None:
         if isinstance(self.client, httpx.Client):
@@ -197,17 +177,12 @@ class AsyncHttpStub:
                 headers=self.headers,
                 timeout=timeout or self.client.timeout,
             )
+        except httpx.TimeoutException as exc:
+            raise TDAMTransportError("timeout", f"POST {path} timed out") from exc
         except httpx.RequestError as exc:
-            is_timeout = isinstance(exc, httpx.TimeoutException)
-            raise TDAMError(
-                -1,
-                str(exc),
-                kind="timeout" if is_timeout else "network",
-                retryable=True,
-            ) from exc
-        result = _decode_response(resp)
+            raise TDAMTransportError("network", f"POST {path} network failure") from exc
         logger.debug("Response %s status=%s", path, resp.status_code)
-        return result
+        return _decode_response(resp)
 
     async def close(self) -> None:
         if isinstance(self.client, httpx.AsyncClient):
