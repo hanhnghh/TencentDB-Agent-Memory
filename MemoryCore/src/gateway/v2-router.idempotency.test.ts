@@ -23,7 +23,303 @@ function makeDeps(store: Partial<IMemoryStore>): V2RouterDeps {
   };
 }
 
+async function dispatchConversationAdd(
+  pathname: "/v2/conversation/add" | "/v3/conversation/add",
+  body: Record<string, unknown>,
+  deps: V2RouterDeps,
+  identity: {
+    serviceId?: string;
+    teamId?: string;
+    userId?: string;
+    agentId?: string;
+    taskId?: string;
+  } = {},
+): Promise<{ status: number; envelope: Record<string, unknown> }> {
+  const request = {
+    headers: {
+      authorization: "Bearer test-key",
+      "x-tdai-service-id": identity.serviceId ?? "memory-1",
+      "x-tdai-team-id": identity.teamId ?? "team-1",
+      "x-tdai-user-id": identity.userId ?? "user-1",
+      "x-tdai-agent-id": identity.agentId ?? "agent-1",
+      ...(identity.taskId ? { "x-tdai-task-id": identity.taskId } : {}),
+    },
+  } as http.IncomingMessage;
+  const response = {} as http.ServerResponse;
+  const sendJson = vi.fn();
+
+  const handled = await handleV2Route(
+    request,
+    response,
+    pathname,
+    "POST",
+    async () => body,
+    sendJson,
+    deps,
+  );
+
+  expect(handled).toBe(true);
+  expect(sendJson).toHaveBeenCalledTimes(1);
+  const [, status, envelope] = sendJson.mock.calls[0] as [http.ServerResponse, number, Record<string, unknown>];
+  return { status, envelope };
+}
+
 describe("conversation/add ingestion receipts", () => {
+  it.each(["/v2/conversation/add", "/v3/conversation/add"] as const)(
+    "%s preserves the public legacy contract when source identity is omitted",
+    async (pathname) => {
+      const upsertL0 = vi.fn(() => true);
+      const { status, envelope } = await dispatchConversationAdd(pathname, {
+        session_id: "session-1",
+        messages: [{ role: "user", content: "legacy caller" }],
+      }, makeDeps({ upsertL0 }));
+
+      expect(status).toBe(200);
+      expect(envelope).toMatchObject({
+        code: 0,
+        data: { total_count: 1, accepted_versions: ["v1"] },
+      });
+      expect(conversationAddDataSchema.parse(envelope.data).receipt).toBeUndefined();
+      expect(upsertL0).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(["/v2/conversation/add", "/v3/conversation/add"] as const)(
+    "%s returns the prior lost-ack receipt without repeating writes, notifications, or quota effects",
+    async (pathname) => {
+      const receipts = new Map<string, L0IngestionReceipt>();
+      const commit = vi.fn(async (input: L0IngestionInput) => {
+        const existing = receipts.get(input.receiptKey);
+        if (existing) return { status: "duplicate" as const, receipt: existing };
+        const receipt = {
+          sourceEventId: input.sourceEventId,
+          contentHash: input.contentHash,
+          payloadHash: input.payloadHash,
+          acceptedIds: input.records.map((entry) => entry.record.id),
+          acceptedVersions: input.records.map(() => "v1"),
+          committedAt: "2026-08-08T00:00:00.000Z",
+        };
+        receipts.set(input.receiptKey, receipt);
+        return { status: "committed" as const, receipt };
+      });
+      const notifyPipeline = vi.fn(async () => undefined);
+      const checkMemoryQuota = vi.fn(async () => ({ allowed: true, current: 0, limit: 100 }));
+      const reportMemoryAdded = vi.fn(async () => undefined);
+      const deps = makeDeps({
+        upsertL0: vi.fn(() => true),
+        getL0IngestionReceipt: vi.fn(async (receiptKey: string) => receipts.get(receiptKey)),
+        commitL0Ingestion: commit,
+      } as Partial<IMemoryStore>);
+      deps.notifyPipeline = notifyPipeline;
+      deps.quotaManager = { checkMemoryQuota, reportMemoryAdded } as V2RouterDeps["quotaManager"];
+      const body = {
+        session_id: "session-1",
+        source_event_id: "event-lost-ack",
+        content_hash: "hash-lost-ack",
+        messages: [{ role: "user", content: "hello" }],
+      };
+
+      const first = await dispatchConversationAdd(pathname, body, deps);
+      const replay = await dispatchConversationAdd(pathname, body, deps);
+
+      expect(first.status).toBe(200);
+      expect(first.envelope).toMatchObject({ data: { receipt: { status: "committed" } } });
+      expect(replay.status).toBe(200);
+      expect(replay.envelope).toMatchObject({ data: { receipt: { status: "duplicate" } } });
+      expect(commit).toHaveBeenCalledTimes(1);
+      expect(notifyPipeline).toHaveBeenCalledTimes(1);
+      expect(checkMemoryQuota).toHaveBeenCalledTimes(1);
+      expect(reportMemoryAdded).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(["/v2/conversation/add", "/v3/conversation/add"] as const)(
+    "%s returns HTTP 409 when a source event is reused with different content",
+    async (pathname) => {
+      const priorReceipt: L0IngestionReceipt = {
+        sourceEventId: "event-conflict",
+        contentHash: "hash-original",
+        payloadHash: "payload-original",
+        acceptedIds: ["msg-original"],
+        acceptedVersions: ["v1"],
+        committedAt: "2026-08-08T00:00:00.000Z",
+      };
+      const deps = makeDeps({
+        upsertL0: vi.fn(() => true),
+        getL0IngestionReceipt: vi.fn(async () => priorReceipt),
+        commitL0Ingestion: vi.fn(),
+      } as Partial<IMemoryStore>);
+
+      const { status, envelope } = await dispatchConversationAdd(pathname, {
+        session_id: "session-1",
+        source_event_id: "event-conflict",
+        content_hash: "hash-changed",
+        messages: [{ role: "user", content: "changed" }],
+      }, deps);
+
+      expect(status).toBe(409);
+      expect(envelope).toMatchObject({
+        code: 409,
+        data: {
+          source_event_id: "event-conflict",
+          expected_content_hash: "hash-original",
+          actual_content_hash: "hash-changed",
+        },
+      });
+    },
+  );
+
+  it.each([
+    { pathname: "/v2/conversation/add" as const, sourceEvent: false },
+    { pathname: "/v3/conversation/add" as const, sourceEvent: false },
+    { pathname: "/v2/conversation/add" as const, sourceEvent: true },
+    { pathname: "/v3/conversation/add" as const, sourceEvent: true },
+  ])("$pathname does not acknowledge storage failure (source_event_id=$sourceEvent)", async ({ pathname, sourceEvent }) => {
+    const notifyPipeline = vi.fn(async () => undefined);
+    const deps = makeDeps({
+      upsertL0: vi.fn(() => false),
+      getL0IngestionReceipt: vi.fn(async () => undefined),
+      commitL0Ingestion: vi.fn(async () => ({ status: "failed" as const })),
+    } as Partial<IMemoryStore>);
+    deps.notifyPipeline = notifyPipeline;
+    const body = {
+      session_id: "session-1",
+      ...(sourceEvent ? { source_event_id: "event-storage-failure" } : {}),
+      messages: [{ role: "user", content: "must persist" }],
+    };
+
+    const { status, envelope } = await dispatchConversationAdd(pathname, body, deps);
+
+    expect(status).toBe(503);
+    expect(envelope).toMatchObject({ code: 503, data: { retryable: true } });
+    expect(notifyPipeline).not.toHaveBeenCalled();
+  });
+
+  it.each(["serviceId", "teamId", "userId", "agentId", "taskId", "sessionId"] as const)(
+    "scopes public receipt and message identity by %s",
+    async (dimension) => {
+      const receiptKeys: string[] = [];
+      const messageIds: string[] = [];
+      const deps = makeDeps({
+        upsertL0: vi.fn(() => true),
+        getL0IngestionReceipt: vi.fn(async () => undefined),
+        commitL0Ingestion: vi.fn(async (input: L0IngestionInput) => {
+          receiptKeys.push(input.receiptKey);
+          messageIds.push(input.records[0].record.id);
+          return {
+            status: "committed" as const,
+            receipt: {
+              sourceEventId: input.sourceEventId,
+              contentHash: input.contentHash,
+              payloadHash: input.payloadHash,
+              acceptedIds: [input.records[0].record.id],
+              acceptedVersions: ["v1"],
+              committedAt: "2026-08-08T00:00:00.000Z",
+            },
+          };
+        }),
+      } as Partial<IMemoryStore>);
+      const baseIdentity = {
+        serviceId: "memory-1",
+        teamId: "team-1",
+        userId: "user-1",
+        agentId: "agent-1",
+        taskId: "task-1",
+      };
+      const changedIdentity = {
+        ...baseIdentity,
+        ...(dimension === "sessionId" ? {} : { [dimension]: `${dimension}-2` }),
+      };
+      const baseBody = {
+        session_id: "session-1",
+        source_event_id: "event-shared",
+        messages: [{ role: "user", content: "same event" }],
+      };
+      const changedBody = dimension === "sessionId" ? { ...baseBody, session_id: "session-2" } : baseBody;
+
+      await dispatchConversationAdd("/v3/conversation/add", baseBody, deps, baseIdentity);
+      await dispatchConversationAdd("/v3/conversation/add", changedBody, deps, changedIdentity);
+
+      expect(new Set(receiptKeys).size).toBe(2);
+      expect(new Set(messageIds).size).toBe(2);
+    },
+  );
+
+  it.each([
+    { field: "source_event_id", length: 0, expectedStatus: 400 },
+    { field: "source_event_id", length: 1, expectedStatus: 200 },
+    { field: "source_event_id", length: 512, expectedStatus: 200 },
+    { field: "source_event_id", length: 513, expectedStatus: 400 },
+    { field: "content_hash", length: 0, expectedStatus: 400 },
+    { field: "content_hash", length: 1, expectedStatus: 200 },
+    { field: "content_hash", length: 256, expectedStatus: 200 },
+    { field: "content_hash", length: 257, expectedStatus: 400 },
+  ])("validates $field length $length at the public route", async ({ field, length, expectedStatus }) => {
+    const deps = makeDeps({
+      upsertL0: vi.fn(() => true),
+      getL0IngestionReceipt: vi.fn(async () => undefined),
+      commitL0Ingestion: vi.fn(async (input: L0IngestionInput) => ({
+        status: "committed" as const,
+        receipt: {
+          sourceEventId: input.sourceEventId,
+          contentHash: input.contentHash,
+          payloadHash: input.payloadHash,
+          acceptedIds: input.records.map(({ record }) => record.id),
+          acceptedVersions: input.records.map(() => "v1"),
+          committedAt: "2026-08-08T00:00:00.000Z",
+        },
+      })),
+    } as Partial<IMemoryStore>);
+    const body = {
+      session_id: "session-1",
+      source_event_id: field === "source_event_id" ? "x".repeat(length) : "event-boundary",
+      ...(field === "content_hash" ? { content_hash: "x".repeat(length) } : {}),
+      messages: [{ role: "user", content: "hello" }],
+    };
+
+    const { status } = await dispatchConversationAdd("/v3/conversation/add", body, deps);
+
+    expect(status).toBe(expectedStatus);
+  });
+
+  it.each([
+    { messages: 0, contentLength: 1, expectedStatus: 400 },
+    { messages: 1, contentLength: 0, expectedStatus: 400 },
+    { messages: 1, contentLength: 1, expectedStatus: 200 },
+    { messages: 100, contentLength: 1, expectedStatus: 200 },
+    { messages: 101, contentLength: 1, expectedStatus: 400 },
+    { messages: 1, contentLength: 8192, expectedStatus: 200 },
+    { messages: 1, contentLength: 8193, expectedStatus: 400 },
+  ])(
+    "preserves the public payload boundary messages=$messages contentLength=$contentLength",
+    async ({ messages, contentLength, expectedStatus }) => {
+      const deps = makeDeps({
+        upsertL0: vi.fn(() => true),
+        getL0IngestionReceipt: vi.fn(async () => undefined),
+        commitL0Ingestion: vi.fn(async (input: L0IngestionInput) => ({
+          status: "committed" as const,
+          receipt: {
+            sourceEventId: input.sourceEventId,
+            contentHash: input.contentHash,
+            payloadHash: input.payloadHash,
+            acceptedIds: input.records.map(({ record }) => record.id),
+            acceptedVersions: input.records.map(() => "v1"),
+            committedAt: "2026-08-08T00:00:00.000Z",
+          },
+        })),
+      } as Partial<IMemoryStore>);
+      const body = {
+        session_id: "session-1",
+        source_event_id: "event-payload-boundary",
+        messages: Array.from({ length: messages }, () => ({ role: "user", content: "x".repeat(contentLength) })),
+      };
+
+      const { status } = await dispatchConversationAdd("/v3/conversation/add", body, deps);
+
+      expect(status).toBe(expectedStatus);
+    },
+  );
+
   it("preserves the legacy contract when source identity is omitted", async () => {
     const upsertL0 = vi.fn(() => true);
     const deps = makeDeps({ upsertL0 });
@@ -162,17 +458,17 @@ describe("conversation/add ingestion receipts", () => {
       content_hash: "caller-hash",
     };
 
-    const first = await handleConversationAdd({
+    const first = await dispatchConversationAdd("/v3/conversation/add", {
       ...base,
       messages: [{ role: "user", content: "original" }],
-    }, auth, "req-original", deps);
-    const changed = await handleConversationAdd({
+    }, deps);
+    const changed = await dispatchConversationAdd("/v3/conversation/add", {
       ...base,
       messages: [{ role: "user", content: "changed" }],
-    }, auth, "req-changed", deps);
+    }, deps);
 
-    expect(first.code).toBe(0);
-    expect(changed).toMatchObject({ code: 409 });
+    expect(first.status).toBe(200);
+    expect(changed).toMatchObject({ status: 409, envelope: { code: 409 } });
     expect(commit).toHaveBeenCalledTimes(1);
   });
 
@@ -239,8 +535,8 @@ describe("conversation/add ingestion receipts", () => {
       messages: [{ role: "user", content: "hello" }, { role: "assistant", content: "hi" }],
     };
 
-    await handleConversationAdd(body, auth, "req-a", deps);
-    await handleConversationAdd(body, auth, "req-b", deps);
+    await dispatchConversationAdd("/v3/conversation/add", body, deps);
+    await dispatchConversationAdd("/v3/conversation/add", body, deps);
 
     expect(seenIds[0]).toEqual(seenIds[1]);
     expect(seenIds[0]).toHaveLength(2);

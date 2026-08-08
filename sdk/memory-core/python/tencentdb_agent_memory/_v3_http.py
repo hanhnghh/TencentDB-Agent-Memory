@@ -53,7 +53,7 @@ def _decode_response(resp: httpx.Response) -> dict:
         raise TDAMResponseError("API response must be a JSON object", header_request_id)
 
     code = envelope.get("code")
-    if not isinstance(code, int):
+    if isinstance(code, bool) or not isinstance(code, int):
         raise TDAMResponseError("API response envelope must contain a numeric code", header_request_id)
     if resp.is_error or code != 0:
         effective_code = code if isinstance(code, int) and code != 0 else resp.status_code

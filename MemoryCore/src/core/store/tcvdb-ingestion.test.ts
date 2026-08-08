@@ -111,4 +111,31 @@ describe("TCVDB L0 ingestion receipt durability", () => {
     expect(clientState.l0WriteBatches).toBe(1);
     expect(clientState.receiptWriteBatches).toBe(1);
   });
+
+  it("serializes concurrent duplicate delivery without another L0 or receipt write", async () => {
+    const store = createStore();
+    await store.init();
+
+    const [first, replay] = await Promise.all([
+      store.commitL0Ingestion(ingestion()),
+      store.commitL0Ingestion(ingestion()),
+    ]);
+
+    expect([first.status, replay.status].sort()).toEqual(["committed", "duplicate"]);
+    expect(clientState.l0WriteBatches).toBe(1);
+    expect(clientState.receiptWriteBatches).toBe(1);
+  });
+
+  it("returns conflict for the same event with changed content without another write", async () => {
+    const store = createStore();
+    await store.init();
+
+    const first = await store.commitL0Ingestion(ingestion());
+    const conflict = await store.commitL0Ingestion(ingestion("payload-changed"));
+
+    expect(first.status).toBe("committed");
+    expect(conflict.status).toBe("conflict");
+    expect(clientState.l0WriteBatches).toBe(1);
+    expect(clientState.receiptWriteBatches).toBe(1);
+  });
 });

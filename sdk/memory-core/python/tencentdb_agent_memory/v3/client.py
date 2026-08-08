@@ -49,13 +49,22 @@ def _strip_none(d: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
 
 
-def _validate_conversation_add_result(data: Any, source_event_id: Optional[str]) -> Dict[str, Any]:
+def _validate_conversation_add_result(
+    data: Any,
+    source_event_id: Optional[str],
+    content_hash: Optional[str],
+) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise TDAMResponseError("conversation/add response data must be an object")
     if (
         not isinstance(data.get("accepted_ids"), list)
+        or not all(isinstance(item, str) for item in data["accepted_ids"])
         or not isinstance(data.get("accepted_versions"), list)
+        or not all(isinstance(item, str) for item in data["accepted_versions"])
+        or len(data["accepted_versions"]) != len(data["accepted_ids"])
+        or isinstance(data.get("total_count"), bool)
         or not isinstance(data.get("total_count"), int)
+        or data["total_count"] != len(data["accepted_ids"])
     ):
         raise TDAMResponseError("conversation/add returned malformed receipt data")
     if source_event_id is not None:
@@ -64,6 +73,7 @@ def _validate_conversation_add_result(data: Any, source_event_id: Optional[str])
             not isinstance(receipt, dict)
             or receipt.get("source_event_id") != source_event_id
             or not isinstance(receipt.get("content_hash"), str)
+            or (content_hash is not None and receipt.get("content_hash") != content_hash)
             or receipt.get("status") not in ("committed", "duplicate")
             or not isinstance(receipt.get("committed_at"), str)
         ):
@@ -233,7 +243,7 @@ class MemoryClient:
                 "messages": messages,
             }),
         )
-        return _validate_conversation_add_result(data, source_event_id)
+        return _validate_conversation_add_result(data, source_event_id, content_hash)
 
     def query_conversation(
         self,
@@ -582,7 +592,7 @@ class AsyncMemoryClient:
                 "messages": messages,
             }),
         )
-        return _validate_conversation_add_result(data, source_event_id)
+        return _validate_conversation_add_result(data, source_event_id, content_hash)
 
     async def query_conversation(
         self,

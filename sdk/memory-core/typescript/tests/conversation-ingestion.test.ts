@@ -6,6 +6,7 @@ import { MemoryClient } from "../src/v3/client.js";
 import { V3HttpTransport } from "../src/v3/http.js";
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -83,6 +84,61 @@ describe("v3 conversation ingestion contract", () => {
     expect(error).toMatchObject({ kind: "malformed", retryable: true });
   });
 
+  it("rejects mismatched success counts with a typed malformed-response error", async () => {
+    const client = new MemoryClient({ post: vi.fn(async () => ({
+      accepted_ids: ["msg-1"],
+      accepted_versions: [],
+      total_count: 2,
+      receipt: {
+        source_event_id: "event-counts",
+        content_hash: "hash-counts",
+        status: "committed" as const,
+        committed_at: "2026-08-08T00:00:00.000Z",
+      },
+    })) } as Transport, {
+      team_id: "team-1",
+      agent_id: "agent-1",
+      user_id: "user-1",
+      session_id: "session-1",
+    });
+
+    const error = await client.addConversation({
+      source_event_id: "event-counts",
+      content_hash: "hash-counts",
+      messages: [{ role: "user", content: "hello" }],
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(TDAMResponseError);
+    expect(error).toMatchObject({ kind: "malformed", retryable: true });
+  });
+
+  it("rejects a receipt whose content hash mismatches the request", async () => {
+    const client = new MemoryClient({ post: vi.fn(async () => ({
+      accepted_ids: ["msg-1"],
+      accepted_versions: ["v1"],
+      total_count: 1,
+      receipt: {
+        source_event_id: "event-hash",
+        content_hash: "different-hash",
+        status: "committed" as const,
+        committed_at: "2026-08-08T00:00:00.000Z",
+      },
+    })) } as Transport, {
+      team_id: "team-1",
+      agent_id: "agent-1",
+      user_id: "user-1",
+      session_id: "session-1",
+    });
+
+    const error = await client.addConversation({
+      source_event_id: "event-hash",
+      content_hash: "expected-hash",
+      messages: [{ role: "user", content: "hello" }],
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(TDAMResponseError);
+  });
+
   it("wraps network failures in a typed retryable transport error", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => {
       throw new TypeError("fetch failed");
@@ -99,7 +155,27 @@ describe("v3 conversation ingestion contract", () => {
     expect(error).toMatchObject({ kind: "network", retryable: true });
   });
 
-  it.each([408, 429, 503])("classifies HTTP %i as a typed retryable API error", async (status) => {
+  it("wraps timeouts in a typed retryable timeout error", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+    })));
+    const transport = new V3HttpTransport({
+      endpoint: "http://memory-core.test",
+      apiKey: "key",
+      serviceId: "memory-1",
+      timeout: 10,
+    });
+    const response = transport.post("/v3/conversation/add", {}).catch((caught: unknown) => caught);
+
+    await vi.advanceTimersByTimeAsync(10);
+    const error = await response;
+
+    expect(error).toBeInstanceOf(TDAMTransportError);
+    expect(error).toMatchObject({ kind: "timeout", retryable: true });
+  });
+
+  it.each([408, 429, 500, 503, 599])("classifies HTTP %i as a typed retryable API error", async (status) => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
       code: status,
       message: "temporarily unavailable",

@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional
 
 import httpx
 
-from .errors import TDAMError
+from .errors import TDAMError, TDAMResponseError, TDAMTransportError
 
 logger = logging.getLogger(__name__)
 
@@ -76,30 +76,19 @@ class HttpStub(Stub):
     def post(self, path: str, body: dict, timeout: Optional[float] = None) -> dict:
         url = f"{self.endpoint}{path}"
         logger.debug("Request %s %s", path, body)
-        resp = self.client.post(
-            url=url,
-            json=body,
-            headers=self.headers,
-            timeout=timeout or self.client.timeout,
-        )
-        logger.debug("Response %s %s", path, resp.text)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") != 0:
-            req_id = resp.headers.get("x-qcloud-transaction-id", data.get("request_id", ""))
-            payload = data.get("data")
-            details = payload if isinstance(payload, dict) else None
-            raise TDAMError(
-                code=data.get("code", -1),
-                message=data.get("message", "unknown error"),
-                request_id=req_id,
-                details=details,
+        try:
+            resp = self.client.post(
+                url=url,
+                json=body,
+                headers=self.headers,
+                timeout=timeout or self.client.timeout,
             )
-        result: dict = data.get("data", {})
-        trace_id = resp.headers.get("x-trace-id")
-        if trace_id:
-            result["trace_id"] = trace_id
-        return result
+        except httpx.TimeoutException as exc:
+            raise TDAMTransportError("timeout", f"POST {path} timed out") from exc
+        except httpx.RequestError as exc:
+            raise TDAMTransportError("network", f"POST {path} network failure") from exc
+        logger.debug("Response %s %s", path, resp.text)
+        return _decode_response(resp)
 
     def close(self) -> None:
         if isinstance(self.client, httpx.Client):
@@ -136,31 +125,59 @@ class AsyncHttpStub:
     async def post(self, path: str, body: dict, timeout: Optional[float] = None) -> dict:
         url = f"{self.endpoint}{path}"
         logger.debug("Request %s %s", path, body)
-        resp = await self.client.post(
-            url=url,
-            json=body,
-            headers=self.headers,
-            timeout=timeout or self.client.timeout,
-        )
-        logger.debug("Response %s %s", path, resp.text)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") != 0:
-            req_id = resp.headers.get("x-qcloud-transaction-id", data.get("request_id", ""))
-            payload = data.get("data")
-            details = payload if isinstance(payload, dict) else None
-            raise TDAMError(
-                code=data.get("code", -1),
-                message=data.get("message", "unknown error"),
-                request_id=req_id,
-                details=details,
+        try:
+            resp = await self.client.post(
+                url=url,
+                json=body,
+                headers=self.headers,
+                timeout=timeout or self.client.timeout,
             )
-        result: dict = data.get("data", {})
-        trace_id = resp.headers.get("x-trace-id")
-        if trace_id:
-            result["trace_id"] = trace_id
-        return result
+        except httpx.TimeoutException as exc:
+            raise TDAMTransportError("timeout", f"POST {path} timed out") from exc
+        except httpx.RequestError as exc:
+            raise TDAMTransportError("network", f"POST {path} network failure") from exc
+        logger.debug("Response %s %s", path, resp.text)
+        return _decode_response(resp)
 
     async def close(self) -> None:
         if isinstance(self.client, httpx.AsyncClient):
             await self.client.aclose()
+
+
+def _decode_response(resp: httpx.Response) -> dict:
+    request_id = (
+        resp.headers.get("x-qcloud-transaction-id")
+        or resp.headers.get("x-trace-id")
+        or ""
+    )
+    try:
+        envelope = resp.json()
+    except ValueError as exc:
+        message = resp.text or f"HTTP {resp.status_code} returned a non-JSON response"
+        if resp.is_error:
+            raise TDAMError(resp.status_code, message, request_id) from exc
+        raise TDAMResponseError(message, request_id) from exc
+
+    code = envelope.get("code") if isinstance(envelope, dict) else None
+    if isinstance(code, bool) or not isinstance(code, int):
+        raise TDAMResponseError(
+            "API response envelope must be an object with a numeric code",
+            request_id,
+        )
+    if resp.is_error or code != 0:
+        effective_code = code if code != 0 else resp.status_code
+        payload = envelope.get("data")
+        details = payload if isinstance(payload, dict) else None
+        raise TDAMError(
+            code=effective_code,
+            message=str(envelope.get("message") or f"HTTP {resp.status_code}"),
+            request_id=str(envelope.get("request_id") or request_id),
+            details=details,
+        )
+    result = envelope.get("data") or {}
+    if not isinstance(result, dict):
+        raise TDAMResponseError("API response data must be a JSON object", request_id)
+    trace_id = resp.headers.get("x-trace-id")
+    if trace_id:
+        result["trace_id"] = trace_id
+    return result

@@ -26,6 +26,7 @@ const identity: TdaiIdentity = {
 };
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -111,7 +112,87 @@ describe("TdaiClient L0 write contract", () => {
     expect(result.receipts.map((receipt) => receipt.status)).toEqual(["duplicate", "committed"]);
   });
 
-  it.each([408, 429, 503])("surfaces HTTP %i write failures as typed retryable errors", async (status) => {
+  it.each([
+    { count: 100, expectedBatches: 1 },
+    { count: 101, expectedBatches: 2 },
+  ])("preserves the $count-message batch boundary without dropping content", async ({ count, expectedBatches }) => {
+    const batches: Array<Array<{ content: string }>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as {
+        source_event_id: string;
+        content_hash: string;
+        messages: Array<{ content: string }>;
+      };
+      batches.push(body.messages);
+      const acceptedIds = body.messages.map((_, index) => `${body.source_event_id}-${index}`);
+      return new Response(JSON.stringify({
+        code: 0,
+        data: {
+          accepted_ids: acceptedIds,
+          accepted_versions: acceptedIds.map(() => "v1"),
+          total_count: acceptedIds.length,
+          receipt: {
+            source_event_id: body.source_event_id,
+            content_hash: body.content_hash,
+            status: "committed",
+            committed_at: "2026-08-08T00:00:00.000Z",
+          },
+        },
+      }), { status: 200 });
+    }));
+    const messages = Array.from({ length: count }, (_, index) => ({
+      role: "user" as const,
+      content: `message-${index}`,
+    }));
+
+    const result = await new TdaiClient(config).addConversation(identity, messages, { sourceEventId: "boundary" });
+
+    expect(batches).toHaveLength(expectedBatches);
+    expect(batches.flat().map(({ content }) => content)).toEqual(messages.map(({ content }) => content));
+    expect(result.totalCount).toBe(count);
+  });
+
+  it.each([
+    { chars: 8192, expectedChunks: 1 },
+    { chars: 8193, expectedChunks: 2 },
+  ])("preserves all content at the $chars-character message boundary", async ({ chars, expectedChunks }) => {
+    const chunks: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as {
+        source_event_id: string;
+        content_hash: string;
+        messages: Array<{ content: string }>;
+      };
+      chunks.push(...body.messages.map(({ content }) => content));
+      const acceptedIds = body.messages.map((_, index) => `${body.source_event_id}-${index}`);
+      return new Response(JSON.stringify({
+        code: 0,
+        data: {
+          accepted_ids: acceptedIds,
+          accepted_versions: acceptedIds.map(() => "v1"),
+          total_count: acceptedIds.length,
+          receipt: {
+            source_event_id: body.source_event_id,
+            content_hash: body.content_hash,
+            status: "committed",
+            committed_at: "2026-08-08T00:00:00.000Z",
+          },
+        },
+      }), { status: 200 });
+    }));
+    const content = "x".repeat(chars);
+
+    await new TdaiClient(config).addConversation(
+      identity,
+      [{ role: "user", content }],
+      { sourceEventId: "content-boundary" },
+    );
+
+    expect(chunks).toHaveLength(expectedChunks);
+    expect(chunks.join("")).toBe(content);
+  });
+
+  it.each([408, 429, 500, 503, 599])("surfaces HTTP %i write failures as typed retryable errors", async (status) => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(
       JSON.stringify({ code: status, message: "storage unavailable", request_id: "req-http" }),
       { status, headers: { "content-type": "application/json" } },
@@ -139,6 +220,48 @@ describe("TdaiClient L0 write contract", () => {
     expect(error).toMatchObject({ kind: "http", status: 503, retryable: true });
   });
 
+  it("surfaces a permanent HTTP 400 write failure as typed and non-retryable", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      JSON.stringify({ code: 400, message: "invalid request", request_id: "req-http-400" }),
+      { status: 400, headers: { "content-type": "application/json" } },
+    )));
+
+    const error = await new TdaiClient(config)
+      .addConversation(identity, [{ role: "user", content: "hello" }], { sourceEventId: "event-http-400" })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(TdaiWriteError);
+    expect(error).toMatchObject({ kind: "http", status: 400, retryable: false });
+  });
+
+  it("does not retry a permanent 4xx write failure", async () => {
+    const write = vi.fn(async () => {
+      throw new TdaiWriteError("http", "invalid request", false, 400);
+    });
+
+    await expect(withL0Retry(write, { attempts: 3, baseMs: 0 })).rejects.toMatchObject({
+      status: 400,
+      retryable: false,
+    });
+    expect(write).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces a write timeout as a typed retryable timeout error", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+    })));
+    const write = new TdaiClient({ ...config, timeoutMs: 10 })
+      .addConversation(identity, [{ role: "user", content: "hello" }], { sourceEventId: "event-timeout" })
+      .catch((caught: unknown) => caught);
+
+    await vi.advanceTimersByTimeAsync(10);
+    const error = await write;
+
+    expect(error).toBeInstanceOf(TdaiWriteError);
+    expect(error).toMatchObject({ kind: "timeout", retryable: true });
+  });
+
   it("rejects a success envelope with a malformed receipt", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(
       JSON.stringify({ code: 0, message: "ok", request_id: "req-malformed", data: {} }),
@@ -147,6 +270,33 @@ describe("TdaiClient L0 write contract", () => {
 
     const error = await new TdaiClient(config)
       .addConversation(identity, [{ role: "user", content: "hello" }], { sourceEventId: "event-malformed" })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(TdaiWriteError);
+    expect(error).toMatchObject({ kind: "malformed", retryable: true });
+  });
+
+  it("rejects mismatched success counts as a malformed response", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as { source_event_id: string; content_hash: string };
+      return new Response(JSON.stringify({
+        code: 0,
+        data: {
+          accepted_ids: ["msg-1"],
+          accepted_versions: [],
+          total_count: 2,
+          receipt: {
+            source_event_id: body.source_event_id,
+            content_hash: body.content_hash,
+            status: "committed",
+            committed_at: "2026-08-08T00:00:00.000Z",
+          },
+        },
+      }), { status: 200 });
+    }));
+
+    const error = await new TdaiClient(config)
+      .addConversation(identity, [{ role: "user", content: "hello" }], { sourceEventId: "event-counts" })
       .catch((caught: unknown) => caught);
 
     expect(error).toBeInstanceOf(TdaiWriteError);
@@ -170,5 +320,19 @@ describe("TdaiClient L0 write contract", () => {
       .addConversation(identity, [{ role: "user", content: "hello" }], { sourceEventId: "event-conflict" })
       .catch((caught: unknown) => caught);
     expect(envelopeError).toMatchObject({ kind: "envelope", code: 40901, retryable: false });
+  });
+
+  it("keeps read-path retrieval fail-soft while write failures stay observable", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      throw new TypeError("fetch failed");
+    }));
+    const client = new TdaiClient(config);
+
+    await expect(client.searchL1(identity, "query")).resolves.toEqual([]);
+    await expect(client.addConversation(
+      identity,
+      [{ role: "user", content: "hello" }],
+      { sourceEventId: "event-write-failure" },
+    )).rejects.toMatchObject({ kind: "network", retryable: true });
   });
 });

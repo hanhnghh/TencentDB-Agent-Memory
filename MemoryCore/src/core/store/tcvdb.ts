@@ -180,6 +180,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
   private readonly l1Collection: string;
   private readonly l0Collection: string;
   private readonly l0ReceiptsCollection: string;
+  private readonly l0IngestionTails = new Map<string, Promise<void>>();
   private readonly profilesCollection: string;
   private readonly auditCollection: string;
   private readonly knowledgeCollection: string;
@@ -975,6 +976,15 @@ export class TcvdbMemoryStore implements IMemoryStore {
   }
 
   async commitL0Ingestion(input: L0IngestionInput): Promise<L0IngestionCommitResult> {
+    const prior = this.l0IngestionTails.get(input.receiptKey) ?? Promise.resolve();
+    let release: () => void = () => undefined;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = prior.then(() => current);
+    this.l0IngestionTails.set(input.receiptKey, tail);
+    await prior;
+
     try {
       await this._ensureInit();
       if (this.degraded) return { status: "failed" };
@@ -1018,6 +1028,11 @@ export class TcvdbMemoryStore implements IMemoryStore {
         `${TAG} [L0-ingestion] FAILED event=${input.sourceEventId}: ${err instanceof Error ? err.message : String(err)}`,
       );
       return { status: "failed" };
+    } finally {
+      release();
+      if (this.l0IngestionTails.get(input.receiptKey) === tail) {
+        this.l0IngestionTails.delete(input.receiptKey);
+      }
     }
   }
 

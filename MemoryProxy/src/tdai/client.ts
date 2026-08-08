@@ -20,7 +20,7 @@ interface TdaiEnvelope<T = unknown> {
   data?: T;
 }
 
-export type TdaiWriteErrorKind = "network" | "http" | "envelope" | "malformed";
+export type TdaiWriteErrorKind = "network" | "timeout" | "http" | "envelope" | "malformed";
 
 /** Typed write-path failure; read-path calls intentionally remain fail-soft. */
 export class TdaiWriteError extends Error {
@@ -382,7 +382,8 @@ export class TdaiClient {
           body: JSON.stringify(stripUndefined(body)),
         });
       } catch (err) {
-        throw new TdaiWriteError("network", `tdai POST ${path} network failure`, true, undefined, undefined, undefined, {
+        const timedOut = controller.signal.aborted;
+        throw new TdaiWriteError(timedOut ? "timeout" : "network", `tdai POST ${path} ${timedOut ? "timed out" : "network failure"}`, true, undefined, undefined, undefined, {
           cause: err,
         });
       }
@@ -442,13 +443,20 @@ export class TdaiClient {
       if (
         !data
         || !Array.isArray(data.accepted_ids)
+        || !data.accepted_ids.every((id) => typeof id === "string")
         || !Array.isArray(data.accepted_versions)
-        || typeof data.total_count !== "number"
+        || !data.accepted_versions.every((version) => typeof version === "string")
+        || data.accepted_versions.length !== data.accepted_ids.length
+        || !Number.isInteger(data.total_count)
+        || data.total_count !== data.accepted_ids.length
       ) {
         throw new TdaiWriteError("malformed", `tdai POST ${path} response has malformed conversation receipt data`, true, response.status);
       }
       const expectedSourceEventId = body.source_event_id;
-      if (expectedSourceEventId !== undefined && !isConversationReceipt(data.receipt, expectedSourceEventId)) {
+      if (
+        expectedSourceEventId !== undefined
+        && !isConversationReceipt(data.receipt, expectedSourceEventId, body.content_hash)
+      ) {
         throw new TdaiWriteError("malformed", `tdai POST ${path} response has malformed or mismatched receipt`, true, response.status);
       }
       return data;
@@ -565,11 +573,16 @@ function normalizeStatusCode(code: number): number {
   return digits.length > 3 ? Number(digits.slice(0, 3)) : code;
 }
 
-function isConversationReceipt(value: unknown, sourceEventId: unknown): value is TdaiConversationReceipt {
+function isConversationReceipt(
+  value: unknown,
+  sourceEventId: unknown,
+  contentHash: unknown,
+): value is TdaiConversationReceipt {
   if (!value || typeof value !== "object") return false;
   const receipt = value as Record<string, unknown>;
   return receipt.source_event_id === sourceEventId
     && typeof receipt.content_hash === "string"
+    && (contentHash === undefined || receipt.content_hash === contentHash)
     && (receipt.status === "committed" || receipt.status === "duplicate")
     && typeof receipt.committed_at === "string";
 }

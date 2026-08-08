@@ -170,8 +170,12 @@ export class MemoryClient {
     if (
       !data
       || !Array.isArray(data.accepted_ids)
+      || !data.accepted_ids.every((id) => typeof id === "string")
       || !Array.isArray(data.accepted_versions)
-      || typeof data.total_count !== "number"
+      || !data.accepted_versions.every((version) => typeof version === "string")
+      || data.accepted_versions.length !== data.accepted_ids.length
+      || !Number.isInteger(data.total_count)
+      || data.total_count !== data.accepted_ids.length
     ) {
       throw new TDAMResponseError("conversation/add returned malformed receipt data");
     }
@@ -181,6 +185,7 @@ export class MemoryClient {
         !receipt
         || receipt.source_event_id !== params.source_event_id
         || typeof receipt.content_hash !== "string"
+        || (params.content_hash !== undefined && receipt.content_hash !== params.content_hash)
         || (receipt.status !== "committed" && receipt.status !== "duplicate")
         || typeof receipt.committed_at !== "string"
       ) {

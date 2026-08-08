@@ -58,4 +58,20 @@ describe("SQLite L0 ingestion receipt durability", () => {
     expect(conflict.status).toBe("conflict");
     expect(count).toBe(1);
   });
+
+  it("returns conflict for the same event with changed content without adding another L0 record", () => {
+    const dir = mkdtempSync(join(tmpdir(), "memory-core-ingestion-conflict-"));
+    tempDirs.push(dir);
+    const store = new VectorStore(join(dir, "vectors.db"), 0);
+    store.init();
+
+    const first = store.commitL0Ingestion(ingestion());
+    const conflict = store.commitL0Ingestion(ingestion("content-2", "payload-2"));
+    const count = store.countL0({ sessionId: "session-1" });
+    store.close();
+
+    expect(first.status).toBe("committed");
+    expect(conflict.status).toBe("conflict");
+    expect(count).toBe(1);
+  });
 });

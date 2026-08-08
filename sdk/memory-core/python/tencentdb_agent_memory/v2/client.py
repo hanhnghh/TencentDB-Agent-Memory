@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from .._http import AsyncHttpStub, HttpStub, Stub
 from ..cos import AsyncMemoryFileReader, AsyncStsCredentialManager, MemoryFileReader, StsCredentialManager
+from ..errors import TDAMResponseError
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,43 @@ def _id_fields(
         "user_id": user_id,
         "task_id": task_id,
     })
+
+
+def _validate_conversation_add_result(
+    data: Any,
+    source_event_id: Optional[str],
+    content_hash: Optional[str],
+) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        raise TDAMResponseError("conversation/add response data must be an object")
+    accepted_ids = data.get("accepted_ids")
+    accepted_versions = data.get("accepted_versions")
+    total_count = data.get("total_count")
+    if (
+        not isinstance(accepted_ids, list)
+        or not all(isinstance(item, str) for item in accepted_ids)
+        or not isinstance(accepted_versions, list)
+        or not all(isinstance(item, str) for item in accepted_versions)
+        or len(accepted_versions) != len(accepted_ids)
+        or isinstance(total_count, bool)
+        or not isinstance(total_count, int)
+        or total_count != len(accepted_ids)
+    ):
+        raise TDAMResponseError("conversation/add returned malformed receipt data")
+    if source_event_id is not None:
+        receipt = data.get("receipt")
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("source_event_id") != source_event_id
+            or not isinstance(receipt.get("content_hash"), str)
+            or (content_hash is not None and receipt.get("content_hash") != content_hash)
+            or receipt.get("status") not in ("committed", "duplicate")
+            or not isinstance(receipt.get("committed_at"), str)
+        ):
+            raise TDAMResponseError(
+                "conversation/add returned a malformed or mismatched source-event receipt"
+            )
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -112,16 +150,21 @@ class MemoryClient:
         agent_id: Optional[str] = None,
         user_id: Optional[str] = None,
         task_id: Optional[str] = None,
+        source_event_id: Optional[str] = None,
+        content_hash: Optional[str] = None,
     ) -> Dict[str, Any]:
         """``POST /conversation/add``"""
-        return self._stub.post(
+        data = self._stub.post(
             f"{_V2}/conversation/add",
-            {
+            _strip_none({
                 **_id_fields(team_id, agent_id, user_id, task_id),
                 "session_id": session_id,
+                "source_event_id": source_event_id,
+                "content_hash": content_hash,
                 "messages": messages,
-            },
+            }),
         )
+        return _validate_conversation_add_result(data, source_event_id, content_hash)
 
     def query_conversation(
         self,
@@ -582,10 +625,14 @@ class AsyncMemoryClient:
         *,
         timeout: float = 30,
         verify: bool = False,
+        stub: Optional[Any] = None,
     ) -> None:
-        if not service_id:
-            raise ValueError("service_id must be provided")
-        self._stub = AsyncHttpStub(endpoint, api_key, service_id, timeout=timeout, verify=verify)
+        if stub is not None:
+            self._stub = stub
+        else:
+            if not service_id:
+                raise ValueError("service_id must be provided")
+            self._stub = AsyncHttpStub(endpoint, api_key, service_id, timeout=timeout, verify=verify)
 
         # Memory file reader (lazy init)
         self._cos_reader: Optional[AsyncMemoryFileReader] = None
@@ -598,12 +645,18 @@ class AsyncMemoryClient:
         *,
         team_id: Optional[str] = None, agent_id: Optional[str] = None,
         user_id: Optional[str] = None, task_id: Optional[str] = None,
+        source_event_id: Optional[str] = None,
+        content_hash: Optional[str] = None,
     ) -> Dict[str, Any]:
-        return await self._stub.post(
+        data = await self._stub.post(
             f"{_V2}/conversation/add",
-            {**_id_fields(team_id, agent_id, user_id, task_id),
-             "session_id": session_id, "messages": messages},
+            _strip_none({**_id_fields(team_id, agent_id, user_id, task_id),
+                         "session_id": session_id,
+                         "source_event_id": source_event_id,
+                         "content_hash": content_hash,
+                         "messages": messages}),
         )
+        return _validate_conversation_add_result(data, source_event_id, content_hash)
 
     async def query_conversation(
         self, *, session_id: Optional[str] = None, limit: Optional[int] = None,
