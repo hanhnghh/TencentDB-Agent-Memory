@@ -187,6 +187,27 @@ function wrapAuthenticationError(rejectReason: string | undefined): CodexBinding
   );
 }
 
+function assertMetadataEntities(
+  scope: string,
+  items: unknown[],
+  requiredFields: string[],
+): void {
+  const malformed = items.some((item) => (
+    !item ||
+    typeof item !== "object" ||
+    requiredFields.some((field) => (
+      typeof (item as Record<string, unknown>)[field] !== "string" ||
+      !(item as Record<string, string>)[field].trim()
+    ))
+  ));
+  if (malformed) {
+    throw new CodexBindingError(
+      "validation_failed",
+      `Unable to validate ${scope}: MemoryCore metadata returned malformed data`,
+    );
+  }
+}
+
 async function atomicWriteJson(path: string, value: unknown, mode: number): Promise<void> {
   const parent = dirname(path);
   await mkdir(parent, { recursive: true, mode: mode === 0o600 ? 0o700 : 0o755 });
@@ -563,6 +584,7 @@ export async function bindCodexProject(
   } catch (error) {
     throw wrapValidationError("Team", error);
   }
+  assertMetadataEntities("Team", teams, ["team_id"]);
   if (!teams.some((team) => team.team_id === teamId)) {
     throw new CodexBindingError(
       "invalid_team",
@@ -580,6 +602,8 @@ export async function bindCodexProject(
   } catch (error) {
     throw wrapValidationError("Agent/Task scope", error);
   }
+  assertMetadataEntities("Agent", agents, ["agent_id", "team_id"]);
+  assertMetadataEntities("Task", tasks, ["task_id", "team_id"]);
   if (!agents.some((agent) => agent.agent_id === agentId && agent.team_id === teamId)) {
     throw new CodexBindingError(
       "invalid_agent",

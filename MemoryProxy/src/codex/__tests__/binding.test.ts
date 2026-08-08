@@ -156,7 +156,23 @@ describe("validated Codex project binding", () => {
     await expect(readFile(resolveCredentialPath(userConfigDir))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("rejects missing, cross-team, or unauthorized IDs without persistence", async () => {
+  it.each([
+    {
+      label: "Team",
+      ids: { teamId: "team-other", agentId: "agent-1", taskId: "task-1" },
+      message: "Team 'team-other' is missing or unauthorized for the verified user",
+    },
+    {
+      label: "Agent",
+      ids: { teamId: "team-1", agentId: "agent-other", taskId: "task-1" },
+      message: "Agent 'agent-other' is missing or unauthorized for Team 'team-1'",
+    },
+    {
+      label: "Task",
+      ids: { teamId: "team-1", agentId: "agent-1", taskId: "task-other" },
+      message: "Task 'task-other' is missing or unauthorized for Team 'team-1'",
+    },
+  ])("rejects a missing or unauthorized $label without persistence", async ({ ids, message }) => {
     const root = await makeTempRoot();
     const projectDir = join(root, "project");
     const userConfigDir = join(root, "user-config");
@@ -171,11 +187,9 @@ describe("validated Codex project binding", () => {
       serviceId: "memory-1",
       serviceToken: "service-secret",
       userKey: "user-key-secret",
-      teamId: "team-1",
-      agentId: "agent-other",
-      taskId: "task-1",
+      ...ids,
       fetcher,
-    })).rejects.toThrow("Agent 'agent-other' is missing or unauthorized for Team 'team-1'");
+    })).rejects.toThrow(message);
 
     await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(resolveCredentialPath(userConfigDir))).rejects.toMatchObject({ code: "ENOENT" });
@@ -386,6 +400,46 @@ describe("validated Codex project binding", () => {
 
     await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(resolveCredentialPath(userConfigDir))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects malformed metadata entities with a clear validation error", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    const userConfigDir = join(root, "user-config");
+    await mkdir(projectDir);
+    const base = successfulApi();
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/v3/meta/team/list") {
+        return jsonResponse({
+          code: 0,
+          data: { items: [null], total: 1, limit: 100, offset: 0 },
+        });
+      }
+      return base(input, init);
+    }) as typeof fetch;
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir,
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      fetcher,
+    })).rejects.toMatchObject({
+      code: "validation_failed",
+      message: "Unable to validate Team: MemoryCore metadata returned malformed data",
+    });
+
+    await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH)))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(resolveCredentialPath(userConfigDir)))
+      .rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("refuses secret-like project preferences before validation or persistence", async () => {
