@@ -342,8 +342,8 @@ describe("memory parity: existing proxy and bridge routes", () => {
     const app = createApp(config);
 
     const health = await app.request("/health");
-    expect(health.status).toBe(503);
-    await expect(health.json()).resolves.toMatchObject({ status: "starting" });
+    expect(health.status).toBe(200);
+    await expect(health.json()).resolves.toMatchObject({ status: "ok" });
 
     const response = await app.request("/codebuddy/mem-space-a/v1/chat/completions", {
       method: "POST",

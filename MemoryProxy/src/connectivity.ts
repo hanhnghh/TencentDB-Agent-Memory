@@ -30,9 +30,9 @@ export async function checkConnectivity(
   }
 
   // Redis
-  if (config.redis.enabled) {
+  if (config.redis.enabled && !config.storage.enabled) {
     probes["redis"] = probeRedis(config.redis);
-  }
+  } else summary["redis"] = "disabled";
 
   // Opik
   if (forwardingEnabled && config.opik.enabled && config.opik.url) {

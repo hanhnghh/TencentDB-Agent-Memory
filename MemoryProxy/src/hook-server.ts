@@ -18,6 +18,7 @@ export function createHookApp(
   const health = options.runtimeHealth ?? new RuntimeHealth(
     config,
     options.memoryRuntimeProvider,
+    { trackConnectivity: false },
   );
   if (!options.runtimeHealth) {
     health.markListenerReady("hooks", config.runtime.hooks.host, config.runtime.hooks.port);

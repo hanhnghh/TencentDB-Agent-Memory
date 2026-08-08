@@ -47,9 +47,13 @@ export class RuntimeHealth {
   constructor(
     private readonly config: ProxyConfig,
     private readonly memoryRuntimeProvider?: MemoryRuntimeProvider,
+    options: { trackConnectivity?: boolean } = {},
   ) {
     this.plan = planRuntime(config);
-    this.connectivity = initialConnectivity(config);
+    this.connectivity = initialConnectivity(
+      config,
+      options.trackConnectivity ?? true,
+    );
     this.listeners = {
       proxy: { ...this.plan.listeners.proxy, ready: false },
       hooks: { ...this.plan.listeners.hooks, ready: false },
@@ -130,9 +134,10 @@ export function runtimeHealthStatusCode(
 
 function initialConnectivity(
   config: ProxyConfig,
+  trackConnectivity: boolean,
 ): Record<string, ConnectivityStatus> {
   const forwarding = config.runtime.mode !== "hooks";
-  return {
+  const statuses: Record<string, ConnectivityStatus> = {
     upstream: forwarding && config.upstream.url ? "pending" : "disabled",
     creditReport: forwarding && config.creditReport.url ? "pending" : "disabled",
     clickhouse: forwarding && config.clickhouse.enabled && config.clickhouse.url
@@ -143,7 +148,7 @@ function initialConnectivity(
       ? "pending"
       : "disabled",
     auth: forwarding && config.auth.enabled && config.auth.url ? "pending" : "disabled",
-    redis: config.redis.enabled ? "pending" : "disabled",
+    redis: config.redis.enabled && !config.storage.enabled ? "pending" : "disabled",
     memoryCore: config.coreSkill.endpoint && config.coreSkill.serviceToken
       ? "pending"
       : "disabled",
@@ -152,4 +157,8 @@ function initialConnectivity(
       ? "pending"
       : "disabled",
   };
+  if (trackConnectivity) return statuses;
+  return Object.fromEntries(
+    Object.keys(statuses).map((name) => [name, "disabled" as const]),
+  );
 }

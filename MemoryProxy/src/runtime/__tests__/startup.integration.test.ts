@@ -179,6 +179,33 @@ describe("mode-aware runtime startup", () => {
     expect(shutdown).toHaveBeenCalledOnce();
   });
 
+  it("continues cleanup when listener close fails", async () => {
+    const config: ProxyConfig = structuredClone(DEFAULT_CONFIG);
+    config.runtime.mode = "proxy";
+    config.creditReport.url = "";
+    config.storage.enabled = true;
+    config.storage.backend = "memory";
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("reachable")));
+    const listenerAdapter: RuntimeListenerAdapter = {
+      listen: async ({ host, port }) => ({
+        host,
+        port,
+        close: async () => {
+          throw new Error("listener close failed");
+        },
+      }),
+    };
+    const shutdown = vi.fn(async () => undefined);
+    const forwardingLoader = async (): Promise<ForwardingRuntime> => ({
+      createApp: () => new Hono(),
+      shutdown,
+    });
+    const running = await startRuntime(config, { listenerAdapter, forwardingLoader });
+
+    await expect(running.stop()).rejects.toThrow("listener close failed");
+    expect(shutdown).toHaveBeenCalledOnce();
+  });
+
   it("starts both listeners separately over one shared health state", async () => {
     const root = await mkdtemp(join(tmpdir(), "both-runtime-startup-"));
     roots.push(root);

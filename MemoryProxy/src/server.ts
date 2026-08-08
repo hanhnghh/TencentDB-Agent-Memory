@@ -29,6 +29,7 @@ export function createApp(config: ProxyConfig, options: CreateAppOptions = {}): 
   const runtimeHealth = options.runtimeHealth ?? new RuntimeHealth(
     config,
     memoryRuntimeProvider,
+    { trackConnectivity: false },
   );
   if (!options.runtimeHealth) {
     runtimeHealth.markListenerReady("proxy", config.server.host, config.server.port);
@@ -39,8 +40,18 @@ export function createApp(config: ProxyConfig, options: CreateAppOptions = {}): 
     handleAnthropicMessages(c, config, memoryRuntimeProvider);
 
   // Hook lifecycle traffic belongs exclusively to the loopback listener.
-  // Reserve the namespace before the public POST catch-all can forward it.
-  app.all("/hooks/*", (c) => c.json({ error: "not_found" }, 404));
+  // Decode before matching so encoded separators cannot bypass the public
+  // namespace reservation and fall through to the LLM forwarding catch-all.
+  app.use("*", async (c, next) => {
+    const classification = classifyPublicPath(c.req.path);
+    if (classification === "hooks") {
+      return c.json({ error: "not_found" }, 404);
+    }
+    if (classification === "malformed") {
+      return c.json({ error: "invalid_path" }, 400);
+    }
+    await next();
+  });
 
   // Eagerly activate storage/bindingRepo so bridge-only requests (no main
   // /v1/messages hits yet) can still recover session state via L2 fallthrough
@@ -208,4 +219,23 @@ export function createApp(config: ProxyConfig, options: CreateAppOptions = {}): 
   app.post("/*", handleOpenAI);
 
   return app;
+}
+
+function classifyPublicPath(path: string): "hooks" | "malformed" | "allowed" {
+  let decoded = path;
+  for (let depth = 0; depth < 3; depth++) {
+    const normalized = decoded.toLowerCase();
+    if (normalized === "/hooks" || normalized.startsWith("/hooks/") ||
+        normalized.startsWith("/hooks%")) {
+      return "hooks";
+    }
+    try {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) return "allowed";
+      decoded = next;
+    } catch {
+      return "malformed";
+    }
+  }
+  return "malformed";
 }

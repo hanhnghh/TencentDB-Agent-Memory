@@ -66,7 +66,7 @@ export async function startRuntime(
   const listeners: RunningListener[] = [];
   let memoryRuntime: ManagedMemoryRuntime | undefined;
   let forwardingRuntime: ForwardingRuntime | undefined;
-  let stopped = false;
+  let stopPromise: Promise<void> | undefined;
 
   initLogger({
     level: config.log.level === "debug" ? "debug" : "info",
@@ -144,21 +144,28 @@ export async function startRuntime(
     return {
       health,
       connectivityChecked,
-      async stop(): Promise<void> {
-        if (stopped) return;
-        stopped = true;
-        await closeListeners(listeners);
-        await connectivityChecked;
-        await forwardingRuntime?.shutdown();
-        await memoryRuntime?.shutdown();
-        await shutdownLogger();
+      stop(): Promise<void> {
+        stopPromise ??= cleanupRuntime({
+          listeners,
+          connectivityChecked,
+          forwardingRuntime,
+          memoryRuntime,
+        }).then((errors) => {
+          throwCleanupErrors(errors, "runtime shutdown failed");
+        });
+        return stopPromise;
       },
     };
   } catch (error: unknown) {
-    await closeListeners(listeners);
-    await forwardingRuntime?.shutdown();
-    await memoryRuntime?.shutdown();
-    await shutdownLogger();
+    const cleanupErrors = await cleanupRuntime({
+      listeners,
+      forwardingRuntime,
+      memoryRuntime,
+    });
+    if (cleanupErrors.length > 0) {
+      const message = error instanceof Error ? error.message : "runtime startup failed";
+      throw new AggregateError([error, ...cleanupErrors], message);
+    }
     throw error;
   }
 }
@@ -182,15 +189,56 @@ async function loadForwardingRuntime(config: ProxyConfig): Promise<ForwardingRun
   return {
     createApp: server.createApp,
     async shutdown(): Promise<void> {
-      await guard.shutdownGuard();
-      await langfuse.shutdownLangfuse();
-      await clickhouse.shutdownClickHouse();
+      const results = await Promise.allSettled([
+        guard.shutdownGuard(),
+        langfuse.shutdownLangfuse(),
+        clickhouse.shutdownClickHouse(),
+      ]);
+      throwCleanupErrors(rejectedReasons(results), "forwarding shutdown failed");
     },
   };
 }
 
 async function closeListeners(listeners: RunningListener[]): Promise<void> {
-  await Promise.all([...listeners].reverse().map((listener) => listener.close()));
+  const results = await Promise.allSettled(
+    [...listeners].reverse().map((listener) => listener.close()),
+  );
+  throwCleanupErrors(rejectedReasons(results), "listener shutdown failed");
+}
+
+async function cleanupRuntime(input: {
+  listeners: RunningListener[];
+  connectivityChecked?: Promise<void>;
+  forwardingRuntime?: ForwardingRuntime;
+  memoryRuntime?: ManagedMemoryRuntime;
+}): Promise<unknown[]> {
+  const errors: unknown[] = [];
+  const steps: Array<() => Promise<unknown>> = [() => closeListeners(input.listeners)];
+  const connectivityChecked = input.connectivityChecked;
+  if (connectivityChecked) steps.push(() => connectivityChecked);
+  const forwardingRuntime = input.forwardingRuntime;
+  if (forwardingRuntime) steps.push(() => forwardingRuntime.shutdown());
+  const memoryRuntime = input.memoryRuntime;
+  if (memoryRuntime) steps.push(() => memoryRuntime.shutdown());
+  steps.push(() => shutdownLogger());
+  for (const step of steps) {
+    try {
+      await step();
+    } catch (error: unknown) {
+      errors.push(error);
+    }
+  }
+  return errors;
+}
+
+function rejectedReasons(results: PromiseSettledResult<unknown>[]): unknown[] {
+  return results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+}
+
+function throwCleanupErrors(errors: unknown[], message: string): void {
+  if (errors.length === 0) return;
+  if (errors.length === 1) throw errors[0];
+  throw new AggregateError(errors, message);
 }
 
 const nodeListenerAdapter: RuntimeListenerAdapter = {

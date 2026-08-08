@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DEFAULT_CONFIG } from "../config.js";
 import { checkConnectivity } from "../connectivity.js";
+import { RuntimeHealth } from "../runtime/health.js";
 import type { ProxyConfig } from "../types.js";
 
 afterEach(() => {
@@ -49,6 +50,25 @@ describe("runtime mode connectivity", () => {
 
     await expect(checkConnectivity(config)).resolves.toMatchObject({
       upstream: "failed",
+    });
+  });
+
+  it("does not probe Redis when configured storage has replaced it", async () => {
+    const config: ProxyConfig = structuredClone(DEFAULT_CONFIG);
+    config.runtime.mode = "hooks";
+    config.upstream.url = "";
+    config.storage.enabled = true;
+    config.storage.backend = "memory";
+    config.redis.enabled = true;
+
+    await expect(checkConnectivity(config)).resolves.toMatchObject({
+      redis: "disabled",
+    });
+    const health = new RuntimeHealth(config);
+    health.markListenerReady("hooks", config.runtime.hooks.host, config.runtime.hooks.port);
+    await expect(health.snapshot()).resolves.toMatchObject({
+      status: "ok",
+      connectivity: { redis: "disabled" },
     });
   });
 });

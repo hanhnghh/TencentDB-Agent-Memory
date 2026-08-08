@@ -51,6 +51,16 @@ describe("runtime mode route isolation", () => {
 
     expect(response.status).toBe(404);
     expect(upstream).not.toHaveBeenCalled();
+
+    for (const path of [
+      "/hooks%2Fsession-start",
+      "/h%6foks%2fsession-start",
+      "/hooks%ZZsession-start",
+    ]) {
+      const encodedResponse = await app.request(path, { method: "POST" });
+      expect([400, 404]).toContain(encodedResponse.status);
+    }
+    expect(upstream).not.toHaveBeenCalled();
   });
 
   it("reports shared listener, durable-store and redacted connectivity state", async () => {
@@ -113,9 +123,21 @@ describe("runtime mode route isolation", () => {
     expect(serialized).not.toContain("memory-secret");
   });
 
-  it("keeps readiness unavailable while active connectivity checks are pending", async () => {
+  it("keeps standalone app health backward-compatible", async () => {
     const config: ProxyConfig = structuredClone(DEFAULT_CONFIG);
     const app = createApp(config);
+
+    const response = await app.request("/health");
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ status: "ok" });
+  });
+
+  it("keeps startup readiness unavailable while active connectivity checks are pending", async () => {
+    const config: ProxyConfig = structuredClone(DEFAULT_CONFIG);
+    const health = new RuntimeHealth(config);
+    health.markListenerReady("proxy", config.server.host, config.server.port);
+    const app = createApp(config, { runtimeHealth: health, storesActivated: true });
 
     const response = await app.request("/health");
 
