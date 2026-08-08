@@ -97,7 +97,7 @@ function cachedHook(id: string, priority: number, content: string): InjectionHoo
 }
 
 describe("memory parity: prewarm, cache, and context order", () => {
-  it("prewarms by full identity and reuses cached blocks in deterministic order", async () => {
+  it("prewarms by the persisted cache tuple and reuses blocks in deterministic order", async () => {
     const registry = new HookRegistryImpl();
     const memoryHook = cachedHook("memory", 100, "memory-context");
     const skillHook = cachedHook("skills", 200, "skill-context");
@@ -176,5 +176,62 @@ describe("memory parity: prewarm, cache, and context order", () => {
       PARITY_IDENTITY.sessionId,
       "memory",
     )).resolves.toBeNull();
+  });
+
+  it.fails("does not reuse cached context after Team/Agent/Task binding changes", async () => {
+    const registry = new HookRegistryImpl();
+    const memoryHook = cachedHook("memory", 100, "original-binding-context");
+    registry.register(memoryHook);
+    const cache = new InMemoryHookCacheRepo();
+
+    await prewarmAll(registry, cache, {
+      keyId: `${PARITY_IDENTITY.agentSource}:${PARITY_IDENTITY.sessionId}`,
+      spaceId: PARITY_IDENTITY.spaceId,
+      userId: PARITY_IDENTITY.userId,
+      agentSource: PARITY_IDENTITY.agentSource,
+      sessionInfo: PARITY_SESSION_INFO,
+      agentDetail: PARITY_AGENT,
+      taskDetail: PARITY_TASK,
+    });
+    const reboundSession = {
+      ...PARITY_SESSION_INFO,
+      team_id: "team-rebound",
+      agent_id: "agent-rebound",
+      task_id: "task-rebound",
+    };
+    const pipeline = new InjectionPipeline(
+      registry,
+      new Map([["openai", new OpenAIAdapter()]]),
+      { hookCacheRepo: cache },
+    );
+    const result = await pipeline.process(
+      {
+        model: "fixture-model",
+        messages: [
+          { role: "system", content: "base-system" },
+          { role: "user", content: "real-user-prompt" },
+        ],
+      },
+      {
+        protocol: "openai",
+        traceId: "trace-rebound",
+        keyId: "key-rebound",
+        modelId: "fixture-model",
+        stream: false,
+        spaceId: PARITY_IDENTITY.spaceId,
+        userId: PARITY_IDENTITY.userId,
+        agentSource: PARITY_IDENTITY.agentSource,
+        custom: { session: reboundSession },
+      },
+    );
+
+    expect(memoryHook.execute).toHaveBeenCalledOnce();
+    expect(result.messages).toEqual([
+      {
+        role: "system",
+        content: "base-system\nunexpected-live-memory",
+      },
+      { role: "user", content: "real-user-prompt" },
+    ]);
   });
 });

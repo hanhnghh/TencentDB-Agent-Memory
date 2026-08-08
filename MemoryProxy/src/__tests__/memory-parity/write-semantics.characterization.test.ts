@@ -10,8 +10,8 @@ import type { ProxyConfig } from "../../types.js";
 import { CoreSkillClient, setCoreSkillClient } from "../../skill/core-client.js";
 import { triggerSkillExtractIfReady } from "../../skill/handler-glue.js";
 import { extractLatestUserMessage, recordTdaiTurn } from "../../tdai/recorder.js";
-import type { TdaiClient } from "../../tdai/client.js";
-import type { TdaiIdentity, TdaiMessage } from "../../tdai/types.js";
+import { TdaiClient } from "../../tdai/client.js";
+import type { TdaiIdentity } from "../../tdai/types.js";
 import {
   COMPLETED_ROUND_GOLDEN,
   FINAL_ASSISTANT,
@@ -32,6 +32,59 @@ const tdaiIdentity: TdaiIdentity = {
   sessionId: PARITY_IDENTITY.sessionId,
 };
 
+const coreSkillConfig = {
+  endpoint: "http://core.fixture",
+  serviceToken: "fixture-token",
+  serviceId: "fixture-service",
+  timeoutMs: 1_000,
+} as const;
+
+function memoryParityConfig(): ProxyConfig {
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.upstream = {
+    url: "http://upstream.fixture/v1/messages",
+    apiKey: "",
+    agents: {},
+  };
+  config.rateLimit = { tpm: 0, qpm: 0 };
+  config.creditReport.url = "http://credit.fixture/report";
+  config.sessionInit.enabled = true;
+  config.tdai = {
+    enabled: true,
+    endpoint: "http://memory.fixture",
+    apiKey: "service-token",
+    serviceId: "configured-space",
+    memory: {
+      enabled: true,
+      inject: false,
+      writeL0: true,
+      recallL1: false,
+      injectL2L3: false,
+      l1Limit: 5,
+      l2Limit: 3,
+      timeoutMs: 1_000,
+    },
+  };
+  config.coreSkill = { ...coreSkillConfig };
+  return config;
+}
+
+async function seedParitySession(): Promise<void> {
+  await getSessionStore().set(
+    `${PARITY_IDENTITY.agentSource}:${PARITY_IDENTITY.sessionId}`,
+    {
+      status: "initialized",
+      keyId: `${PARITY_IDENTITY.agentSource}:${PARITY_IDENTITY.sessionId}`,
+      startedAt: 1,
+      attemptCount: 0,
+      userId: PARITY_IDENTITY.userId,
+      sessionInfo: PARITY_SESSION_INFO,
+      agentDetail: PARITY_AGENT,
+      taskDetail: PARITY_TASK,
+    },
+  );
+}
+
 afterEach(() => {
   setCoreSkillClient(null);
   __resetSessionStoreForTests();
@@ -41,51 +94,8 @@ afterEach(() => {
 
 describe("memory parity: observed legacy intermediate L0 behavior", () => {
   it("keeps the proxy route's intermediate L0 write separate from completed-round skill ingestion", async () => {
-    const config = structuredClone(DEFAULT_CONFIG);
-    config.upstream = {
-      url: "http://upstream.fixture/v1/messages",
-      apiKey: "",
-      agents: {},
-    };
-    config.rateLimit = { tpm: 0, qpm: 0 };
-    config.creditReport.url = "http://credit.fixture/report";
-    config.sessionInit.enabled = true;
-    config.tdai = {
-      enabled: true,
-      endpoint: "http://memory.fixture",
-      apiKey: "service-token",
-      serviceId: "configured-space",
-      memory: {
-        enabled: true,
-        inject: false,
-        writeL0: true,
-        recallL1: false,
-        injectL2L3: false,
-        l1Limit: 5,
-        l2Limit: 3,
-        timeoutMs: 1_000,
-      },
-    };
-    config.coreSkill = {
-      endpoint: "http://core.fixture",
-      serviceToken: "fixture-token",
-      serviceId: "fixture-service",
-      timeoutMs: 1_000,
-    };
-
-    await getSessionStore().set(
-      `${PARITY_IDENTITY.agentSource}:${PARITY_IDENTITY.sessionId}`,
-      {
-        status: "initialized",
-        keyId: `${PARITY_IDENTITY.agentSource}:${PARITY_IDENTITY.sessionId}`,
-        startedAt: 1,
-        attemptCount: 0,
-        userId: PARITY_IDENTITY.userId,
-        sessionInfo: PARITY_SESSION_INFO,
-        agentDetail: PARITY_AGENT,
-        taskDetail: PARITY_TASK,
-      },
-    );
+    const config = memoryParityConfig();
+    await seedParitySession();
 
     const l0Requests: Array<Record<string, unknown>> = [];
     const skillRequests: Array<Record<string, unknown>> = [];
@@ -182,12 +192,22 @@ describe("memory parity: observed legacy intermediate L0 behavior", () => {
   });
 
   it("records each proxy HTTP response independently, including an intermediate tool-loop response", async () => {
-    const writes: Array<{ identity: TdaiIdentity; messages: TdaiMessage[] }> = [];
-    const client = {
-      addConversation: vi.fn(async (identity: TdaiIdentity, messages: TdaiMessage[]) => {
-        writes.push({ identity, messages });
-      }),
-    } as unknown as TdaiClient;
+    const writes: Array<Record<string, unknown>> = [];
+    const fetcher: typeof fetch = async (_input, init) => {
+      writes.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    vi.stubGlobal("fetch", vi.fn(fetcher));
+    const config = memoryParityConfig().tdai;
+    const client = new TdaiClient({
+      ...config.memory,
+      endpoint: config.endpoint,
+      apiKey: config.apiKey,
+      serviceId: config.serviceId,
+    });
 
     await recordTdaiTurn(
       client,
@@ -205,20 +225,28 @@ describe("memory parity: observed legacy intermediate L0 behavior", () => {
     // Characterization only: the approved target below deliberately does not
     // treat this per-response fragmentation as the future parity contract.
     expect(writes).toEqual([
-      {
-        identity: tdaiIdentity,
+      expect.objectContaining({
+        team_id: tdaiIdentity.teamId,
+        user_id: tdaiIdentity.userId,
+        agent_id: tdaiIdentity.agentId,
+        session_id: tdaiIdentity.sessionId,
+        task_id: tdaiIdentity.taskId,
         messages: [
           { role: "user", content: USER_PROMPT },
           { role: "assistant", content: INTERMEDIATE_ASSISTANT },
         ],
-      },
-      {
-        identity: tdaiIdentity,
+      }),
+      expect.objectContaining({
+        team_id: tdaiIdentity.teamId,
+        user_id: tdaiIdentity.userId,
+        agent_id: tdaiIdentity.agentId,
+        session_id: tdaiIdentity.sessionId,
+        task_id: tdaiIdentity.taskId,
         messages: [
           { role: "user", content: "xin chào\nexit: 0" },
           { role: "assistant", content: FINAL_ASSISTANT },
         ],
-      },
+      }),
     ]);
   });
 
@@ -236,45 +264,103 @@ describe("memory parity: observed legacy intermediate L0 behavior", () => {
 });
 
 describe("memory parity: approved completed-round target", () => {
-  it("defines L0 as the real user prompt plus final assistant answer", () => {
-    const targetL0: TdaiMessage[] = [
-      { role: "user", content: USER_PROMPT },
-      { role: "assistant", content: FINAL_ASSISTANT },
+  it.fails("commits one L0 write for the completed human round", async () => {
+    const config = memoryParityConfig();
+    await seedParitySession();
+    const upstreamResponses = [
+      {
+        id: "message-intermediate",
+        type: "message",
+        role: "assistant",
+        content: [
+          { type: "text", text: INTERMEDIATE_ASSISTANT },
+          {
+            type: "tool_use",
+            id: "tool-1",
+            name: "shell",
+            input: { cmd: "printf 'xin chào'" },
+          },
+        ],
+        model: "fixture-model",
+        stop_reason: "tool_use",
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+      {
+        id: "message-final",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "text", text: FINAL_ASSISTANT }],
+        model: "fixture-model",
+        stop_reason: "end_turn",
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
     ];
+    const l0Requests: Array<Record<string, unknown>> = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url === config.upstream.url) {
+        const next = upstreamResponses.shift();
+        if (!next) throw new Error("unexpected third upstream request");
+        return new Response(JSON.stringify(next), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.endsWith("/v3/conversation/add")) {
+        l0Requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      }
+      return new Response(JSON.stringify({ code: 0, data: { items: [] } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    vi.stubGlobal("fetch", vi.fn(fetcher));
+    const app = createApp(config);
+    const callProxy = (messages: Array<Record<string, unknown>>) => app.request(
+      `/claude-code/${PARITY_IDENTITY.spaceId}/v1/messages`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "client-key",
+          "x-conversation-id": PARITY_IDENTITY.sessionId,
+          "x-user-id": PARITY_IDENTITY.userId,
+        },
+        body: JSON.stringify({
+          model: "fixture-model",
+          max_tokens: 128,
+          stream: false,
+          messages,
+        }),
+      },
+    );
 
-    expect(targetL0).toEqual([
-      COMPLETED_ROUND_GOLDEN[0],
-      COMPLETED_ROUND_GOLDEN[COMPLETED_ROUND_GOLDEN.length - 1],
-    ]);
+    await callProxy([PROXY_ROUND_INPUTS[0].messages[1]]);
+    await callProxy(PROXY_ROUND_INPUTS[0].messages.slice(1));
+    await vi.waitFor(() => expect(l0Requests.length).toBeGreaterThan(0));
+
+    expect(l0Requests).toHaveLength(1);
+    expect(l0Requests[0]).toMatchObject({
+      messages: [
+        { role: "user", content: USER_PROMPT },
+        { role: "assistant", content: FINAL_ASSISTANT },
+      ],
+    });
   });
 
   it("commits the full normalized tool-aware round to skill ingestion only after the final response", async () => {
     const requests: Array<{ url: string; init?: RequestInit }> = [];
-    const client = new CoreSkillClient(
-      {
-        endpoint: "http://core.fixture",
-        serviceToken: "fixture-token",
-        serviceId: "fixture-service",
-        timeoutMs: 1_000,
-      },
-      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+    const fetcher: typeof fetch = async (url, init) => {
         requests.push({ url: String(url), init });
         return new Response(JSON.stringify({ code: 0, data: { status: "ok" } }), {
           status: 200,
           headers: { "content-type": "application/json" },
         });
-      }) as typeof fetch,
-    );
+      };
+    const client = new CoreSkillClient(coreSkillConfig, fetcher);
     setCoreSkillClient(client);
     const fixture = PROXY_ROUND_INPUTS[0];
-    const config = {
-      coreSkill: {
-        endpoint: "http://core.fixture",
-        serviceToken: "fixture-token",
-        serviceId: "fixture-service",
-        timeoutMs: 1_000,
-      },
-    } as ProxyConfig;
+    const config = memoryParityConfig();
     const sessionInfo = {
       session_id: PARITY_IDENTITY.sessionId,
       space_id: PARITY_IDENTITY.spaceId,

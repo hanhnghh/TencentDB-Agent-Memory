@@ -5,7 +5,7 @@ import { KvSessionRepo } from "../../db/kv-session-repo.js";
 import { injectSessionContext } from "../../session/context-injector.js";
 import { SessionStore } from "../../session/store.js";
 import { MemoryStorage } from "../../storage/memory-storage.js";
-import type { MetadataClient } from "../../meta/client.js";
+import { MetadataClient } from "../../meta/client.js";
 import type { SessionInitState } from "../../session/types.js";
 import {
   OTHER_PARITY_IDENTITY,
@@ -15,17 +15,13 @@ import {
   PARITY_TASK,
 } from "./fixtures.js";
 
+type ParityIdentity = {
+  [Key in keyof typeof PARITY_IDENTITY]: string;
+};
+
 function initializedState(
   keyId: string,
-  identity: {
-    spaceId: string;
-    userId: string;
-    agentSource: string;
-    sessionId: string;
-    teamId: string;
-    agentId: string;
-    taskId: string;
-  } = PARITY_IDENTITY,
+  identity: ParityIdentity = PARITY_IDENTITY,
 ): SessionInitState {
   return {
     status: "initialized",
@@ -117,21 +113,39 @@ describe("memory parity: identity and binding", () => {
         taskId: PARITY_IDENTITY.taskId,
       },
     );
-    const metadataClient = {
-      getAgent: vi.fn(async () => ({
-        agent_id: PARITY_IDENTITY.agentId,
-        team_id: PARITY_IDENTITY.teamId,
-        name: PARITY_AGENT.name,
-        description: PARITY_AGENT.description,
-        prompt: PARITY_AGENT.prompt,
-      })),
-      getTask: vi.fn(async () => ({
-        task_id: PARITY_IDENTITY.taskId,
-        team_id: PARITY_IDENTITY.teamId,
-        title: PARITY_TASK.name,
-        description: PARITY_TASK.description,
-      })),
-    } as unknown as MetadataClient;
+    const fetcher: typeof fetch = async (input) => {
+      const url = String(input);
+      const data = url.endsWith("/v3/meta/agent/get")
+        ? {
+            agent_id: PARITY_IDENTITY.agentId,
+            team_id: PARITY_IDENTITY.teamId,
+            name: PARITY_AGENT.name,
+            description: PARITY_AGENT.description,
+            prompt: PARITY_AGENT.prompt,
+          }
+        : {
+            task_id: PARITY_IDENTITY.taskId,
+            team_id: PARITY_IDENTITY.teamId,
+            title: PARITY_TASK.name,
+            description: PARITY_TASK.description,
+          };
+      return new Response(JSON.stringify({ code: 0, data }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const metadataClient = new MetadataClient(
+      {
+        endpoint: "http://metadata.fixture",
+        serviceToken: "fixture-token",
+        timeoutMs: 1_000,
+      },
+      PARITY_IDENTITY.spaceId,
+      "user-key",
+      vi.fn(fetcher),
+    );
+    const getAgent = vi.spyOn(metadataClient, "getAgent");
+    const getTask = vi.spyOn(metadataClient, "getTask");
     const store = new SessionStore(30 * 60 * 1000, undefined, bindingRepo);
 
     const recovered = await store.getOrRecover(
@@ -158,8 +172,8 @@ describe("memory parity: identity and binding", () => {
       agentDetail: { id: PARITY_IDENTITY.agentId },
       taskDetail: { id: PARITY_IDENTITY.taskId },
     });
-    expect(metadataClient.getAgent).toHaveBeenCalledWith(PARITY_IDENTITY.agentId);
-    expect(metadataClient.getTask).toHaveBeenCalledWith(PARITY_IDENTITY.taskId);
+    expect(getAgent).toHaveBeenCalledWith(PARITY_IDENTITY.agentId);
+    expect(getTask).toHaveBeenCalledWith(PARITY_IDENTITY.taskId);
   });
 
   it("injects Agent before Task in a stable, delimited context block", () => {

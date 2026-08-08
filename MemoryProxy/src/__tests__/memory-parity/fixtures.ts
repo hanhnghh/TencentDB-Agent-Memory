@@ -38,6 +38,26 @@ export interface HookRoundInput {
   };
 }
 
+export interface NormalizationToolExchange {
+  toolCallId: string;
+  toolName: string;
+  input: unknown;
+  result: string;
+  failed: boolean;
+}
+
+export interface NormalizationScenario {
+  id:
+    | "unicode-code"
+    | "multiple-tools"
+    | "failed-tool"
+    | "empty-result"
+    | "large-result-boundary";
+  proxyInputs: ProxyRoundInput[];
+  hookInput: HookRoundInput;
+  golden: NormalizedMessage[];
+}
+
 export const PARITY_IDENTITY = {
   spaceId: "mem-space-a",
   userId: "user-a",
@@ -92,142 +112,237 @@ export const USER_PROMPT = "Giữ Unicode 🧠 và code:\n```ts\nconst café = t
 export const INTERMEDIATE_ASSISTANT = "I will inspect the workspace.";
 export const FINAL_ASSISTANT = "Done — the code block and Unicode are preserved.";
 
-export const COMPLETED_ROUND_GOLDEN: NormalizedMessage[] = [
-  { role: "user", content: USER_PROMPT },
-  {
-    role: "tool_call",
-    content: JSON.stringify({ cmd: "printf 'xin chào'" }),
-    tool_call_id: "tool-1",
-    tool_name: "shell",
-  },
-  {
-    role: "tool_result",
-    content: "xin chào\nexit: 0",
-    tool_call_id: "tool-1",
-  },
-  { role: "assistant", content: FINAL_ASSISTANT },
-];
+export const LARGE_TOOL_RESULT = "界".repeat(40 * 1024 + 1);
 
-export const PROXY_ROUND_INPUTS: ProxyRoundInput[] = [
-  {
-    protocol: "anthropic",
-    agentSource: "claude-code",
-    messages: [
-      { role: "system", content: "secret system instruction" },
+function createNormalizationScenario(input: {
+  id: NormalizationScenario["id"];
+  userPrompt: string;
+  tools: NormalizationToolExchange[];
+  assistant: string;
+}): NormalizationScenario {
+  const golden: NormalizedMessage[] = [
+    { role: "user", content: input.userPrompt },
+    ...input.tools.map((tool) => ({
+      role: "tool_call" as const,
+      content: JSON.stringify(tool.input),
+      tool_call_id: tool.toolCallId,
+      tool_name: tool.toolName,
+    })),
+    ...input.tools.map((tool) => ({
+      role: "tool_result" as const,
+      content: tool.result,
+      tool_call_id: tool.toolCallId,
+    })),
+    { role: "assistant", content: input.assistant },
+  ];
+  const turnId = `turn-${input.id}`;
+
+  return {
+    id: input.id,
+    golden,
+    proxyInputs: [
       {
-        role: "user",
-        content: [
-          { type: "text", text: "<system-reminder>generated context</system-reminder>" },
-          { type: "image", source: { type: "base64", data: "not-memory" } },
-          { type: "text", text: USER_PROMPT },
-        ],
-      },
-      {
-        role: "assistant",
-        content: [
-          { type: "thinking", thinking: "hidden reasoning" },
-          { type: "tool_use", id: "tool-1", name: "shell", input: { cmd: "printf 'xin chào'" } },
-        ],
-      },
-      {
-        role: "user",
-        content: [
+        protocol: "anthropic",
+        agentSource: "claude-code",
+        messages: [
+          { role: "system", content: "secret system instruction" },
           {
-            type: "tool_result",
-            tool_use_id: "tool-1",
+            role: "user",
             content: [
-              { type: "text", text: "xin chào\nexit: 0" },
+              { type: "text", text: "<system-reminder>generated context</system-reminder>" },
               { type: "image", source: { type: "base64", data: "not-memory" } },
+              { type: "text", text: input.userPrompt },
             ],
           },
-        ],
-      },
-    ],
-    assistantMessage: {
-      role: "assistant",
-      content: [
-        { type: "thinking", thinking: "more hidden reasoning" },
-        { type: "text", text: FINAL_ASSISTANT },
-        { type: "image", source: { type: "base64", data: "not-memory" } },
-      ],
-    },
-  },
-  {
-    protocol: "openai",
-    agentSource: "codebuddy",
-    messages: [
-      { role: "system", content: "secret system instruction" },
-      {
-        role: "user",
-        content: `<user_info>generated context</user_info><user_query>${USER_PROMPT}</user_query>`,
-      },
-      {
-        role: "assistant",
-        content: null,
-        tool_calls: [
           {
-            id: "tool-1",
-            type: "function",
-            function: { name: "shell", arguments: JSON.stringify({ cmd: "printf 'xin chào'" }) },
+            role: "assistant",
+            content: [
+              { type: "thinking", thinking: "hidden reasoning" },
+              ...input.tools.map((tool) => ({
+                type: "tool_use",
+                id: tool.toolCallId,
+                name: tool.toolName,
+                input: tool.input,
+              })),
+            ],
+          },
+          {
+            role: "user",
+            content: input.tools.map((tool) => ({
+              type: "tool_result",
+              tool_use_id: tool.toolCallId,
+              is_error: tool.failed,
+              content: [
+                { type: "text", text: tool.result },
+                { type: "image", source: { type: "base64", data: "not-memory" } },
+              ],
+            })),
           },
         ],
+        assistantMessage: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "more hidden reasoning" },
+            { type: "text", text: input.assistant },
+            { type: "image", source: { type: "base64", data: "not-memory" } },
+          ],
+        },
       },
-      { role: "tool", tool_call_id: "tool-1", content: "xin chào\nexit: 0" },
+      {
+        protocol: "openai",
+        agentSource: "codebuddy",
+        messages: [
+          { role: "system", content: "secret system instruction" },
+          {
+            role: "user",
+            content: `<user_info>generated context</user_info><user_query>${input.userPrompt}</user_query>`,
+          },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: input.tools.map((tool) => ({
+              id: tool.toolCallId,
+              type: "function",
+              function: {
+                name: tool.toolName,
+                arguments: JSON.stringify(tool.input),
+              },
+            })),
+          },
+          ...input.tools.map((tool) => ({
+            role: "tool",
+            tool_call_id: tool.toolCallId,
+            content: tool.result,
+          })),
+        ],
+        assistantMessage: { role: "assistant", content: input.assistant },
+      },
     ],
-    assistantMessage: { role: "assistant", content: FINAL_ASSISTANT },
-  },
-];
+    // Intentionally transport-neutral: the future Codex adapter can consume
+    // every scenario without importing either proxy protocol shape.
+    hookInput: {
+      sessionStart: {
+        event: "SessionStart",
+        source: "startup",
+        session_id: PARITY_IDENTITY.sessionId,
+      },
+      prompt: {
+        event: "UserPromptSubmit",
+        session_id: PARITY_IDENTITY.sessionId,
+        turn_id: turnId,
+        prompt: input.userPrompt,
+      },
+      tools: input.tools.map((tool) => ({
+        event: "PostToolUse",
+        session_id: PARITY_IDENTITY.sessionId,
+        turn_id: turnId,
+        tool_call_id: tool.toolCallId,
+        tool_name: tool.toolName,
+        input: tool.input,
+        result: tool.result,
+        failed: tool.failed,
+      })),
+      stop: {
+        event: "Stop",
+        session_id: PARITY_IDENTITY.sessionId,
+        turn_id: turnId,
+        assistant: input.assistant,
+      },
+    },
+  };
+}
 
-// This fixture is intentionally transport-neutral. A future Codex adapter can
-// consume it without importing HTTP/proxy request shapes.
-export const HOOK_ROUND_INPUT: HookRoundInput = {
-  sessionStart: {
-    event: "SessionStart",
-    source: "startup",
-    session_id: PARITY_IDENTITY.sessionId,
-  },
-  prompt: {
-    event: "UserPromptSubmit",
-    session_id: PARITY_IDENTITY.sessionId,
-    turn_id: "turn-1",
-    prompt: USER_PROMPT,
-  },
-  tools: [
-    {
-      event: "PostToolUse",
-      session_id: PARITY_IDENTITY.sessionId,
-      turn_id: "turn-1",
-      tool_call_id: "tool-1",
-      tool_name: "shell",
+export const NORMALIZATION_SCENARIOS: NormalizationScenario[] = [
+  createNormalizationScenario({
+    id: "unicode-code",
+    userPrompt: USER_PROMPT,
+    tools: [{
+      toolCallId: "tool-1",
+      toolName: "shell",
       input: { cmd: "printf 'xin chào'" },
       result: "xin chào\nexit: 0",
       failed: false,
-    },
-  ],
-  stop: {
-    event: "Stop",
-    session_id: PARITY_IDENTITY.sessionId,
-    turn_id: "turn-1",
+    }],
     assistant: FINAL_ASSISTANT,
-  },
-};
+  }),
+  createNormalizationScenario({
+    id: "multiple-tools",
+    userPrompt: "Inspect two files",
+    tools: [
+      {
+        toolCallId: "tool-read-a",
+        toolName: "read",
+        input: { path: "a.ts" },
+        result: "export const a = 1;",
+        failed: false,
+      },
+      {
+        toolCallId: "tool-read-b",
+        toolName: "read",
+        input: { path: "b.ts" },
+        result: "export const b = 2;",
+        failed: false,
+      },
+    ],
+    assistant: "Both files were inspected.",
+  }),
+  createNormalizationScenario({
+    id: "failed-tool",
+    userPrompt: "Run the failing command",
+    tools: [{
+      toolCallId: "tool-failed",
+      toolName: "shell",
+      input: { cmd: "exit 17" },
+      result: "command failed\nexit: 17",
+      failed: true,
+    }],
+    assistant: "The command failed with exit code 17.",
+  }),
+  createNormalizationScenario({
+    id: "empty-result",
+    userPrompt: "Read the empty file",
+    tools: [{
+      toolCallId: "tool-empty",
+      toolName: "read",
+      input: { path: "empty.txt" },
+      result: "",
+      failed: false,
+    }],
+    assistant: "The file is empty.",
+  }),
+  createNormalizationScenario({
+    id: "large-result-boundary",
+    userPrompt: "Read the large generated payload",
+    tools: [{
+      toolCallId: "tool-large",
+      toolName: "read",
+      input: { path: "large.txt" },
+      result: LARGE_TOOL_RESULT,
+      failed: false,
+    }],
+    assistant: "The large payload was preserved.",
+  }),
+];
+
+const unicodeScenario = NORMALIZATION_SCENARIOS[0];
+export const COMPLETED_ROUND_GOLDEN = unicodeScenario.golden;
+export const PROXY_ROUND_INPUTS = unicodeScenario.proxyInputs;
+export const HOOK_ROUND_INPUT = unicodeScenario.hookInput;
 
 export function normalizedHookRound(input: HookRoundInput): NormalizedMessage[] {
   return [
     { role: "user", content: input.prompt.prompt },
-    ...input.tools.flatMap((tool) => [
-      {
-        role: "tool_call" as const,
-        content: JSON.stringify(tool.input),
-        tool_call_id: tool.tool_call_id,
-        tool_name: tool.tool_name,
-      },
-      {
-        role: "tool_result" as const,
-        content: tool.result,
-        tool_call_id: tool.tool_call_id,
-      },
-    ]),
+    ...input.tools.map((tool) => ({
+      role: "tool_call" as const,
+      content: JSON.stringify(tool.input),
+      tool_call_id: tool.tool_call_id,
+      tool_name: tool.tool_name,
+    })),
+    ...input.tools.map((tool) => ({
+      role: "tool_result" as const,
+      content: tool.result,
+      tool_call_id: tool.tool_call_id,
+    })),
     { role: "assistant", content: input.stop.assistant },
   ];
 }

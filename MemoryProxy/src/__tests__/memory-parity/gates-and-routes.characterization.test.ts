@@ -4,9 +4,20 @@ import { checkAclOrDeny, TdaiClient } from "../../tdai/client.js";
 import { fetchAssetCapabilities } from "../../tdai/capabilities.js";
 import { createApp } from "../../server.js";
 import { DEFAULT_CONFIG } from "../../config.js";
+import {
+  __resetSessionStoreForTests,
+  getSessionStore,
+} from "../../session/store.js";
 import type { ProxyConfig } from "../../types.js";
+import {
+  PARITY_AGENT,
+  PARITY_IDENTITY,
+  PARITY_SESSION_INFO,
+  PARITY_TASK,
+} from "./fixtures.js";
 
 afterEach(() => {
+  __resetSessionStoreForTests();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -188,6 +199,89 @@ describe("memory parity: existing proxy and bridge routes", () => {
     expect(JSON.parse(String(anthropicInit?.body))).toEqual(anthropicRequest);
   });
 
+  it("preserves OpenAI and Anthropic streaming event boundaries", async () => {
+    const openAiEvents = [
+      'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"hel"},"finish_reason":null}]}',
+      'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":"stop"}]}',
+      "data: [DONE]",
+      "",
+    ].join("\n\n");
+    const anthropicEvents = [
+      "event: message_start",
+      'data: {"type":"message_start","message":{"id":"message-1","type":"message","role":"assistant","content":[],"model":"fixture-model","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}',
+      "event: content_block_start",
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+      "event: content_block_delta",
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}',
+      "event: message_delta",
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}',
+      "event: message_stop",
+      'data: {"type":"message_stop"}',
+      "",
+    ].join("\n\n");
+    const upstreamBodies: Array<Record<string, unknown>> = [];
+    const fetcher: typeof fetch = async (_input, init) => {
+      const headers = new Headers(init?.headers);
+      upstreamBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      const body = headers.has("x-api-key") ? anthropicEvents : openAiEvents;
+      return new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    };
+    vi.stubGlobal("fetch", vi.fn(fetcher));
+    const app = createApp(testConfig());
+
+    const openAiResponse = await app.request(
+      "/codebuddy/mem-space-a/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer client-key",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "fixture-model",
+          stream: true,
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      },
+    );
+    const openAiText = await openAiResponse.text();
+
+    expect(openAiResponse.status).toBe(200);
+    expect(openAiResponse.headers.get("content-type")).toContain("text/event-stream");
+    expect(openAiText).toContain('"content":"hel"');
+    expect(openAiText).toContain('"content":"lo"');
+    expect(openAiText).toContain("data: [DONE]");
+
+    const anthropicResponse = await app.request(
+      "/claude-code/mem-space-a/v1/messages",
+      {
+        method: "POST",
+        headers: {
+          "x-api-key": "client-key",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "fixture-model",
+          max_tokens: 128,
+          stream: true,
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      },
+    );
+    const anthropicText = await anthropicResponse.text();
+
+    expect(anthropicResponse.status).toBe(200);
+    expect(anthropicResponse.headers.get("content-type")).toContain("text/event-stream");
+    expect(anthropicText).toContain("event: content_block_delta");
+    expect(anthropicText).toContain('"text":"hello"');
+    expect(anthropicText).toContain("event: message_stop");
+    const streamedBodies = upstreamBodies.filter(({ stream }) => stream === true);
+    expect(streamedBodies).toHaveLength(2);
+  });
+
   it("keeps bridge capability allowlists ahead of the proxy catch-all", async () => {
     const app = createApp(testConfig());
     const options = {
@@ -209,5 +303,82 @@ describe("memory parity: existing proxy and bridge routes", () => {
     await expect(memoryRead.json()).resolves.toMatchObject({ code: 40101 });
     await expect(skillWrite.json()).resolves.toMatchObject({ code: 40301 });
     await expect(memoryWrite.json()).resolves.toMatchObject({ code: 40301 });
+  });
+
+  it("forwards authorized bridge reads with session-owned identity and service auth", async () => {
+    await getSessionStore().set(
+      `${PARITY_IDENTITY.agentSource}:${PARITY_IDENTITY.sessionId}`,
+      {
+        status: "initialized",
+        keyId: `${PARITY_IDENTITY.agentSource}:${PARITY_IDENTITY.sessionId}`,
+        startedAt: 1,
+        attemptCount: 0,
+        userId: PARITY_IDENTITY.userId,
+        sessionInfo: PARITY_SESSION_INFO,
+        agentDetail: PARITY_AGENT,
+        taskDetail: PARITY_TASK,
+      },
+    );
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      calls.push({ url: String(input), init });
+      return new Response(JSON.stringify({ code: 0, data: { source: String(input) } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    vi.stubGlobal("fetch", vi.fn(fetcher));
+    const config = testConfig();
+    config.coreSkill = {
+      endpoint: "http://core.fixture",
+      serviceToken: "service-token",
+      serviceId: "configured-service",
+      timeoutMs: 1_000,
+    };
+    config.tdai = {
+      ...config.tdai,
+      apiKey: "memory-token",
+      serviceId: "configured-memory-space",
+    };
+    const app = createApp(config);
+    const request = (path: string, body: Record<string, unknown>) => app.request(path, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-conversation-id": PARITY_IDENTITY.sessionId,
+      },
+      body: JSON.stringify(body),
+    });
+
+    const skillResponse = await request("/skill-bridge/v3/skill/list", {
+      team_id: "forged-team",
+      user_id: "forged-user",
+      agent_id: "forged-agent",
+    });
+    const memoryResponse = await request("/memory-bridge/v3/scenario/read", {
+      path: "project/setup",
+      team_id: "forged-team",
+      user_id: "forged-user",
+      agent_id: "forged-agent",
+    });
+
+    expect(skillResponse.status).toBe(200);
+    expect(memoryResponse.status).toBe(200);
+    expect(calls.map(({ url }) => url)).toEqual([
+      "http://core.fixture/v3/skill/list",
+      "http://core.fixture/v3/scenario/read",
+    ]);
+    for (const { init } of calls) {
+      const headers = new Headers(init?.headers);
+      expect(headers.get("authorization"))
+        .toMatch(/^Bearer (service-token|memory-token)$/);
+      expect(headers.get("x-tdai-service-id")).toBe(PARITY_IDENTITY.spaceId);
+      expect(headers.get("content-type")).toBe("application/json");
+      expect(JSON.parse(String(init?.body))).toMatchObject({
+        team_id: PARITY_IDENTITY.teamId,
+        user_id: PARITY_IDENTITY.userId,
+        agent_id: PARITY_IDENTITY.agentId,
+      });
+    }
   });
 });
