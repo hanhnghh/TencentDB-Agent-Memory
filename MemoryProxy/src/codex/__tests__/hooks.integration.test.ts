@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { DEFAULT_CONFIG } from "../../config.js";
 import { createHookApp } from "../../hook-server.js";
+import { log } from "../../report/log.js";
 import {
   InMemoryMemoryRuntimeAdapters,
   MemoryRuntime,
@@ -1026,7 +1027,8 @@ describe("Codex lifecycle hook contract", () => {
     expect(store.appendToolEvent).not.toHaveBeenCalled();
   });
 
-  it("commits one canonical completed round on Stop and suppresses repeated Stop", async () => {
+  it("commits one correlated, redacted round on Stop and suppresses repeated Stop", async () => {
+    const info = vi.spyOn(log, "info");
     const commitCompletedRound = vi.fn<MemoryRuntimeContract["commitCompletedRound"]>(async () => ({
       status: "skipped",
       sourceEventId: "codex:stop:test",
@@ -1096,6 +1098,15 @@ describe("Codex lifecycle hook contract", () => {
       finalResponse: "Đã hoàn thành.",
     });
     expect(store.markCommitted).toHaveBeenCalledWith({ ...identity, turnId: "turn-7" });
+    expect(info).toHaveBeenCalledWith("codex_hook.round_committed", {
+      sessionId: "session-1",
+      turnId: "turn-7",
+      sourceEventId: expect.stringMatching(/^codex:stop:sha256:[a-f0-9]{64}$/),
+      toolCount: 1,
+    });
+    expect(JSON.stringify(info.mock.calls)).not.toMatch(
+      /(?:user-key-secret|hidden reasoning|Giữ Unicode|Đã hoàn thành)/,
+    );
 
     vi.mocked(store.recordStop).mockResolvedValueOnce({
       status: "duplicate",
@@ -1113,6 +1124,7 @@ describe("Codex lifecycle hook contract", () => {
       body: JSON.stringify(body),
     })).status).toBe(200);
     expect(commitCompletedRound).toHaveBeenCalledTimes(1);
+    info.mockRestore();
   });
 
   it("does not acknowledge Stop when durable enqueue fails and retries on redelivery", async () => {
