@@ -181,6 +181,20 @@ describe("skill conversation ingestion duplicate safety", () => {
     expect(conversationAddRequestSchema.safeParse(baseInput).success).toBe(true);
   });
 
+  it.each([
+    ["source_event_id", ""],
+    ["source_event_id", "x".repeat(257)],
+    ["source_event_id", 42],
+    ["content_hash", ""],
+    ["content_hash", "x".repeat(257)],
+    ["content_hash", 42],
+  ])("rejects invalid %s values at the request boundary", (field, value) => {
+    expect(conversationAddRequestSchema.safeParse({
+      ...baseInput,
+      [field]: value,
+    }).success).toBe(false);
+  });
+
   it("returns the original receipt for an exact replay and rejects changed content", async () => {
     const { wired } = makeWired();
     const first = await wired.handler.handle({
@@ -209,6 +223,79 @@ describe("skill conversation ingestion duplicate safety", () => {
     expect(current.messages).toEqual(baseInput.messages);
   });
 
+  it("keeps legacy requests without source identity backward compatible", async () => {
+    const { wired } = makeWired();
+    const result = await handleConversationAdd(
+      baseInput,
+      { apiKey: "key", serviceId: "space-1" },
+      "request-legacy",
+      {
+        getSkillCore: () => undefined,
+        logger: { debug() {}, info() {}, warn() {}, error() {} },
+        resolveConversationAdd: async () => wired,
+      },
+    );
+
+    expect(result).toMatchObject({
+      code: 0,
+      data: {
+        status: "ok",
+        receipt: {
+          receipt_id: expect.any(String),
+          content_hash: expect.stringMatching(/^sha256:/),
+          accepted_at_ms: expect.any(Number),
+        },
+      },
+    });
+    expect((result.data as { receipt: { source_event_id?: string } }).receipt)
+      .not.toHaveProperty("source_event_id");
+    await expect(wired.buffer.readCurrent(baseInput)).resolves.toEqual({
+      messages: baseInput.messages,
+    });
+  });
+
+  it("rejects changed payload content even when the caller repeats the declared hash", async () => {
+    const { wired } = makeWired();
+    const original = {
+      ...baseInput,
+      source_event_id: "event-with-untrusted-hash",
+      content_hash: "sha256:caller-value",
+    };
+    await wired.handler.handle(original);
+
+    await expect(wired.handler.handle({
+      ...original,
+      messages: [{ role: "user", content: "changed despite repeated declared hash" }],
+    })).rejects.toMatchObject({
+      name: "SourceEventConflictError",
+      sourceEventId: "event-with-untrusted-hash",
+    });
+
+    await expect(wired.buffer.readCurrent(baseInput)).resolves.toEqual({
+      messages: baseInput.messages,
+    });
+  });
+
+  it("makes a failed aggregate commit expose neither the append nor its receipt", async () => {
+    const backend = new MemoryBackend();
+    backend.failSessionCommitOnce = true;
+    const { wired } = makeWired(backend);
+    const input = { ...baseInput, source_event_id: "event-failed-before-commit" };
+
+    await expect(wired.handler.handle(input)).rejects.toThrow("secret-storage-path");
+    await expect(wired.buffer.readSessionState(baseInput)).resolves.toMatchObject({
+      version: 0,
+      current: { messages: [] },
+      receipts: {},
+    });
+
+    const retry = await wired.handler.handle(input);
+    expect(retry.receipt.source_event_id).toBe("event-failed-before-commit");
+    await expect(wired.buffer.readCurrent(baseInput)).resolves.toEqual({
+      messages: baseInput.messages,
+    });
+  });
+
   it("maps changed-content replay to the public conflict envelope", async () => {
     const { wired } = makeWired();
     const deps = {
@@ -234,6 +321,35 @@ describe("skill conversation ingestion duplicate safety", () => {
     expect(conflict).toMatchObject({
       code: 40902,
       data: { source_event_id: "gateway-event" },
+    });
+  });
+
+  it("returns the original receipt through the public gateway on replay", async () => {
+    const { wired } = makeWired();
+    const deps = {
+      getSkillCore: () => undefined,
+      logger: { debug() {}, info() {}, warn() {}, error() {} },
+      resolveConversationAdd: async () => wired,
+    };
+    const body = { ...baseInput, source_event_id: "gateway-replay" };
+
+    const first = await handleConversationAdd(
+      body,
+      { apiKey: "key", serviceId: "space-1" },
+      "request-first",
+      deps,
+    );
+    const replay = await handleConversationAdd(
+      body,
+      { apiKey: "key", serviceId: "space-1" },
+      "request-replay",
+      deps,
+    );
+
+    expect(replay.code).toBe(0);
+    expect(replay.data).toEqual(first.data);
+    await expect(wired.buffer.readCurrent(baseInput)).resolves.toEqual({
+      messages: baseInput.messages,
     });
   });
 
@@ -361,6 +477,38 @@ describe("skill conversation ingestion duplicate safety", () => {
     expect(maxActive).toBe(1);
   });
 
+  it.each([
+    ["space_id", "space-2"],
+    ["user_id", "user-2"],
+    ["team_id", "team-2"],
+    ["agent_id", "agent-2"],
+    ["session_id", "session-2"],
+  ] as const)("includes %s in the session serialization scope", async (field, value) => {
+    const queue = new LocalSkillAgentTaskQueue();
+    let active = 0;
+    let maxActive = 0;
+    let bothEntered!: () => void;
+    const bothEnteredPromise = new Promise<void>((resolve) => { bothEntered = resolve; });
+    const enter = async (session: typeof baseInput) => queue.withSessionMutex(
+      session,
+      { lockTtlMs: 1_000, waitDeadlineMs: 1_000 },
+      async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        if (active === 2) bothEntered();
+        await bothEnteredPromise;
+        active -= 1;
+      },
+    );
+
+    await Promise.all([
+      enter(baseInput),
+      enter({ ...baseInput, [field]: value }),
+    ]);
+
+    expect(maxActive).toBe(2);
+  });
+
   it("renews the distributed same-session mutex while work is active", async () => {
     const queue = new RedisSkillAgentTaskQueue({
       client: new LeaseRedis(),
@@ -428,5 +576,130 @@ describe("skill conversation ingestion duplicate safety", () => {
     await expect(buffer.readArchive(second.archived.archive_key)).resolves.toMatchObject({
       messages: [{ content: "b" }],
     });
+  });
+
+  it("preserves observed legacy tool-call counting and paired archive payloads", async () => {
+    const { wired } = makeWired(undefined, { toolCallThreshold: 2 });
+    const first = await wired.handler.handle({
+      ...baseInput,
+      source_event_id: "tool-pair-a",
+      messages: [
+        { role: "tool_call", content: "{\"command\":\"first\"}", tool_call_id: "call-a" },
+        { role: "tool_result", content: "", tool_call_id: "call-a" },
+      ],
+    });
+    const second = await wired.handler.handle({
+      ...baseInput,
+      source_event_id: "tool-pair-b",
+      messages: [
+        { role: "tool_call", content: "{\"command\":\"second\"}", tool_call_id: "call-b" },
+        { role: "tool_result", content: "command failed", tool_call_id: "call-b" },
+      ],
+    });
+
+    expect(first.status).toBe("ok");
+    expect(second).toMatchObject({
+      status: "archived",
+      archived: { reason: "tool_calls" },
+    });
+    if (!second.archived) throw new Error("expected tool threshold archive");
+    await expect(wired.buffer.readArchive(second.archived.archive_key)).resolves.toMatchObject({
+      messages: [
+        { role: "tool_call", tool_call_id: "call-a" },
+        { role: "tool_result", tool_call_id: "call-a", content: "" },
+        { role: "tool_call", tool_call_id: "call-b" },
+        { role: "tool_result", tool_call_id: "call-b", content: "command failed" },
+      ],
+    });
+  });
+
+  it("preserves the observed legacy byte-threshold archive reason", async () => {
+    const { wired } = makeWired(undefined, {
+      bytesThreshold: 1,
+      requestCompressThresholdBytes: 1_000_000,
+    });
+
+    const result = await wired.handler.handle({
+      ...baseInput,
+      source_event_id: "byte-threshold",
+    });
+
+    expect(result).toMatchObject({
+      status: "archived",
+      archived: { reason: "bytes" },
+    });
+  });
+
+  it("preserves the observed legacy inclusive compression boundary", async () => {
+    const rawBytes = baseInput.messages.reduce(
+      (sum, message) => sum + Buffer.byteLength(JSON.stringify(message), "utf8"),
+      0,
+    );
+    const { wired } = makeWired(undefined, {
+      requestCompressThresholdBytes: rawBytes,
+    });
+
+    const result = await wired.handler.handle({
+      ...baseInput,
+      source_event_id: "compression-boundary",
+    });
+
+    expect(result).toMatchObject({
+      status: "archived",
+      archived: { reason: "compressed" },
+    });
+  });
+
+  it("preserves the observed legacy deterministic oversize fallback", async () => {
+    const backend = new MemoryBackend();
+    const storage = new StorageAdapter(backend);
+    const buffer = new SkillBufferStorage({ storage });
+    const queue = new LocalSkillAgentTaskQueue();
+    const trigger = new SkillTriggerService({ buffer, queue });
+    const handler = new SkillConversationAddHandler({
+      buffer,
+      trigger,
+      thresholds: {
+        toolCallThreshold: 1_000,
+        bytesThreshold: 1_000_000,
+        requestCompressThresholdBytes: 1,
+      },
+      compressOptions: { toolContentThresholdBytes: 1_000_000 },
+      oversizeOptions: {
+        chunkMaxBytes: 120,
+        headKeepBytes: 60,
+        tailKeepBytes: 60,
+        placeholderTemplate: "omitted {n} messages ({bytes} bytes)",
+      },
+      serialize: (session, fn) => queue.withSessionMutex(
+        session,
+        { lockTtlMs: 1_000, waitDeadlineMs: 1_000 },
+        fn,
+      ),
+    });
+
+    const result = await handler.handle({
+      ...baseInput,
+      source_event_id: "oversize-boundary",
+      messages: ["first", "middle-a", "middle-b", "last"].map((label) => ({
+        role: "user" as const,
+        content: `${label}:${"x".repeat(50)}`,
+      })),
+    });
+
+    expect(result).toMatchObject({
+      status: "archived",
+      archived: { reason: "oversize" },
+    });
+    if (!result.archived) throw new Error("expected oversize archive");
+    const archive = await buffer.readArchive(result.archived.archive_key);
+    expect(archive?.messages).toEqual([
+      expect.objectContaining({ content: expect.stringContaining("first:") }),
+      expect.objectContaining({
+        role: "system",
+        content: expect.stringMatching(/^omitted \d+ messages/),
+      }),
+      expect.objectContaining({ content: expect.stringContaining("last:") }),
+    ]);
   });
 });

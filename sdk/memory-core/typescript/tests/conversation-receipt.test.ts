@@ -72,6 +72,40 @@ describe("TypeScript SDK skill conversation receipt", () => {
     });
   });
 
+  it.each([
+    [Object.assign(new Error("socket unavailable"), { name: "TypeError" }), "network"],
+    [Object.assign(new Error("deadline exceeded"), { name: "TimeoutError" }), "timeout"],
+  ])("exposes %s transport failures as typed retryable errors", async (transportError, kind) => {
+    vi.stubGlobal("fetch", vi.fn(async () => { throw transportError; }));
+
+    const failure = await client().conversationAdd(request).catch((error: unknown) => error);
+    expect(failure).toMatchObject({
+      name: "TDAMError",
+      kind,
+      retryable: true,
+    });
+  });
+
+  it.each([
+    [40902, "conflict", false],
+    [50001, "server", true],
+  ])("classifies HTTP-200 business failure %i", async (code, kind, retryable) => {
+    vi.stubGlobal("fetch", vi.fn(async () => response({
+      code,
+      message: "failed",
+      request_id: "request-business",
+    })));
+
+    const failure = await client().conversationAdd(request).catch((error: unknown) => error);
+    expect(failure).toMatchObject({
+      name: "TDAMError",
+      code,
+      kind,
+      retryable,
+      requestId: "request-business",
+    });
+  });
+
   it("surfaces malformed success responses as typed permanent failures", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("not-json", { status: 200 })));
     const failure = await client().conversationAdd(request).catch((error: unknown) => error);
@@ -98,6 +132,23 @@ describe("TypeScript SDK skill conversation receipt", () => {
 
   it("rejects a non-object data payload in a generic success envelope", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => response({ code: 0, data: [] })));
+    const transport = new V3HttpTransport({
+      endpoint: "https://core.example",
+      apiKey: "key",
+      serviceId: "space-1",
+    });
+
+    const failure = await transport.post("/v3/skill/listing", {})
+      .catch((error: unknown) => error);
+    expect(failure).toMatchObject({
+      name: "TDAMError",
+      kind: "invalid_response",
+      retryable: false,
+    });
+  });
+
+  it("rejects a non-object response envelope", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => response([])));
     const transport = new V3HttpTransport({
       endpoint: "https://core.example",
       apiKey: "key",

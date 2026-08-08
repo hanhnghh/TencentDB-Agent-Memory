@@ -3,7 +3,7 @@ import asyncio
 import httpx
 import pytest
 
-from tencentdb_agent_memory._v3_http import _decode_response
+from tencentdb_agent_memory._v3_http import AsyncHttpStub, HttpStub, _decode_response
 from tencentdb_agent_memory.errors import TDAMError
 from tencentdb_agent_memory.v3.skill_client import AsyncSkillClient, SkillClient
 
@@ -75,6 +75,106 @@ def test_transport_exposes_typed_retry_classification(status, code, retryable, k
     assert caught.value.http_status == status
 
 
+@pytest.mark.parametrize(
+    ("code", "retryable", "kind"),
+    [
+        (40902, False, "conflict"),
+        (50001, True, "server"),
+    ],
+)
+def test_http_200_business_failures_remain_typed(code, retryable, kind):
+    response = httpx.Response(
+        200,
+        json={"code": code, "message": "failed", "request_id": "request-business"},
+    )
+    with pytest.raises(TDAMError) as caught:
+        _decode_response(response)
+    assert caught.value.code == code
+    assert caught.value.retryable is retryable
+    assert caught.value.kind == kind
+    assert caught.value.request_id == "request-business"
+
+
+@pytest.mark.parametrize(
+    ("error", "kind"),
+    [
+        (
+            httpx.ConnectError(
+                "socket unavailable",
+                request=httpx.Request("POST", "https://core.example"),
+            ),
+            "network",
+        ),
+        (
+            httpx.ReadTimeout(
+                "deadline exceeded",
+                request=httpx.Request("POST", "https://core.example"),
+            ),
+            "timeout",
+        ),
+    ],
+)
+def test_sync_transport_exposes_network_and_timeout_failures(error, kind):
+    class FailingClient:
+        timeout = 1
+
+        def post(self, **_kwargs):
+            raise error
+
+    transport = HttpStub(
+        "https://core.example",
+        "key",
+        "space-1",
+        client=FailingClient(),
+    )
+    with pytest.raises(TDAMError) as caught:
+        transport.post("/v3/skill/conversation/add", REQUEST)
+    assert caught.value.kind == kind
+    assert caught.value.retryable is True
+
+
+@pytest.mark.parametrize(
+    ("error", "kind"),
+    [
+        (
+            httpx.ConnectError(
+                "socket unavailable",
+                request=httpx.Request("POST", "https://core.example"),
+            ),
+            "network",
+        ),
+        (
+            httpx.ReadTimeout(
+                "deadline exceeded",
+                request=httpx.Request("POST", "https://core.example"),
+            ),
+            "timeout",
+        ),
+    ],
+)
+def test_async_transport_exposes_network_and_timeout_failures(error, kind):
+    class FailingAsyncClient:
+        timeout = 1
+
+        async def post(self, **_kwargs):
+            raise error
+
+    transport = AsyncHttpStub(
+        "https://core.example",
+        "key",
+        "space-1",
+        client=FailingAsyncClient(),
+    )
+
+    async def invoke():
+        await transport.post("/v3/skill/conversation/add", REQUEST)
+
+    with pytest.raises(TDAMError) as caught:
+        asyncio.run(invoke())
+    assert caught.value.kind == kind
+    assert caught.value.retryable is True
+
+
 def test_malformed_success_is_a_typed_permanent_failure():
     response = httpx.Response(200, content=b"not-json")
     with pytest.raises(TDAMError) as caught:
@@ -85,6 +185,14 @@ def test_malformed_success_is_a_typed_permanent_failure():
 
 def test_non_object_success_data_is_a_typed_permanent_failure():
     response = httpx.Response(200, json={"code": 0, "data": []})
+    with pytest.raises(TDAMError) as caught:
+        _decode_response(response)
+    assert caught.value.kind == "invalid_response"
+    assert caught.value.retryable is False
+
+
+def test_non_object_response_envelope_is_a_typed_permanent_failure():
+    response = httpx.Response(200, json=[])
     with pytest.raises(TDAMError) as caught:
         _decode_response(response)
     assert caught.value.kind == "invalid_response"

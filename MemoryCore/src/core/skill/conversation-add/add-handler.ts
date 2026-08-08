@@ -239,7 +239,9 @@ export class SkillConversationAddHandler {
     const acceptedAtMs = this.now();
     const receipt: ConversationReceipt = {
       receipt_id: randomUUID(),
-      source_event_id: input.source_event_id,
+      ...(input.source_event_id === undefined
+        ? {}
+        : { source_event_id: input.source_event_id }),
       content_hash: input.content_hash ?? fingerprint,
       accepted_at_ms: acceptedAtMs,
     };

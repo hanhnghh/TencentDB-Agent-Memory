@@ -85,6 +85,58 @@ describe("CoreSkillClient conversation receipts", () => {
     });
   });
 
+  it.each([
+    [Object.assign(new Error("socket unavailable"), { name: "TypeError" }), "network"],
+    [Object.assign(new Error("deadline exceeded"), { name: "TimeoutError" }), "timeout"],
+  ])("classifies %s transport failures as retryable", async (transportError, kind) => {
+    const client = new CoreSkillClient(
+      config,
+      vi.fn(async () => { throw transportError; }) as typeof fetch,
+    );
+
+    const failure = await client.addConversation({
+      session_id: "session-1",
+      user_id: "user-1",
+      team_id: "team-1",
+      agent_id: "agent-1",
+      source_event_id: "event-1",
+      messages: [{ role: "user", content: "hello" }],
+    }).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      name: "CoreSkillClientError",
+      kind,
+      retryable: true,
+    });
+  });
+
+  it.each([
+    [40902, "conflict", false],
+    [50001, "server", true],
+  ])("classifies HTTP-200 business failure %i", async (code, kind, retryable) => {
+    const client = new CoreSkillClient(
+      config,
+      vi.fn(async () => response({ code, message: "failed", request_id: "request-business" })) as typeof fetch,
+    );
+
+    const failure = await client.addConversation({
+      session_id: "session-1",
+      user_id: "user-1",
+      team_id: "team-1",
+      agent_id: "agent-1",
+      source_event_id: "event-1",
+      messages: [{ role: "user", content: "hello" }],
+    }).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      name: "CoreSkillClientError",
+      code,
+      kind,
+      retryable,
+      requestId: "request-business",
+    });
+  });
+
   it("surfaces malformed success responses as typed permanent failures", async () => {
     const client = new CoreSkillClient(
       config,
@@ -129,6 +181,22 @@ describe("CoreSkillClient conversation receipts", () => {
       config,
       vi.fn(async () => response({ code: 0, data: [] })) as typeof fetch,
     );
+    const failure = await client.post("/v3/skill/listing", {})
+      .catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      name: "CoreSkillClientError",
+      kind: "invalid_response",
+      retryable: false,
+    });
+  });
+
+  it("rejects a non-object response envelope", async () => {
+    const client = new CoreSkillClient(
+      config,
+      vi.fn(async () => response([])) as typeof fetch,
+    );
+
     const failure = await client.post("/v3/skill/listing", {})
       .catch((error: unknown) => error);
 

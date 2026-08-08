@@ -25,8 +25,11 @@
  *   docs/design/2026-07-17-conversation-normalize.md。
  */
 
+import { createHash } from "node:crypto";
+
 import type { ProxyConfig } from "../types.js";
 import type { AssetCapabilityFlags } from "../injection/types.js";
+import { countHumanTurns } from "../turnSeq.js";
 import { getCoreSkillClient } from "./core-client.js";
 import {
   countToolCalls,
@@ -120,6 +123,17 @@ export async function triggerSkillExtractIfReady(input: TriggerInput): Promise<v
     );
     if (turnMessages.length === 0) return;
 
+    // Keep identity independent from content: an exact retry returns Core's
+    // original receipt, while changed content for the same turn conflicts.
+    const turnSequence = countHumanTurns(rawMsgs, input.protocol);
+    const sourceEventId = `proxy:${sha256(JSON.stringify({
+      agent_source: input.agentSource,
+      protocol: input.protocol,
+      session_id: sessionKey,
+      turn_sequence: turnSequence,
+    }))}`;
+    const contentHash = `sha256:${sha256(JSON.stringify(turnMessages))}`;
+
     try {
       const client = getCoreSkillClient(config.coreSkill);
       const t0 = Date.now();
@@ -131,6 +145,8 @@ export async function triggerSkillExtractIfReady(input: TriggerInput): Promise<v
           team_id: teamId,
           agent_id: agentId,
           task_id: sessionInfo.task_id as string | undefined,
+          source_event_id: sourceEventId,
+          content_hash: contentHash,
           messages: turnMessages,
         },
         // core Shark 走 x-tdai-service-id = 真实内核实例 ID
@@ -169,3 +185,7 @@ export async function triggerSkillExtractIfReady(input: TriggerInput): Promise<v
 
 // 兼容: 部分老代码从 handler-glue 里 import countToolCalls
 export { countToolCalls };
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}

@@ -124,6 +124,35 @@ asyncio.run(main())
 | Offload | `offload_compact()` | `POST /v2/offload/compact` |
 | Offload | `offload_query_mmd()` | `POST /v2/offload/query-mmd` |
 
+## Duplicate-safe skill conversation ingestion
+
+`SkillClient.conversation_add()` and its async counterpart accept optional
+`source_event_id` and `content_hash` values. Reuse a stable event ID when
+retrying one completed round. An exact replay returns the original durable
+`receipt`; the same ID with changed content raises `TDAMError` with
+`kind == "conflict"` and `retryable is False`. Network failures, timeouts,
+throttling, and server failures are exposed as typed retryable errors.
+
+```python
+from tencentdb_agent_memory.v3 import SkillClient
+
+skills = SkillClient(
+    endpoint="http://127.0.0.1:8420",
+    api_key="your-user-key",
+    service_id="your-memory-instance-id",
+)
+result = skills.conversation_add(
+    session_id="sess-1",
+    source_event_id="stop:sess-1:turn-7",
+    content_hash="sha256:...",
+    user_id="usr-1",
+    team_id="team-1",
+    agent_id="agent-1",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(result["receipt"]["receipt_id"])
+```
+
 ## MetadataClient (v3 management plane)
 
 `MetadataClient` / `AsyncMetadataClient` wrap the gateway's v3 management-plane endpoints. Unlike `MemoryClient` they do **not** require the isolation quad (team/agent/user/session); auth is Bearer + `x-tdai-service-id`, with business fields like `team_id` in the request body.

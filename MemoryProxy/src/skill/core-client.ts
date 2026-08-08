@@ -125,7 +125,7 @@ export interface ExtractAsyncResult {
  *   - session_id / space_id / user_id / team_id / agent_id 全部必填
  *   - ID 字段不能包含 `|`（Core 拒绝，返回 400）
  *   - messages 是本轮增量（user + 中间 tool_call/tool_result + assistant 总结），
- *     不重传历史（Core 不去重，重传会造成 buffer 重复）
+ *     不重传历史；重试同一轮时复用 source_event_id
  *   - source_event_id 可选；传入后 Core 对重放去重并返回同一 receipt
  *   - space_id 若显式提供，必须与请求使用的 x-tdai-service-id 一致
  *   - Core 会在 server 侧串行同 session；caller 仍可串行以减少排队

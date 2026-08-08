@@ -1,5 +1,13 @@
 # Changelog — tencentdb-agent-memory-sdk-python
 
+## Unreleased — 2026-08-08
+
+### Added
+
+- Sync and async `conversation_add()` accept optional `source_event_id` and
+  `content_hash`, return a durable receipt, and expose typed retry/conflict
+  classification through `TDAMError`.
+
 ## Unreleased — 2026-07-31
 
 ### Added
