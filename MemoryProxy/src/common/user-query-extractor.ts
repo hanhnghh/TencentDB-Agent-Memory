@@ -2,11 +2,10 @@
  * User query extractor —— 从 CC / CodeBuddy / 其他 coding agent 的 user
  * message content 里剥掉一切 harness 上下文，只保留"用户真正键入的文本"。
  *
- * 使用场景（proxy 内三处共用）：
- *   1. tdai/recorder.ts::extractLatestUserMessage —— L0 写入
- *   2. agent-adapters/codebuddy.ts::extractUserText —— mem 命令 parser +
+ * 使用场景（proxy 内共用）：
+ *   1. agent-adapters/codebuddy.ts::extractUserText —— mem 命令 parser +
  *      normalize-conversation 抽 skill buffer 干净文本
- *   3. mem-command 通过 adapter.extractUserText 间接调用
+ *   2. mem-command 通过 adapter.extractUserText 间接调用
  *
  * 抽取语义（按优先级排列）：
  *
@@ -26,7 +25,7 @@
  *      - 「会话初始化 — ...」标题残留行
  *      → 剥离完剩下什么就是用户键入
  *
- * 迁移历史：本文件由 tdai/recorder.ts 抽离而来（原为 tdai 私有），语义未变。
+ * 迁移历史：本文件由旧 direct-writer helper 抽离而来，语义未变。
  * 见 docs/design/2026-07-30-cc-request-routing-plan.md 附录 + codebuddy adapter
  * 抓包结论。
  */

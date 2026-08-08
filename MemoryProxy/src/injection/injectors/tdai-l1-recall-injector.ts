@@ -3,7 +3,7 @@ import { HOOK_PRIORITY } from "../types.js";
 import { getLastUserMessage, getMessageText } from "../context.js";
 import type { TdaiClient } from "../../tdai/client.js";
 import { getTdaiIdentity } from "../../tdai/identity.js";
-import { extractUserQueryText } from "../../tdai/recorder.js";
+import { extractUserQueryText } from "../../common/user-query-extractor.js";
 import type { CoreSkillConfig } from "../../types.js";
 import { getMetadataClient } from "../../meta/client.js";
 import { resolveFixedAssetCtxs } from "./tdai-fixed-asset.js";

@@ -1,12 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TdaiClient, TdaiWriteError } from "../client.js";
-import {
-  __resetL0WriteOrderingForTests,
-  withL0Retry,
-  withL0SessionOrdering,
-} from "../pending-writes.js";
-import { recordTdaiTurn } from "../recorder.js";
 import type { TdaiIdentity, TdaiMemoryConfig, TdaiMessage } from "../types.js";
 
 const config: TdaiMemoryConfig = {
@@ -63,121 +57,9 @@ afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
-  __resetL0WriteOrderingForTests();
 });
 
 describe("TdaiClient L0 write contract", () => {
-  it("serializes same-session writes while keeping agent-source scopes independent", async () => {
-    const order: string[] = [];
-    let releaseFirst = (): void => undefined;
-    const firstBlocked = new Promise<void>((resolve) => {
-      releaseFirst = resolve;
-    });
-    const scope = {
-      serviceId: "memory-1",
-      teamId: "team-1",
-      userId: "user-1",
-      agentId: "agent-1",
-      taskId: "task-1",
-      agentSource: "codebuddy",
-      sessionId: "session-1",
-    };
-
-    const first = withL0SessionOrdering(scope, async () => {
-      order.push("first:start");
-      await firstBlocked;
-      order.push("first:end");
-    });
-    const second = withL0SessionOrdering(scope, async () => {
-      order.push("second");
-    });
-    const otherSource = withL0SessionOrdering({ ...scope, agentSource: "claude-code" }, async () => {
-      order.push("other-source");
-    });
-
-    await otherSource;
-    expect(order).toEqual(["first:start", "other-source"]);
-    releaseFirst();
-    await Promise.all([first, second]);
-    expect(order).toEqual(["first:start", "other-source", "first:end", "second"]);
-  });
-
-  it("derives stable but distinct source events for separate same-turn responses", async () => {
-    const seenSourceEvents: string[] = [];
-    const client = {
-      addConversation: vi.fn(async (
-        _identity: TdaiIdentity,
-        _messages: TdaiMessage[],
-        options: { sourceEventId?: string; contentHash?: string } = {},
-      ) => {
-        seenSourceEvents.push(options.sourceEventId ?? "");
-        return { acceptedIds: [], totalCount: 0, receipts: [] };
-      }),
-    };
-    const userMessage: TdaiMessage = { role: "user", content: "run the checks" };
-    const source = { sourceEventId: "proxy:session-1:turn:4" };
-
-    await recordTdaiTurn(client, identity, userMessage, "first tool request", source);
-    await recordTdaiTurn(client, identity, userMessage, "first tool request", source);
-    await recordTdaiTurn(client, identity, userMessage, "final response", source);
-
-    expect(seenSourceEvents[0]).toBe(seenSourceEvents[1]);
-    expect(seenSourceEvents[2]).not.toBe(seenSourceEvents[0]);
-  });
-
-  it("replays partial batches with stable event ids and returns all receipts", async () => {
-    const messages: TdaiMessage[] = Array.from({ length: 101 }, (_, index) => ({
-      role: index % 2 === 0 ? "user" : "assistant",
-      content: `message-${index}`,
-    }));
-    const seenEventIds: string[] = [];
-    let request = 0;
-    vi.spyOn(Math, "random").mockReturnValue(0);
-    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
-      request += 1;
-      const body = parseConversationWriteBody(init);
-      seenEventIds.push(body.sourceEventId);
-      if (request === 2) {
-        return new Response(JSON.stringify({ code: 503, message: "storage unavailable", request_id: "req-2" }), {
-          status: 503,
-          headers: { "content-type": "application/json" },
-        });
-      }
-      const duplicate = request === 3;
-      const acceptedIds = body.messages.map((_, index) => `${body.sourceEventId}-${index}`);
-      return new Response(JSON.stringify({
-        code: 0,
-        message: "ok",
-        request_id: `req-${request}`,
-        data: {
-          accepted_ids: acceptedIds,
-          accepted_versions: acceptedIds.map(() => "v1"),
-          total_count: acceptedIds.length,
-          receipt: {
-            source_event_id: body.sourceEventId,
-            content_hash: body.contentHash,
-            status: duplicate ? "duplicate" : "committed",
-            committed_at: "2026-08-08T00:00:00.000Z",
-          },
-        },
-      }), { status: 200, headers: { "content-type": "application/json" } });
-    }));
-
-    const result = await withL0Retry(
-      () => new TdaiClient(config).addConversation(identity, messages, { sourceEventId: "turn-7" }),
-      { attempts: 2, baseMs: 0 },
-    );
-
-    expect(seenEventIds).toEqual([
-      "turn-7:batch:0-of-2",
-      "turn-7:batch:1-of-2",
-      "turn-7:batch:0-of-2",
-      "turn-7:batch:1-of-2",
-    ]);
-    expect(result.totalCount).toBe(101);
-    expect(result.receipts.map((receipt) => receipt.status)).toEqual(["duplicate", "committed"]);
-  });
-
   it.each([
     { count: 100, expectedBatches: 1 },
     { count: 101, expectedBatches: 2 },
@@ -291,18 +173,6 @@ describe("TdaiClient L0 write contract", () => {
 
     expect(error).toBeInstanceOf(TdaiWriteError);
     expect(error).toMatchObject({ kind: "http", status: 400, retryable: false });
-  });
-
-  it("does not retry a permanent 4xx write failure", async () => {
-    const write = vi.fn(async () => {
-      throw new TdaiWriteError("http", "invalid request", false, 400);
-    });
-
-    await expect(withL0Retry(write, { attempts: 3, baseMs: 0 })).rejects.toMatchObject({
-      status: 400,
-      retryable: false,
-    });
-    expect(write).toHaveBeenCalledTimes(1);
   });
 
   it("surfaces a write timeout as a typed retryable timeout error", async () => {

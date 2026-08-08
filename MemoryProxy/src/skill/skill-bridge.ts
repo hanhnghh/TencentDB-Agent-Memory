@@ -24,9 +24,8 @@ import { extractBearerToken } from "../opik.js";
 import { apiKeyToKeyId } from "../opik.js";
 import { getSessionStore } from "../session/store.js";
 import { verifyUserKey, isAuthEnabled } from "../auth.js";
-// getSkillExtractTrigger / KvExtractStore 已随老链路一起删除。
-// 详见 handler-glue.ts 顶部注释 —— skill_extract 触发路径当前不可用,
-// core 侧后续会出手动归档接口, 到时 agent 工具再重新指向那个接口。
+// The retired proxy-side extract trigger is intentionally not exposed here;
+// Core can add an explicit manual-archive operation when that contract exists.
 import { getRedisClient } from "../db/redis-client.js";
 import { VersionPinRepo } from "./version-pin-repo.js";
 import { KvVersionPinRepo } from "./kv-version-pin-repo.js";

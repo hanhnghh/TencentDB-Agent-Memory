@@ -4,7 +4,7 @@
  * Scope: only the endpoints the proxy itself calls.
  *   - POST /v3/skill/search              → SkillInjector RAG 检索.
  *   - POST /v3/skill/listing             → SkillInjector owner-agent listing.
- *   - POST /v3/skill/conversation/add    → handler-glue 新链路, 每轮真人对话结束推送.
+ *   - POST /v3/skill/conversation/add    → durable MemoryRuntime delivery.
  *   - POST /v3/skill/extract 等其他方法保留在类里, 供 agent 通过 skill-bridge
  *     反代时透传使用 (agent 通过 curl 直接命中, 不由 proxy 主动触发)。
  *

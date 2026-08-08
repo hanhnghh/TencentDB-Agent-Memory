@@ -4,16 +4,13 @@
  *
  * Motivation:
  *   The read side (injection) has a first-class pipeline + hook registry +
- *   yaml whitelist (`injection.injectors: [...]`). The write side
- *   historically had none — `triggerSkillExtractIfReady` and
- *   `recordTdaiTurn` were sprinkled across handler.ts / anthropicHandler.ts
- *   and had no top-level kill switch. Operators could not "inject but not
- *   extract" without touching source dependencies.
+ *   yaml whitelist (`injection.injectors: [...]`). MemoryRuntime uses this
+ *   gate when deciding which durable completed-round channels to enqueue.
  *
  * Design (intentionally minimal — keep the stable version stable):
  *   - Add ONE yaml section: `extraction: { enabled, extractors: [...] }`.
  *   - Add ONE pure predicate: `isExtractionAllowed(config, asset)`.
- *   - Wrap each existing call site in `if (isExtractionAllowed(...))`.
+ *   - Evaluate it once behind the MemoryRuntime extraction port.
  *
  * Backwards compatibility is preserved by making the gate PERMISSIVE when
  * the config section is missing or malformed:
@@ -24,12 +21,10 @@
  *   - `extractors: []`                    → deny everything
  *   - `extractors: ["skill"]`             → allow only "skill"
  *
- * Adding a new extractor asset later means: register it under a stable name
- * here and add one `if (isExtractionAllowed(config, "your-asset"))` at the
- * new call site. No pipeline refactor required.
+ * Adding a new extractor asset later means registering it under a stable name
+ * and mapping it once in the runtime extraction adapter.
  */
 
-import { log } from "./report/log.js";
 import type { ProxyConfig } from "./types.js";
 
 export function isExtractionAllowed(config: ProxyConfig, asset: string): boolean {
@@ -41,33 +36,4 @@ export function isExtractionAllowed(config: ProxyConfig, asset: string): boolean
   // so a partial or misconfigured yaml never silently disables writes.
   if (!Array.isArray(ext.extractors)) return true;
   return ext.extractors.includes(asset);
-}
-
-/**
- * Emit a structured debug event when the gate blocks an extraction call.
- * Call this in the *else* branch of `isExtractionAllowed`. No-ops when the
- * asset would have been allowed anyway (defensive: prevents misleading
- * "skipped" events if a caller forgets the surrounding `if`).
- *
- * Level rationale: emitted at DEBUG level (not INFO) because it fires on
- * every turn once extraction is off and would swamp production log volume.
- * Flip `log.level=debug` when investigating "why isn't extract running?".
- */
-export function logExtractionSkipped(
-  config: ProxyConfig,
-  asset: string,
-  sessionKey: string | undefined,
-): void {
-  // If this asset is actually allowed, do NOT emit a skip event — that would
-  // be a lie. This makes the function safe to call unconditionally next to
-  // an `if (!isExtractionAllowed(...))` guard without worrying about drift.
-  if (isExtractionAllowed(config, asset)) return;
-
-  const ext = config.extraction;
-  const reason =
-    !ext ? "no-config"                          // won't happen (allowed path)
-    : ext.enabled === false ? "disabled"        // extraction.enabled=false
-    : "not-in-extractors";                      // asset missing from whitelist
-  const session = sessionKey && sessionKey.length > 0 ? sessionKey : "-";
-  log.debug("extraction.skipped", { asset, session, reason });
 }

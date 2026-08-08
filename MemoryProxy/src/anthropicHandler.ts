@@ -39,13 +39,6 @@ import { writeFailedReportRaw } from "./clickhouse.js";
 import { verifyUserKey } from "./auth.js";
 import { matchSystemUserByUserId, hasSystemUsers } from "./systemUser.js";
 import { handleSystemUserPassthrough } from "./systemUserPassthrough.js";
-import { TdaiClient } from "./tdai/client.js";
-import { deriveTdaiIdentity } from "./tdai/identity.js";
-import { extractLatestUserMessage, recordTdaiTurn } from "./tdai/recorder.js";
-import { trackWrite, withL0Retry, withL0SessionOrdering } from "./tdai/pending-writes.js";
-import type { TdaiIdentity, TdaiMessage } from "./tdai/types.js";
-import { triggerSkillExtractIfReady } from "./skill/handler-glue.js";
-import { isExtractionAllowed, logExtractionSkipped } from "./extraction-gate.js";
 import type { CcRequestKind } from "./common/cc-request-classifier.js";
 import { buildRequestDebugMetadata } from "./common/langfuse-debug.js";
 import { resolveAgentAdapter } from "./agent-adapters/index.js";
@@ -86,28 +79,6 @@ const SKIP_RESPONSE_HEADERS = new Set([
   "content-length",
   "connection",
 ]);
-
-/**
- * Build a per-request TdaiClient. `spaceId` (extracted from the request path
- * `/{agent}/{spaceId}/...`) overrides `config.tdai.serviceId` so writes/recalls
- * land on the correct kernel tenant. Falls back to config when the request
- * carries no spaceId (older single-tenant deployments).
- */
-function createTdaiClient(config: ProxyConfig, spaceId?: string): TdaiClient | null {
-  if (!config.tdai.enabled || !config.tdai.memory.enabled || !config.tdai.endpoint) return null;
-  return new TdaiClient({
-    enabled: config.tdai.enabled && config.tdai.memory.enabled,
-    endpoint: config.tdai.endpoint,
-    apiKey: config.tdai.apiKey,
-    serviceId: spaceId || config.tdai.serviceId,
-    writeL0: config.tdai.memory.writeL0,
-    recallL1: config.tdai.memory.recallL1,
-    injectL2L3: config.tdai.memory.injectL2L3,
-    l1Limit: config.tdai.memory.l1Limit,
-    l2Limit: config.tdai.memory.l2Limit,
-    timeoutMs: config.tdai.memory.timeoutMs,
-  });
-}
 
 /**
  * Normalize Anthropic top-level `system` field into a plain string for
@@ -810,59 +781,6 @@ export async function handleAnthropicMessages(
         console.log(`[session-init] session=${sessionKey} bypassed → skipping all injection`);
       }
 
-      if (!memoryRuntime && !initResult.bypassed && initResult.sessionInfo) {
-        try {
-          const { fetchAssetCapabilities } = await import("./tdai/capabilities.js");
-          assetCapabilities = await fetchAssetCapabilities({
-            endpoint: config.tdai.endpoint,
-            apiKey: config.tdai.apiKey,
-            serviceId: config.tdai.serviceId,
-            serviceIdOverride: spaceId,
-            userId: (initResult.sessionInfo as { user_id?: string }).user_id,
-            userKey: callerUserKey,
-            timeoutMs: config.tdai.memory.timeoutMs,
-          });
-          console.log(`[asset-capability] user=${(initResult.sessionInfo as { user_id?: string }).user_id ?? "-"} flags=${JSON.stringify(assetCapabilities)}`);
-        } catch (err) {
-          console.warn(`[asset-capability] resolve failed: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
-
-      // Await prewarm so the first-turn pipeline always hits the cache.
-      // A fire-and-forget void() here caused the bug where the pipeline
-      // ran before the cache was populated, silently injecting zero
-      // blocks for the entire first turn.
-      if (
-        !memoryRuntime &&
-        !initResult.bypassed &&
-        initResult.justRegistered &&
-        initResult.sessionInfo &&
-        config.injection?.enabled &&
-        (config.injection.injectors?.length ?? 0) > 0
-      ) {
-        try {
-          const mod = await import("./injection/index.js");
-          await mod.prewarmFromConfig(config, {
-            keyId: sessionKey,
-            userId: userId || "anonymous",
-            agentSource,
-            sessionInfo: initResult.sessionInfo as import("./session/types.js").SessionInfo,
-            agentDetail: initResult.agentDetail ?? null,
-            taskDetail: initResult.taskDetail ?? null,
-            assetCapabilities,
-            // 透传 caller 的 sk-mem key，用于 prewarm 阶段 TDAI ACL 校验（x-tdai-user-key）
-            callerUserKey: callerUserKey ?? undefined,
-          });
-        } catch (err) {
-          console.warn(
-            "[hook-cache] handler prewarm error (anthropic):",
-            err instanceof Error ? err.message : String(err),
-          );
-          // Don't re-throw: the pipeline's resolveHookBlocks has its own
-          // cache-miss → execute() fallback as a safety net (see pipeline.ts).
-        }
-      }
-
       if (initResult.messages) {
         body = { ...body, messages: initResult.messages };
         messages = initResult.messages as unknown[];
@@ -1007,51 +925,6 @@ export async function handleAnthropicMessages(
         thinking: thinkingEnabled,
       });
 
-      // Step 20: L0 写入 — 保证对话时间线完整。
-      //   同步 await 保证 L0 落盘再返回，避免响应先返回后进程未 flush 就退出丢失。
-      //   注意：只有 mem 命令时全网只有这一次落盘，跟主对话路径不同（那边有 SIGTERM
-      //   trackWrite 兜底 + withL0Retry），这里必须显式等。
-      const tdaiClientForMem = createTdaiClient(config, spaceId);
-      const tdaiIdentityForMem = deriveTdaiIdentity({
-        sessionInfo: sessionInfo as Record<string, unknown> | null | undefined,
-        userId: userId || null,
-        sessionKey,
-        userKey: callerUserKey,
-      });
-      if (!memoryRuntime && tdaiClientForMem && tdaiIdentityForMem && isExtractionAllowed(config, "tdai-memory")) {
-        const userMsg = { role: "user" as const, content: memCmd.rawMessage };
-        try {
-          await recordTdaiTurn(tdaiClientForMem, tdaiIdentityForMem, userMsg, memResult.messageText);
-        } catch (err: unknown) {
-          console.error("[mem-command] L0 write error:", err);
-        }
-      }
-
-      // Step 19: skill extract — 对话轮次计数正常累积
-      //   Bug: 之前用 `config.extraction?.skill?.enabled` 访问路径错误
-      //        (extraction 结构是 { enabled, extractors: [...] }, 没有 .skill),
-      //        导致 mem 命令**从来**没写过 skill buffer。改用 isExtractionAllowed
-      //        与主对话链路对齐。
-      //   Bug: fire-and-forget 没 await 导致响应先返回、写入被中断。改成同步 await
-      //        保证 buffer 落盘再返回响应。
-      if (!memoryRuntime && isExtractionAllowed(config, "skill")) {
-        try {
-          const assistantMsg = { role: "assistant", content: [{ type: "text", text: memResult.messageText }] };
-          await triggerSkillExtractIfReady({
-            config,
-            sessionKey,
-            agentSource,
-            sessionInfo: sessionInfo as Record<string, unknown>,
-            inputMessages: messages as unknown[],
-            assistantMessage: assistantMsg,
-            protocol: "anthropic",
-            assetCapabilities,
-          });
-        } catch (err: unknown) {
-          console.warn("[mem-command] skill extract trigger error:", err instanceof Error ? err.message : String(err));
-        }
-      }
-
       if (memoryRuntime && memoryRuntimeWriteEnabled) {
         await commitAnthropicCompletedRound({
           runtime: memoryRuntime,
@@ -1075,53 +948,7 @@ export async function handleAnthropicMessages(
     }
   }
 
-  const tdaiClient = assetCapabilities?.chat_memory === false ? null : createTdaiClient(config, spaceId);
-  const tdaiIdentity = injectedSkipped
-    ? null
-    : deriveTdaiIdentity({
-        sessionInfo: sessionInfo as Record<string, unknown> | null | undefined,
-        userId: userId || null,
-        sessionKey,
-        userKey: callerUserKey,
-      });
-  const tdaiUserMessage = extractLatestUserMessage(messages);
-
-  // ── Context injection (before cost guard) ────────────────────────────────
-  // CC 分流：
-  //   - SIDEQUERY: 完全跳过 injection（自带短 prompt，不共享 cache）
-  //   - FORK: 走 pipeline 但 readOnly=true（miss 时不 self-heal 写 cache，避免破坏主对话 cache）
-  //   - MAIN: 走完整 pipeline（含 self-heal）
-  const skipInjection = requestKind === "sidequery";
-  if (!memoryRuntime && !injectedSkipped && !skipInjection && config.injection?.enabled && config.injection.injectors.length > 0) {
-    try {
-      console.log(`[injection-debug] entering injection pipeline session=${sessionKey} turnSeq=${countHumanTurns(messages, "anthropic")} injectors=${config.injection.injectors} kind=${requestKind}`);
-      const injectionTurnSeq = countHumanTurns(messages, "anthropic");
-      const { getInjectionPipeline } = await import("./injection/index.js");
-      const pipeline = getInjectionPipeline(config);
-      const injectedBody = await pipeline.process(body, {
-        protocol: "anthropic",
-        traceId,
-        keyId,
-        modelId: modelId as string,
-        stream: isStream,
-        agentSource,
-        userId: userId || "anonymous",
-        spaceId,
-        sessionKey,
-        turnSeq: injectionTurnSeq,
-        // 透传原始请求路径 —— AssetReflectionInjector 用它判断 `/analyse` marker。
-        // 其它 injector 不依赖此字段。
-        requestPath: c.req.path,
-        custom: sessionInfo ? { session: sessionInfo, userKey: callerUserKey ?? undefined, assetCapabilities } : undefined,
-        readOnly: requestKind === "fork",
-      });
-      body = injectedBody;
-      messages = Array.isArray(injectedBody.messages) ? injectedBody.messages : messages;
-      hasTools = Array.isArray(body.tools) && body.tools.length > 0;
-    } catch (err: unknown) {
-      console.error("[injection] anthropic pipeline error:", err instanceof Error ? err.message : String(err));
-    }
-  } else if (skipInjection) {
+  if (requestKind === "sidequery") {
     console.log(`[injection-debug] skipping injection for kind=sidequery session=${sessionKey}`);
   }
 
@@ -1384,20 +1211,12 @@ export async function handleAnthropicMessages(
       retried,
       logMeta: retried ? { retrySuccess: true } : {},
       pipe,
-      sessionKeyForSkill: sessionKey,
       agentSource,
-      sessionInfo,
-      tdaiClient,
-      tdaiIdentity,
-      tdaiUserMessage,
-      assetCapabilities,
       lf,
       spaceId,
       upstreamRequestId,
-      requestKind,
       langfuseDebug,
       debugMetadata,
-      memoryRuntime,
       runtimeCommit: memoryRuntime && memoryRuntimeWriteEnabled
         ? {
             runtime: memoryRuntime,
@@ -1554,58 +1373,6 @@ export async function handleAnthropicMessages(
   }
 
   pipe.responseDone(usage);
-
-  // CC 分流：FORK/SIDEQUERY 是 CC 客户端后台自发调用，不是用户真实对话轮，
-  //          跳过 skill/L0 副作用。Credit 仍上报（token 消耗真实）。
-  const isMainDialog = requestKind === "main";
-
-  // Skill extract trigger — count tool_use blocks + buffer conversation.
-  // 同步 await：直到 store 落盘再继续，保证下一轮跨节点读到最新数据。
-  if (!memoryRuntime && isMainDialog && isExtractionAllowed(config, "skill")) {
-    await triggerSkillExtractIfReady({
-      config,
-      sessionKey,
-      agentSource,
-      sessionInfo,
-      inputMessages: messages,
-      assistantMessage,
-      protocol: "anthropic",
-      assetCapabilities,
-      turnSequence: lf.turnSeq,
-    });
-  } else if (!memoryRuntime && isMainDialog) {
-    logExtractionSkipped(config, "skill", sessionKey);
-  } else if (!isMainDialog) {
-    console.log(`[cc-routing] skip skill buffer for kind=${requestKind} session=${sessionKey}`);
-  }
-
-  // TDAI L0 write (non-streaming).
-  //
-  // 与 stream 分支 (1476-1481) 对称：把 user_query + assistant 回复写入 L0
-  // 短期记忆。**此前仅 stream=true 会写**，non-stream 请求（如工具/测试脚本
-  // 常用的 stream:false）沉默丢失。缺失该调用意味着 CC non-stream 场景
-  // 完全没有 L0 记忆写入。
-  if (!memoryRuntime && isMainDialog && tdaiClient && isExtractionAllowed(config, "tdai-memory")) {
-    await withL0SessionOrdering({
-      serviceId: config.tdai.serviceId || "default",
-      teamId: tdaiIdentity?.teamId ?? "",
-      userId: tdaiIdentity?.userId ?? "",
-      agentId: tdaiIdentity?.agentId ?? "",
-      taskId: tdaiIdentity?.taskId,
-      agentSource,
-      sessionId: sessionKey,
-    }, () => withL0Retry(() => recordTdaiTurn(
-      tdaiClient,
-      tdaiIdentity,
-      tdaiUserMessage,
-      outputContent,
-      { sourceEventId: `proxy:${agentSource}:${sessionKey}:turn:${lf.turnSeq}` },
-    ))).catch((err: unknown) => pipe.error("TDAI_L0", err));
-  } else if (!memoryRuntime && isMainDialog && tdaiClient) {
-    logExtractionSkipped(config, "tdai-memory", sessionKey);
-  } else if (!isMainDialog) {
-    console.log(`[cc-routing] skip L0 write for kind=${requestKind} session=${sessionKey}`);
-  }
 
   // Credit usage reporting (non-streaming). Failures are surfaced to the client
   // via the `x-credit-report-error` response header but never replace the
@@ -1823,29 +1590,17 @@ interface AnthropicTapContext {
   retried: boolean;
   logMeta: Record<string, unknown>;
   pipe: ReturnType<typeof createPipeline>;
-  /** For skill extract trigger. */
-  sessionKeyForSkill: string;
-  /** Client type (URL path 第一段) — 透传给 extract trigger 作为三段隔离键之一。 */
   agentSource: string;
-  sessionInfo: Record<string, unknown> | null | undefined;
-  /** Tdai L0 write. */
-  tdaiClient: TdaiClient | null;
-  tdaiIdentity: TdaiIdentity | null;
-  tdaiUserMessage: TdaiMessage | null;
-  assetCapabilities?: import("./injection/types.js").AssetCapabilityFlags;
   /** Langfuse turn-trace context (trace = one turn). */
   lf: LangfuseTurnContext;
   /** Space/tenant ID from request path. */
   spaceId?: string;
   /** Upstream response header `x-request-id` (empty when not returned). */
   upstreamRequestId?: string;
-  /** CC 请求分流类别，决定 stream 完成后是否触发 skill/L0 副作用。 */
-  requestKind: CcRequestKind;
   /** `config.langfuse.debug === true` 的求值结果，透传避免流内重复读 config。 */
   langfuseDebug: boolean;
   /** buildRequestDebugMetadata 求值结果；debug=false 时为 {}。 */
   debugMetadata: Record<string, unknown>;
-  memoryRuntime?: MemoryRuntimeContract;
   runtimeCommit?: {
     runtime: MemoryRuntimeContract;
     identity: {
@@ -1981,63 +1736,7 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
         }
       }
 
-      // CC 分流：FORK/SIDEQUERY 不是真实对话轮，跳过 L0/skill。Credit 仍上报。
-      const isMainDialog = ctx.requestKind === "main";
-
-      // Tdai L0 write
-      const tdaiClient = ctx.tdaiClient;
-      if (!ctx.memoryRuntime && isMainDialog && tdaiClient && isExtractionAllowed(ctx.config, "tdai-memory")) {
-        // Streaming 不 await（会拖慢 SSE 关流），trackWrite + withL0Retry 应对两条丢包线：
-        //   - trackWrite 注册 in-flight promise 到全局 set；SIGTERM 时 index.ts 会
-        //     flushPendingWrites 兜底，避免 pod rolling 时 event loop 未 flush 就退出丢 L0。
-        //   - withL0Retry 3 次退避重试（~3.5s），挡 tdai kernel 瞬断 / 5xx / 网络抖动。
-        trackWrite(
-          withL0SessionOrdering({
-            serviceId: ctx.config.tdai.serviceId || "default",
-            teamId: ctx.tdaiIdentity?.teamId ?? "",
-            userId: ctx.tdaiIdentity?.userId ?? "",
-            agentId: ctx.tdaiIdentity?.agentId ?? "",
-            taskId: ctx.tdaiIdentity?.taskId,
-            agentSource: ctx.agentSource,
-            sessionId: ctx.sessionKeyForSkill,
-          }, () => withL0Retry(() => recordTdaiTurn(
-            tdaiClient,
-            ctx.tdaiIdentity,
-            ctx.tdaiUserMessage,
-            outputText || null,
-            { sourceEventId: `proxy:${ctx.agentSource}:${ctx.sessionKeyForSkill}:turn:${lf.turnSeq}` },
-          ))).catch((err: unknown) => pipe.error("TDAI_L0", err))
-        );
-      } else if (!ctx.memoryRuntime && isMainDialog && tdaiClient) {
-        logExtractionSkipped(ctx.config, "tdai-memory", ctx.sessionKeyForSkill);
-      } else if (!isMainDialog) {
-        console.log(`[cc-routing] skip L0 write (stream) for kind=${ctx.requestKind} session=${ctx.sessionKeyForSkill}`);
-      }
-
       pipe.streamDone(Object.keys(usage).length > 0 ? usage : null);
-
-      // Skill extract trigger — after stream finalization.
-      // 同步 await：直到 store 落盘再继续，保证下一轮跨节点读到最新数据。
-      if (!ctx.memoryRuntime && isMainDialog && isExtractionAllowed(ctx.config, "skill")) {
-        await triggerSkillExtractIfReady({
-          config: ctx.config,
-          sessionKey: ctx.sessionKeyForSkill,
-          agentSource: ctx.agentSource,
-          sessionInfo: ctx.sessionInfo,
-          inputMessages: ctx.inputMessages,
-          assistantMessage: outputText
-            ? { role: "assistant", content: outputText }
-            : null,
-          protocol: "anthropic",
-          assetCapabilities: ctx.assetCapabilities,
-          toolCallCountOverride: toolUseCount,
-          turnSequence: ctx.lf.turnSeq,
-        });
-      } else if (!ctx.memoryRuntime && isMainDialog) {
-        logExtractionSkipped(ctx.config, "skill", ctx.sessionKeyForSkill);
-      } else if (!isMainDialog) {
-        console.log(`[cc-routing] skip skill buffer (stream) for kind=${ctx.requestKind} session=${ctx.sessionKeyForSkill}`);
-      }
 
       // Credit accounting remains a transport responsibility and must run even
       // when the subsequent durable memory enqueue fails.

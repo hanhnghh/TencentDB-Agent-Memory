@@ -20,7 +20,6 @@ import { initAuth } from "./auth.js";
 import { initSystemUsers } from "./systemUser.js";
 import { checkConnectivity } from "./connectivity.js";
 import { initProxyStorage, getEffectiveBackend } from "./storage/factory.js";
-import { flushPendingWrites, pendingWriteCount } from "./tdai/pending-writes.js";
 import { createProxyMemoryRuntime } from "./runtime/proxy-production.js";
 
 const overrides = parseArgv(process.argv);
@@ -113,18 +112,8 @@ serve(
 );
 
 // ── Graceful shutdown ────────────────────────────────────────────────────────
-// L0 flush 顺序放在最前：streaming 场景 recordTdaiTurn 是 fire-and-forget，
-// pod rolling update 收到 SIGTERM 时 event loop 里可能还有 in-flight POST
-// 未落到 tdai kernel。先等它们跑完（10s 兜底），再关闭 langfuse/clickhouse/log。
-// k8s 默认 terminationGracePeriodSeconds=30s，10s 留出充足余量。
 async function gracefulShutdown(signal: "SIGTERM" | "SIGINT"): Promise<void> {
   log.info("server.shutdown", { signal });
-  const pending = pendingWriteCount();
-  if (pending > 0) {
-    log.info("server.shutdown.flush_l0", { pending });
-    const { drained, remaining } = await flushPendingWrites(10_000);
-    log.info("server.shutdown.flush_l0.done", { drained, remaining });
-  }
   await shutdownGuard();
   await proxyMemoryRuntime?.shutdown();
   await shutdownLangfuse();

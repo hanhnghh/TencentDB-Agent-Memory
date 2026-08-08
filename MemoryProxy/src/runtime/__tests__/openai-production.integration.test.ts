@@ -18,7 +18,7 @@ import {
   PARITY_TASK,
 } from "../../__tests__/memory-parity/fixtures.js";
 import { parseRequestBody } from "../../__tests__/memory-parity/test-support.js";
-import { createOpenAIMemoryRuntime } from "../openai-production.js";
+import { createProxyMemoryRuntime } from "../proxy-production.js";
 
 const roots: string[] = [];
 const previousOutboxPath = process.env.PROXY_OUTBOX_PATH;
@@ -37,7 +37,7 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-describe("OpenAI production MemoryRuntime", () => {
+describe("proxy production MemoryRuntime", () => {
   it("resolves binding, enforces ACL/capabilities and durably delivers both channels", async () => {
     const root = await mkdtemp(join(tmpdir(), "openai-memory-runtime-"));
     roots.push(root);
@@ -116,7 +116,7 @@ describe("OpenAI production MemoryRuntime", () => {
       throw new Error(`unexpected fixture URL: ${url}`);
     }));
 
-    const managed = await createOpenAIMemoryRuntime(config);
+    const managed = await createProxyMemoryRuntime(config);
     try {
       const runtime = managed.provider.forRequest({ userKey: "client-user-key" });
       await expect(runtime.prepareContext({

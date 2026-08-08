@@ -30,7 +30,8 @@
  *   - anthropic 形态: { role: "assistant", content: <blocks 数组> }
  *   - openai 形态:    { role: "assistant", content: string | null, tool_calls?: [...] }
  *
- * 该模块不做"本轮切片"—— 调用方要发全历史还是本轮增量由 handler-glue 决定, 这里只做格式规范化。
+ * 该模块不做"本轮切片"—— completed-round adapter 决定 round 边界,
+ * 这里只做格式规范化。
  *
  * 除 normalizer 外, 本文件还导出两个 round 边界判定 helper:
  *   - isFinalAnswer(asst, toolCallCountOverride?):
@@ -38,7 +39,7 @@
  *   - findLastFinalAssistant(rawMessages, protocol):
  *       在 messages[] 里找上一次 final assistant 的 index (round 起点定位)
  *
- * 这两个 helper 由 handler-glue 用来实现 round-level 触发: 只有 final answer
+ * 这两个 helper 由 completed-round adapter 用来实现 round-level 触发: 只有 final answer
  * 时才 push 到 core, 中间态跳过, 避免"每次 HTTP 都发一次增量"导致 core buffer
  * 累计爆炸 (10 次 tool_use 或 40KB 就触发一次归档)。
  */
@@ -126,7 +127,7 @@ export function isFinalAnswer(
  * role=assistant 且响应内没有 tool_use / tool_calls。返回 -1 表示历史里全是
  * 中间态 / 没有 assistant, 调用方应从 index 0 开始 slice。
  *
- * 用途: 在 handler-glue 里定位本 round 起点 —— 从"上一次 final assistant"
+ * 用途: 在 completed-round adapter 里定位本 round 起点 —— 从"上一次 final assistant"
  * 之后 slice, 就是本 round 完整对话 (user + 中间 tool_use/tool_result... +
  * 本次 assistantMessage)。
  *
@@ -190,7 +191,7 @@ function convertAnthropicMessage(msg: RawMessage, agentSource: string): Normaliz
   // skill 抽取无关, 计入 40KB bytes 阈值只会让归档节奏乱套。两侧协议统一处理:
   //   - Anthropic: system 本来就在 body.system 顶层, messages 里出现是少数场景
   //   - OpenAI:    system 在 messages[0], 每次 request 都带一份
-  // 详见 handler-glue.ts 上游 normalize 调用点。
+  // 详见 runtime/proxy-completed-round.ts 上游 normalize 调用点。
   if (role === "system") {
     return [];
   }

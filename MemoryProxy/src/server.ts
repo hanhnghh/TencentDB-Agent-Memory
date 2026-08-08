@@ -19,13 +19,11 @@ import type {
 
 export interface CreateAppOptions {
   memoryRuntimeProvider?: ProxyMemoryRuntimeProvider;
-  /** @deprecated Use memoryRuntimeProvider. */
-  openAIMemoryRuntimeProvider?: ProxyMemoryRuntimeProvider;
 }
 
 export function createApp(config: ProxyConfig, options: CreateAppOptions = {}): Hono {
   const app = new Hono();
-  const memoryRuntimeProvider = options.memoryRuntimeProvider ?? options.openAIMemoryRuntimeProvider;
+  const memoryRuntimeProvider = options.memoryRuntimeProvider;
   const handleOpenAI = (c: Parameters<typeof handleChatCompletions>[0]) =>
     handleChatCompletions(c, config, memoryRuntimeProvider);
   const handleAnthropic = (c: Parameters<typeof handleAnthropicMessages>[0]) =>

@@ -7,12 +7,6 @@ import {
   getSessionStore,
 } from "../../session/store.js";
 import type { ProxyConfig } from "../../types.js";
-import { CoreSkillClient, setCoreSkillClient } from "../../skill/core-client.js";
-import { triggerSkillExtractIfReady } from "../../skill/handler-glue.js";
-import { extractLatestUserMessage, recordTdaiTurn } from "../../tdai/recorder.js";
-import { TdaiClient } from "../../tdai/client.js";
-import { flushPendingWrites } from "../../tdai/pending-writes.js";
-import type { TdaiIdentity } from "../../tdai/types.js";
 import {
   InMemoryMemoryRuntimeAdapters,
   MemoryRuntime,
@@ -21,6 +15,8 @@ import {
   type CommitCompletedRoundInput,
   type MemoryRuntimeContract,
 } from "../../runtime/index.js";
+import { buildAnthropicCompletedRound } from "../../runtime/anthropic-adapter.js";
+import { buildOpenAICompletedRound } from "../../runtime/openai-adapter.js";
 import {
   COMPLETED_ROUND_GOLDEN,
   FINAL_ASSISTANT,
@@ -33,14 +29,6 @@ import {
   USER_PROMPT,
 } from "./fixtures.js";
 import { parseRequestBody } from "./test-support.js";
-
-const tdaiIdentity: TdaiIdentity = {
-  teamId: PARITY_IDENTITY.teamId,
-  userId: PARITY_IDENTITY.userId,
-  agentId: PARITY_IDENTITY.agentId,
-  taskId: PARITY_IDENTITY.taskId,
-  sessionId: PARITY_IDENTITY.sessionId,
-};
 
 const coreSkillConfig = {
   endpoint: "http://core.fixture",
@@ -79,34 +67,6 @@ function memoryParityConfig(): ProxyConfig {
   return config;
 }
 
-function l0SuccessResponse(init?: RequestInit): Response {
-  const body = parseRequestBody(init);
-  const messages = Array.isArray(body.messages) ? body.messages : [];
-  const acceptedIds = messages.map((_, index) => `fixture-message-${index}`);
-  const sourceEventId = body.source_event_id;
-  const contentHash = body.content_hash;
-  const receipt = typeof sourceEventId === "string" && typeof contentHash === "string"
-    ? {
-        source_event_id: sourceEventId,
-        content_hash: contentHash,
-        status: "committed",
-        committed_at: "2026-08-08T00:00:00.000Z",
-      }
-    : undefined;
-  return new Response(JSON.stringify({
-    code: 0,
-    data: {
-      accepted_ids: acceptedIds,
-      accepted_versions: acceptedIds.map(() => "v1"),
-      total_count: acceptedIds.length,
-      receipt,
-    },
-  }), {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  });
-}
-
 async function seedParitySession(
   agentSource: string = PARITY_IDENTITY.agentSource,
 ): Promise<void> {
@@ -126,14 +86,13 @@ async function seedParitySession(
 }
 
 afterEach(() => {
-  setCoreSkillClient(null);
   __resetSessionStoreForTests();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
-describe("memory parity: observed legacy intermediate L0 behavior", () => {
-  it("keeps the Anthropic proxy route's intermediate L0 write separate from completed-round skill ingestion", async () => {
+describe("memory parity: removed legacy orchestration", () => {
+  it("does not run direct Anthropic writers without a MemoryRuntime", async () => {
     const config = memoryParityConfig();
     await seedParitySession();
 
@@ -179,14 +138,11 @@ describe("memory parity: observed legacy intermediate L0 behavior", () => {
       }
       if (url.endsWith("/v3/skill/conversation/add")) {
         skillRequests.push(parseRequestBody(init));
-        return new Response(JSON.stringify({ code: 0, data: { status: "ok" } }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
+        throw new Error("legacy skill writer must not be called");
       }
       if (url.endsWith("/v3/conversation/add")) {
         l0Requests.push(parseRequestBody(init));
-        return l0SuccessResponse(init);
+        throw new Error("legacy L0 writer must not be called");
       }
       throw new Error(`unexpected fixture URL: ${url}`);
     }));
@@ -213,26 +169,11 @@ describe("memory parity: observed legacy intermediate L0 behavior", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual(intermediateBody);
-    await expect(flushPendingWrites(1_000)).resolves.toEqual({
-      drained: true,
-      remaining: 0,
-    });
-    expect(l0Requests).toHaveLength(1);
-    expect(l0Requests[0]).toMatchObject({
-      team_id: PARITY_IDENTITY.teamId,
-      user_id: PARITY_IDENTITY.userId,
-      agent_id: PARITY_IDENTITY.agentId,
-      session_id: PARITY_IDENTITY.sessionId,
-      task_id: PARITY_IDENTITY.taskId,
-      messages: [
-        { role: "user", content: USER_PROMPT },
-        { role: "assistant", content: INTERMEDIATE_ASSISTANT },
-      ],
-    });
+    expect(l0Requests).toHaveLength(0);
     expect(skillRequests).toHaveLength(0);
   });
 
-  it("keeps the OpenAI proxy route's intermediate L0 write separate from completed-round skill ingestion", async () => {
+  it("does not run direct OpenAI writers without a MemoryRuntime", async () => {
     const config = memoryParityConfig();
     await seedParitySession("codebuddy");
 
@@ -281,14 +222,11 @@ describe("memory parity: observed legacy intermediate L0 behavior", () => {
       }
       if (url.endsWith("/v3/skill/conversation/add")) {
         skillRequests.push(parseRequestBody(init));
-        return new Response(JSON.stringify({ code: 0, data: { status: "ok" } }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
+        throw new Error("legacy skill writer must not be called");
       }
       if (url.endsWith("/v3/conversation/add")) {
         l0Requests.push(parseRequestBody(init));
-        return l0SuccessResponse(init);
+        throw new Error("legacy L0 writer must not be called");
       }
       throw new Error(`unexpected fixture URL: ${url}`);
     }));
@@ -314,92 +252,39 @@ describe("memory parity: observed legacy intermediate L0 behavior", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual(intermediateBody);
-    await expect(flushPendingWrites(1_000)).resolves.toEqual({
-      drained: true,
-      remaining: 0,
-    });
-    expect(l0Requests).toHaveLength(1);
-    expect(l0Requests[0]).toMatchObject({
-      team_id: PARITY_IDENTITY.teamId,
-      user_id: PARITY_IDENTITY.userId,
-      agent_id: PARITY_IDENTITY.agentId,
-      session_id: PARITY_IDENTITY.sessionId,
-      task_id: PARITY_IDENTITY.taskId,
-      messages: [
-        { role: "user", content: USER_PROMPT },
-        { role: "assistant", content: INTERMEDIATE_ASSISTANT },
-      ],
-    });
+    expect(l0Requests).toHaveLength(0);
     expect(skillRequests).toHaveLength(0);
   });
 
-  it("records each proxy HTTP response independently, including an intermediate tool-loop response", async () => {
-    const writes: Array<Record<string, unknown>> = [];
-    const fetcher: typeof fetch = async (_input, init) => {
-      writes.push(parseRequestBody(init));
-      return l0SuccessResponse(init);
-    };
-    vi.stubGlobal("fetch", vi.fn(fetcher));
-    const config = memoryParityConfig().tdai;
-    const client = new TdaiClient({
-      ...config.memory,
-      endpoint: config.endpoint,
-      apiKey: config.apiKey,
-      serviceId: config.serviceId,
-    });
-
-    await recordTdaiTurn(
-      client,
-      tdaiIdentity,
-      { role: "user", content: USER_PROMPT },
-      INTERMEDIATE_ASSISTANT,
-    );
-    await recordTdaiTurn(
-      client,
-      tdaiIdentity,
-      { role: "user", content: "xin chào\nexit: 0" },
-      FINAL_ASSISTANT,
-    );
-
-    // Characterization only: the approved target below deliberately does not
-    // treat this per-response fragmentation as the future parity contract.
-    expect(writes).toEqual([
-      expect.objectContaining({
-        team_id: tdaiIdentity.teamId,
-        user_id: tdaiIdentity.userId,
-        agent_id: tdaiIdentity.agentId,
-        session_id: tdaiIdentity.sessionId,
-        task_id: tdaiIdentity.taskId,
-        messages: [
-          { role: "user", content: USER_PROMPT },
-          { role: "assistant", content: INTERMEDIATE_ASSISTANT },
-        ],
-      }),
-      expect.objectContaining({
-        team_id: tdaiIdentity.teamId,
-        user_id: tdaiIdentity.userId,
-        agent_id: tdaiIdentity.agentId,
-        session_id: tdaiIdentity.sessionId,
-        task_id: tdaiIdentity.taskId,
-        messages: [
-          { role: "user", content: "xin chào\nexit: 0" },
-          { role: "assistant", content: FINAL_ASSISTANT },
-        ],
-      }),
-    ]);
-  });
-
-  it("characterizes the proxy extractor treating a tool-result-shaped user message as L0 user text", () => {
-    const extracted = extractLatestUserMessage([
-      { role: "user", content: USER_PROMPT },
-      {
-        role: "user",
-        content: [{ type: "tool_result", tool_use_id: "tool-1", content: "tool output" }],
-      },
-    ]);
-
-    expect(extracted).toEqual({ role: "user", content: "tool output" });
-  });
+  it.each(PROXY_ROUND_INPUTS)(
+    "does not commit a $protocol intermediate tool response",
+    (fixture) => {
+      const builder = fixture.protocol === "anthropic"
+        ? buildAnthropicCompletedRound
+        : buildOpenAICompletedRound;
+      const intermediate = fixture.protocol === "anthropic"
+        ? {
+            role: "assistant",
+            content: [{ type: "tool_use", id: "tool-1", name: "shell", input: {} }],
+          }
+        : {
+            role: "assistant",
+            content: null,
+            tool_calls: [{ id: "tool-1", function: { name: "shell", arguments: "{}" } }],
+          };
+      expect(builder({
+        identity: {
+          serviceId: PARITY_IDENTITY.spaceId,
+          userId: PARITY_IDENTITY.userId,
+          agentSource: fixture.agentSource,
+          sessionId: PARITY_IDENTITY.sessionId,
+        },
+        turnSequence: 1,
+        inputMessages: fixture.messages,
+        assistantMessage: intermediate,
+      })).toBeNull();
+    },
+  );
 });
 
 describe("memory parity: approved completed-round target", () => {
@@ -564,11 +449,6 @@ describe("memory parity: approved completed-round target", () => {
     const streamText = await stream.text();
     expect(streamText).toContain(`"text":"${FINAL_ASSISTANT}"`);
     expect(streamText).toContain("event: message_stop");
-    await expect(flushPendingWrites(1_000)).resolves.toEqual({
-      drained: true,
-      remaining: 0,
-    });
-
     expect(l0Requests).toHaveLength(0);
     expect(JSON.stringify(upstreamRequests[0].system)).toContain("runtime-prepared-context");
     expect(JSON.stringify(upstreamRequests[0].system)).toContain("<asset_reflection>");
@@ -1295,7 +1175,7 @@ describe("memory parity: approved completed-round target", () => {
     };
     vi.stubGlobal("fetch", vi.fn(fetcher));
     const app = createApp(config, {
-      openAIMemoryRuntimeProvider: { forRequest: () => runtime },
+      memoryRuntimeProvider: { forRequest: () => runtime },
     });
     const callProxy = (messages: Array<Record<string, unknown>>) => app.request(
       `/codebuddy/${PARITY_IDENTITY.spaceId}/analyse/v1/chat/completions`,
@@ -1341,11 +1221,6 @@ describe("memory parity: approved completed-round target", () => {
     const streamText = await streamResponse.text();
     expect(streamText).toContain(`"content":"${FINAL_ASSISTANT}"`);
     expect(streamText).toContain("data: [DONE]");
-    await expect(flushPendingWrites(1_000)).resolves.toEqual({
-      drained: true,
-      remaining: 0,
-    });
-
     expect(l0Requests).toHaveLength(0);
     expect(upstreamAuthorizations).toEqual([
       "Bearer client-key",
@@ -1393,7 +1268,7 @@ describe("memory parity: approved completed-round target", () => {
     });
     vi.stubGlobal("fetch", fetcher);
     const app = createApp(config, {
-      openAIMemoryRuntimeProvider: { forRequest: () => runtime },
+      memoryRuntimeProvider: { forRequest: () => runtime },
     });
 
     const response = await app.request(
@@ -1429,7 +1304,9 @@ describe("memory parity: approved completed-round target", () => {
     await seedParitySession("codebuddy");
     const committed: CommitCompletedRoundInput[] = [];
     const runtime: MemoryRuntimeContract = {
-      prepareContext: async () => { throw new Error("context backend unavailable"); },
+      prepareContext: async () => {
+        throw new MemoryRuntimeContextError(new Error("context backend unavailable"));
+      },
       commitCompletedRound: async (input) => {
         committed.push(input);
         return { status: "skipped", sourceEventId: input.sourceEventId, reason: "fixture" };
@@ -1449,7 +1326,7 @@ describe("memory parity: approved completed-round target", () => {
       });
     }));
     const app = createApp(config, {
-      openAIMemoryRuntimeProvider: { forRequest: () => runtime },
+      memoryRuntimeProvider: { forRequest: () => runtime },
     });
 
     const response = await app.request("/codebuddy/v1/chat/completions", {
@@ -1471,6 +1348,49 @@ describe("memory parity: approved completed-round target", () => {
     expect(committed).toHaveLength(1);
     expect(committed[0].identity.serviceId).toBe(PARITY_IDENTITY.spaceId);
     expect(committed[0].realPrompt).toBe(USER_PROMPT);
+  });
+
+  it("fails closed when OpenAI runtime read authorization is denied", async () => {
+    const config = memoryParityConfig();
+    await seedParitySession("codebuddy");
+    const upstream = vi.fn();
+    vi.stubGlobal("fetch", upstream);
+    const runtime: MemoryRuntimeContract = {
+      prepareContext: async () => {
+        throw new MemoryRuntimeAuthorizationError("read", "fixture-denied");
+      },
+      commitCompletedRound: vi.fn(),
+    };
+    const app = createApp(config, { memoryRuntimeProvider: { forRequest: () => runtime } });
+
+    const response = await app.request(
+      `/codebuddy/${PARITY_IDENTITY.spaceId}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer client-key",
+          "content-type": "application/json",
+          "x-conversation-id": PARITY_IDENTITY.sessionId,
+          "x-user-id": PARITY_IDENTITY.userId,
+        },
+        body: JSON.stringify({
+          model: "fixture-model",
+          stream: false,
+          messages: [{ role: "user", content: USER_PROMPT }],
+        }),
+      },
+    );
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        message: "Memory access denied",
+        type: "permission_error",
+        code: "memory_access_denied",
+      },
+    });
+    expect(upstream).not.toHaveBeenCalled();
+    expect(runtime.commitCompletedRound).not.toHaveBeenCalled();
   });
 
   it("does not acknowledge an upstream success when durable enqueue fails", async () => {
@@ -1511,7 +1431,7 @@ describe("memory parity: approved completed-round target", () => {
       });
     }));
     const app = createApp(config, {
-      openAIMemoryRuntimeProvider: { forRequest: () => failingRuntime },
+      memoryRuntimeProvider: { forRequest: () => failingRuntime },
     });
 
     const response = await app.request(
@@ -1536,89 +1456,33 @@ describe("memory parity: approved completed-round target", () => {
   });
 
   it.each(PROXY_ROUND_INPUTS)(
-    "$protocol proxy commits the full normalized tool-aware round to skill ingestion only after the final response",
-    async (fixture) => {
-      const requests: Array<{ url: string; init?: RequestInit }> = [];
-      const fetcher: typeof fetch = async (url, init) => {
-        requests.push({ url: String(url), init });
-        return new Response(JSON.stringify({ code: 0, data: { status: "ok" } }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
-      };
-      const client = new CoreSkillClient(coreSkillConfig, fetcher);
-      setCoreSkillClient(client);
-      const config = memoryParityConfig();
-      const sessionInfo = {
-        session_id: PARITY_IDENTITY.sessionId,
-        space_id: PARITY_IDENTITY.spaceId,
-        user_id: PARITY_IDENTITY.userId,
-        team_id: PARITY_IDENTITY.teamId,
-        agent_id: PARITY_IDENTITY.agentId,
-        task_id: PARITY_IDENTITY.taskId,
-      };
-
-      await triggerSkillExtractIfReady({
-        config,
-        sessionKey: PARITY_IDENTITY.sessionId,
-        agentSource: fixture.agentSource,
-        sessionInfo,
-        inputMessages: fixture.messages,
-        assistantMessage: fixture.protocol === "anthropic"
-          ? {
-              role: "assistant",
-              content: [{ type: "tool_use", id: "still-running", name: "read", input: {} }],
-            }
-          : {
-              role: "assistant",
-              content: null,
-              tool_calls: [{
-                id: "still-running",
-                type: "function",
-                function: { name: "read", arguments: "{}" },
-              }],
-            },
-        protocol: fixture.protocol,
-      });
-      expect(requests).toHaveLength(0);
-
-      await triggerSkillExtractIfReady({
-        config,
-        sessionKey: PARITY_IDENTITY.sessionId,
-        agentSource: fixture.agentSource,
-        sessionInfo,
-        inputMessages: fixture.messages,
-        assistantMessage: fixture.assistantMessage,
-        protocol: fixture.protocol,
-        assetCapabilities: {
-          skill: false,
-          llm_wiki: true,
-          code_graph: true,
-          chat_memory: true,
+    "$protocol adapter produces the canonical completed round once",
+    (fixture) => {
+      const builder = fixture.protocol === "anthropic"
+        ? buildAnthropicCompletedRound
+        : buildOpenAICompletedRound;
+      const completed = builder({
+        identity: {
+          serviceId: PARITY_IDENTITY.spaceId,
+          userId: PARITY_IDENTITY.userId,
+          agentSource: fixture.agentSource,
+          sessionId: PARITY_IDENTITY.sessionId,
         },
-      });
-      expect(requests).toHaveLength(0);
-
-      await triggerSkillExtractIfReady({
-        config,
-        sessionKey: PARITY_IDENTITY.sessionId,
-        agentSource: fixture.agentSource,
-        sessionInfo,
+        turnSequence: 1,
         inputMessages: fixture.messages,
         assistantMessage: fixture.assistantMessage,
-        protocol: fixture.protocol,
       });
 
-      expect(requests).toHaveLength(1);
-      expect(requests[0].url).toBe("http://core.fixture/v3/skill/conversation/add");
-      expect(parseRequestBody(requests[0].init)).toMatchObject({
-        session_id: PARITY_IDENTITY.sessionId,
-        space_id: PARITY_IDENTITY.spaceId,
-        user_id: PARITY_IDENTITY.userId,
-        team_id: PARITY_IDENTITY.teamId,
-        agent_id: PARITY_IDENTITY.agentId,
-        task_id: PARITY_IDENTITY.taskId,
-        messages: COMPLETED_ROUND_GOLDEN,
+      expect(completed).toMatchObject({
+        identity: {
+          serviceId: PARITY_IDENTITY.spaceId,
+          userId: PARITY_IDENTITY.userId,
+          agentSource: fixture.agentSource,
+          sessionId: PARITY_IDENTITY.sessionId,
+          turnId: "turn-1",
+        },
+        realPrompt: USER_PROMPT,
+        finalResponse: FINAL_ASSISTANT,
       });
     },
   );
