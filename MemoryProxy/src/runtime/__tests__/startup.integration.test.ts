@@ -50,12 +50,16 @@ describe("mode-aware runtime startup", () => {
     const fetcher = vi.fn();
     vi.stubGlobal("fetch", fetcher);
     const forwardingLoader = vi.fn<() => Promise<ForwardingRuntime>>();
+    let hookApp: Hono | undefined;
     const listenerAdapter: RuntimeListenerAdapter = {
-      listen: async ({ host, port }) => ({
-        host,
-        port,
-        close: async () => undefined,
-      }),
+      listen: async ({ app, host, port }) => {
+        hookApp = app;
+        return {
+          host,
+          port,
+          close: async () => undefined,
+        };
+      },
     };
 
     const running = await startRuntime(config, { listenerAdapter, forwardingLoader });
@@ -76,6 +80,12 @@ describe("mode-aware runtime startup", () => {
       expect(fetcher).not.toHaveBeenCalled();
       expect(forwardingLoader).not.toHaveBeenCalled();
       expect(getHookCacheRepo()).toBeInstanceOf(KvHookCacheRepo);
+      if (!hookApp) throw new Error("hook app was not composed");
+      expect((await hookApp.request("/hooks/session-start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "not-json",
+      })).status).toBe(400);
     } finally {
       await running.stop();
     }
@@ -204,6 +214,41 @@ describe("mode-aware runtime startup", () => {
 
     await expect(running.stop()).rejects.toThrow("listener close failed");
     expect(shutdown).toHaveBeenCalledOnce();
+  });
+
+  it("closes the Codex hook journal even when hook listener shutdown fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hook-cleanup-runtime-"));
+    roots.push(root);
+    process.env.PROXY_OUTBOX_PATH = join(root, "outbox.db");
+    const config: ProxyConfig = structuredClone(DEFAULT_CONFIG);
+    config.runtime.mode = "hooks";
+    config.upstream.url = "";
+    config.extraction.enabled = false;
+    config.storage.enabled = true;
+    config.storage.backend = "memory";
+    const resourceClose = vi.fn();
+    const running = await startRuntime(config, {
+      listenerAdapter: {
+        listen: async ({ host, port }) => ({
+          host,
+          port,
+          close: async () => { throw new Error("hook listener close failed"); },
+        }),
+      },
+      codexHookRuntimeFactory: () => ({
+        accessResolver: {
+          resolve: async () => { throw new Error("not used"); },
+        },
+        turnStore: {
+          beginTurn: async () => ({ status: "persisted" }),
+          close: resourceClose,
+        },
+        close: resourceClose,
+      }),
+    });
+
+    await expect(running.stop()).rejects.toThrow("hook listener close failed");
+    expect(resourceClose).toHaveBeenCalledOnce();
   });
 
   it("starts both listeners separately over one shared health state", async () => {

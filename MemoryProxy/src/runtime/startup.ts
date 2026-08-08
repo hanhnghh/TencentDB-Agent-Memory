@@ -2,6 +2,15 @@ import { serve } from "@hono/node-server";
 import type { Hono } from "hono";
 
 import { checkConnectivity } from "../connectivity.js";
+import {
+  createCodexHookAccessResolver,
+  type CodexHookAccessResolver,
+} from "../codex/hook-access.js";
+import {
+  openDurableCodexTurnStore,
+  type CodexTurnStore,
+} from "../codex/turn-store.js";
+import { resolveDbPath } from "../db/index.js";
 import { createHookApp } from "../hook-server.js";
 import { tryActivateRedis, tryActivateStorage } from "../injection/index.js";
 import { initLogger, log, shutdownLogger } from "../report/log.js";
@@ -47,6 +56,13 @@ export interface ForwardingRuntime {
 export interface StartRuntimeOptions {
   listenerAdapter?: RuntimeListenerAdapter;
   forwardingLoader?: (config: ProxyConfig) => Promise<ForwardingRuntime>;
+  codexHookRuntimeFactory?: (config: ProxyConfig) => CodexHookRuntimeResources;
+}
+
+export interface CodexHookRuntimeResources {
+  accessResolver: CodexHookAccessResolver;
+  turnStore: CodexTurnStore;
+  close(): void;
 }
 
 export interface RunningRuntime {
@@ -63,9 +79,11 @@ export async function startRuntime(
   const plan = planRuntime(config);
   const listenerAdapter = options.listenerAdapter ?? nodeListenerAdapter;
   const forwardingLoader = options.forwardingLoader ?? loadForwardingRuntime;
+  const codexHookRuntimeFactory = options.codexHookRuntimeFactory ?? createCodexHookRuntime;
   const listeners: RunningListener[] = [];
   let memoryRuntime: ManagedMemoryRuntime | undefined;
   let forwardingRuntime: ForwardingRuntime | undefined;
+  let codexHookRuntime: CodexHookRuntimeResources | undefined;
   let stopPromise: Promise<void> | undefined;
 
   initLogger({
@@ -82,6 +100,9 @@ export async function startRuntime(
     }
     if (plan.dependencies.memoryRuntime) {
       memoryRuntime = await createMemoryRuntime(config);
+    }
+    if (plan.listeners.hooks.enabled) {
+      codexHookRuntime = codexHookRuntimeFactory(config);
     }
 
     if (plan.dependencies.forwarding) {
@@ -117,6 +138,8 @@ export async function startRuntime(
         app: createHookApp(config, {
           memoryRuntimeProvider: memoryRuntime?.provider,
           runtimeHealth: health,
+          codexAccessResolver: codexHookRuntime?.accessResolver,
+          codexTurnStore: codexHookRuntime?.turnStore,
         }),
         host: plan.listeners.hooks.host,
         port: plan.listeners.hooks.port,
@@ -149,6 +172,7 @@ export async function startRuntime(
           listeners,
           connectivityChecked,
           forwardingRuntime,
+          codexHookRuntime,
           memoryRuntime,
         }).then((errors) => {
           throwCleanupErrors(errors, "runtime shutdown failed");
@@ -160,6 +184,7 @@ export async function startRuntime(
     const cleanupErrors = await cleanupRuntime({
       listeners,
       forwardingRuntime,
+      codexHookRuntime,
       memoryRuntime,
     });
     if (cleanupErrors.length > 0) {
@@ -210,6 +235,7 @@ async function cleanupRuntime(input: {
   listeners: RunningListener[];
   connectivityChecked?: Promise<void>;
   forwardingRuntime?: ForwardingRuntime;
+  codexHookRuntime?: CodexHookRuntimeResources;
   memoryRuntime?: ManagedMemoryRuntime;
 }): Promise<unknown[]> {
   const errors: unknown[] = [];
@@ -218,6 +244,8 @@ async function cleanupRuntime(input: {
   if (connectivityChecked) steps.push(() => connectivityChecked);
   const forwardingRuntime = input.forwardingRuntime;
   if (forwardingRuntime) steps.push(() => forwardingRuntime.shutdown());
+  const codexHookRuntime = input.codexHookRuntime;
+  if (codexHookRuntime) steps.push(async () => codexHookRuntime.close());
   const memoryRuntime = input.memoryRuntime;
   if (memoryRuntime) steps.push(() => memoryRuntime.shutdown());
   steps.push(() => shutdownLogger());
@@ -229,6 +257,17 @@ async function cleanupRuntime(input: {
     }
   }
   return errors;
+}
+
+function createCodexHookRuntime(config: ProxyConfig): CodexHookRuntimeResources {
+  const turnStore = openDurableCodexTurnStore({
+    dbPath: process.env.PROXY_OUTBOX_PATH?.trim() || resolveDbPath(),
+  });
+  return {
+    accessResolver: createCodexHookAccessResolver(config),
+    turnStore,
+    close: () => turnStore.close(),
+  };
 }
 
 function rejectedReasons(results: PromiseSettledResult<unknown>[]): unknown[] {

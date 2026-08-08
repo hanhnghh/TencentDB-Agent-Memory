@@ -214,6 +214,7 @@ export interface HookCacheContextAdapterOptions {
   prewarm(input: PrewarmInput, options?: PrewarmOptions): Promise<PrewarmResult>;
   callerUserKeyFor?: (identity: BoundRuntimeIdentity) => string | undefined;
   classifyHook?: (hookId: string) => RuntimeContextKind | null;
+  promptRecall?: (request: RuntimeContextRequest) => Promise<RuntimeContextBlock[]>;
 }
 
 export class HookCacheContextAdapter implements RuntimeContextAdapter {
@@ -281,6 +282,13 @@ export class HookCacheContextAdapter implements RuntimeContextAdapter {
       entry.blocks.forEach((block, index) => {
         blocks.push(toRuntimeBlock(entry.hookId, kind, block, entryIndex, index));
       });
+    }
+    if (request.query && this.options.promptRecall) {
+      try {
+        blocks.push(...await this.options.promptRecall(request));
+      } catch {
+        degraded.push("prompt_recall:failed");
+      }
     }
     return {
       blocks,
@@ -379,6 +387,19 @@ export function createRuntimeSessionKey(identity: RuntimeIdentity): string {
   return `memory-runtime:${hashTuple([
     identity.serviceId,
     identity.userId,
+    identity.agentSource,
+    identity.sessionId,
+  ])}`;
+}
+
+/** Full binding cache key for transports that already resolved Team/Agent/Task. */
+export function createBoundRuntimeSessionKey(identity: BoundRuntimeIdentity): string {
+  return `memory-runtime:${hashTuple([
+    identity.serviceId,
+    identity.teamId,
+    identity.userId,
+    identity.agentId,
+    identity.taskId,
     identity.agentSource,
     identity.sessionId,
   ])}`;

@@ -2,6 +2,8 @@ import { createSessionNamespace } from "../agent-sources.js";
 import { getHookCacheRepo } from "../db/hookCacheRepo.js";
 import { resolveDbPath } from "../db/index.js";
 import { prewarmFromConfig } from "../injection/index.js";
+import { TdaiL1RecallInjector } from "../injection/injectors/tdai-l1-recall-injector.js";
+import type { AgentContext } from "../injection/types.js";
 import { getMetadataClient } from "../meta/client.js";
 import {
   MemoryCoreRoundDelivery,
@@ -22,12 +24,16 @@ import {
   ProductionMemoryRuntimeAdapters,
   SessionStoreBindingAdapter,
   type MemoryRuntimeContract,
+  type RuntimeContextBlock,
+  type RuntimeContextRequest,
   type RuntimeExtractionDecision,
 } from "./index.js";
 export { isProxyMemoryRuntimeRequired } from "./mode.js";
 
 export interface MemoryRuntimeAccess {
   userKey: string;
+  /** Prevalidated full-tuple cache key used by lifecycle transports. */
+  bindingCacheKey?: string;
 }
 
 export interface MemoryRuntimeProvider {
@@ -57,13 +63,13 @@ export async function createMemoryRuntime(
 
   const provider: MemoryRuntimeProvider = {
     health: () => outbox.health(),
-    forRequest: ({ userKey }) => {
+    forRequest: ({ userKey, bindingCacheKey }) => {
       const configuredExtraction = new ConfigExtractionAdapter(config);
       const runtime = new MemoryRuntime(new ProductionMemoryRuntimeAdapters({
         binding: new SessionStoreBindingAdapter(
           getSessionStore(),
           (identity) => getMetadataClient(config.coreSkill, identity.serviceId, userKey),
-          (identity) => createSessionNamespace(identity.agentSource, identity.sessionId),
+          (identity) => bindingCacheKey ?? createSessionNamespace(identity.agentSource, identity.sessionId),
         ),
         authorization: new MemoryCoreAuthorizationAdapter(
           (identity) => createTdaiClient(config, identity.serviceId),
@@ -81,6 +87,7 @@ export async function createMemoryRuntime(
               cacheRepo: getHookCacheRepo(),
               prewarm: (input, options) => prewarmFromConfig(config, input, options),
               callerUserKeyFor: () => userKey,
+              promptRecall: (request) => recallCodexPrompt(config, userKey, request),
             })
           : {
               prepareContext: async () => ({
@@ -114,6 +121,67 @@ export async function createMemoryRuntime(
       outbox.close();
     },
   };
+}
+
+async function recallCodexPrompt(
+  config: ProxyConfig,
+  userKey: string,
+  request: RuntimeContextRequest,
+): Promise<RuntimeContextBlock[]> {
+  const query = request.query?.trim();
+  if (
+    !query ||
+    !request.capabilities.chatMemory ||
+    !config.tdai.enabled ||
+    !config.tdai.memory.enabled ||
+    !config.tdai.memory.recallL1
+  ) {
+    return [];
+  }
+  const { identity } = request.binding;
+  const client = createTdaiClient(config, identity.serviceId);
+  const injector = new TdaiL1RecallInjector(
+    client,
+    config.coreSkill,
+    config.tdai.memory.l1Limit,
+    config.tdai.memory.l1Limit,
+    client,
+  );
+  const session = request.binding.sessionInfo ?? {
+    session_id: identity.sessionId,
+    space_id: identity.serviceId,
+    user_id: identity.userId,
+    team_id: identity.teamId,
+    agent_id: identity.agentId,
+    task_id: identity.taskId,
+    identity_verified: true,
+  };
+  const context: AgentContext = {
+    messages: [{ role: "user", blocks: [{ type: "text", content: query }] }],
+    requestParams: {},
+    metadata: {
+      protocol: "openai",
+      traceId: `codex:${identity.sessionId}:prompt-recall`,
+      keyId: createSessionNamespace(identity.agentSource, identity.sessionId),
+      modelId: "codex-subscription",
+      stream: false,
+      agentSource: identity.agentSource,
+      userId: identity.userId,
+      spaceId: identity.serviceId,
+      sessionKey: identity.sessionId,
+      custom: { session: { ...session, user_key: userKey } },
+    },
+  };
+  const recalled = await injector.execute(context);
+  return recalled.map((block, index) => ({
+    id: `${injector.id}:${index}`,
+    sourceHookId: injector.id,
+    kind: "memory",
+    order: 1_500_000 + index,
+    type: block.type,
+    content: block.content,
+    ...(block.metadata === undefined ? {} : { metadata: block.metadata }),
+  }));
 }
 
 function createTdaiClient(config: ProxyConfig, serviceId: string): TdaiClient {

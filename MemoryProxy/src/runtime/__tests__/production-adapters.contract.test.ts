@@ -25,6 +25,60 @@ import {
 } from "../../__tests__/memory-parity/fixtures.js";
 
 describe("MemoryRuntime production adapters", () => {
+  it("adds prompt-specific recall through the context port and degrades read failures", async () => {
+    const promptRecall = vi.fn(async () => [{
+      id: "tdai-l1-recall-injector:0",
+      sourceHookId: "tdai-l1-recall-injector",
+      kind: "memory" as const,
+      order: 1_500_000,
+      type: "text" as const,
+      content: "prompt-specific memory",
+    }]);
+    const adapter = new HookCacheContextAdapter({
+      cacheRepo: {
+        put: vi.fn(),
+        putMany: vi.fn(),
+        get: vi.fn(async () => null),
+        getAllForSession: vi.fn(async () => []),
+        clearBySession: vi.fn(),
+      },
+      prewarm: vi.fn(async () => ({
+        cachedHookIds: [], entries: [], skipped: [], durationMs: 0,
+      })),
+      promptRecall,
+    });
+    const request = {
+      binding: {
+        identity: {
+          serviceId: PARITY_IDENTITY.spaceId,
+          teamId: PARITY_IDENTITY.teamId,
+          userId: PARITY_IDENTITY.userId,
+          agentId: PARITY_IDENTITY.agentId,
+          taskId: PARITY_IDENTITY.taskId,
+          agentSource: "codex",
+          sessionId: PARITY_IDENTITY.sessionId,
+        },
+        agent: PARITY_AGENT,
+        task: PARITY_TASK,
+        sessionInfo: PARITY_SESSION_INFO,
+        resolution: "cached" as const,
+      },
+      capabilities: { skill: true, llmWiki: true, codeGraph: true, chatMemory: true },
+      query: "the real prompt",
+    };
+
+    await expect(adapter.prepareContext(request)).resolves.toMatchObject({
+      blocks: [{ sourceHookId: "tdai-l1-recall-injector", content: "prompt-specific memory" }],
+    });
+    expect(promptRecall).toHaveBeenCalledWith(request);
+
+    promptRecall.mockRejectedValueOnce(new Error("recall offline"));
+    await expect(adapter.prepareContext(request)).resolves.toMatchObject({
+      blocks: [],
+      diagnostics: { degraded: ["prompt_recall:failed"] },
+    });
+  });
+
   it("returns fresh fork context without self-healing the shared cache", async () => {
     const putMany = vi.fn();
     const prewarm = vi.fn(async () => ({

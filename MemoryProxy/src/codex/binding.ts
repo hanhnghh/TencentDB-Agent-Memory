@@ -120,6 +120,12 @@ export interface CodexBindingStatus {
   credentialPath: string;
 }
 
+/** Internal sidecar view; never serialize this value into hook output or logs. */
+export interface CodexRuntimeCredential {
+  binding: CodexProjectBinding;
+  userKey: string;
+}
+
 export interface BindingDoctorCheck {
   name: string;
   status: "pass" | "fail" | "warn";
@@ -583,6 +589,20 @@ export async function readCodexProjectBinding(projectDir: string): Promise<Codex
       `Cannot read project binding: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
+}
+
+/** Resolve the validated project binding and its protected user-level key. */
+export async function resolveCodexRuntimeCredential(
+  paths: CodexBindingPaths,
+): Promise<CodexRuntimeCredential | null> {
+  const binding = await readCodexProjectBinding(paths.projectDir);
+  if (!binding) return null;
+  const credentialPath = resolveCredentialPath(paths.userConfigDir);
+  await assertCredentialOutsideProject(paths.projectDir, credentialPath);
+  const credentials = await readCredentialFile(credentialPath);
+  const userKey = credentials.user_keys[binding.service_id];
+  if (typeof userKey !== "string" || userKey.trim().length === 0) return null;
+  return { binding, userKey };
 }
 
 /** Validate the complete current runtime scope, then persist it locally. */

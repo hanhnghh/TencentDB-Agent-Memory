@@ -120,6 +120,46 @@ to MemoryCore. Neither is the proxy model credential (`PROXY_UPSTREAM_API_KEY`
 or `upstream.apiKey`) nor the internal memory-distillation model credential
 (`MEMORY_LLM_API_KEY`).
 
+### Codex lifecycle context
+
+The repo-local plugin scaffold is under
+`plugins/tencentdb-agent-memory`. Its single thin executable forwards the
+documented `SessionStart` and `UserPromptSubmit` JSON payloads to the
+loopback-only hook listener; Codex still calls the model through its own
+subscription transport.
+
+Start the sidecar without any proxy upstream credential:
+
+```bash
+npm start -- --config config.yaml --mode hooks
+```
+
+`SessionStart` handles `startup`, `resume`, `clear`, and `compact`, restoring
+ordered session, memory, skill, and knowledge context. Returned context is
+delimited and marked `capture=exclude`, secrets are redacted, and complete
+blocks are selected deterministically within the output bound. The documented
+`transcript_path` field is accepted but is never the primary protocol or read
+on this path.
+
+`UserPromptSubmit` durably records the exact `(service, team, user, agent, task,
+source, session, turn, prompt)` identity before acknowledging the hook. Add these optional,
+non-secret preferences to `.codex/memory-binding.json` to enable per-prompt L1
+recall and cap the number of returned blocks:
+
+```json
+{
+  "preferences": {
+    "dynamicRecall": true,
+    "contextLimit": 5
+  }
+}
+```
+
+The hook never replaces or rewrites the original prompt. If the sidecar is
+unavailable, the executable returns valid empty hook output and Codex continues
+without injected memory. Plugin installation/trust automation is delivered by
+the separate packaging workflow; hook definitions must be reviewed before use.
+
 ### 1. Install dependencies
 
 ```bash

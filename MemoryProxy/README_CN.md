@@ -117,6 +117,41 @@ npm run codex -- unbind
 模型凭据（`PROXY_UPSTREAM_API_KEY` 或 `upstream.apiKey`），也不是内部记忆提炼
 模型凭据（`MEMORY_LLM_API_KEY`）。
 
+### Codex 生命周期上下文
+
+仓库内插件骨架位于 `plugins/tencentdb-agent-memory`。其中唯一的轻量可执行程序
+会把官方 `SessionStart` 和 `UserPromptSubmit` JSON payload 发送到仅监听回环地址的
+hook sidecar；Codex 仍然通过自己的订阅通道调用模型。
+
+无需配置 proxy 上游凭据即可启动 sidecar：
+
+```bash
+npm start -- --config config.yaml --mode hooks
+```
+
+`SessionStart` 支持 `startup`、`resume`、`clear` 和 `compact`，按顺序恢复 session、
+memory、skill 与 knowledge 上下文。返回内容带明确分隔和 `capture=exclude` 标记，
+会脱敏 secret，并在输出上限内按确定性顺序选择完整 block。官方 payload 中的
+`transcript_path` 会被接受，但此路径不会读取它，也不会把 transcript 当作主协议。
+
+`UserPromptSubmit` 只有在把准确的 `(service, team, user, agent, task, source,
+session, turn, prompt)` 身份持久写入 SQLite journal 后才确认成功。可在
+`.codex/memory-binding.json` 中加入
+以下非敏感偏好，启用逐 prompt 的 L1 recall 并限制返回 block 数：
+
+```json
+{
+  "preferences": {
+    "dynamicRecall": true,
+    "contextLimit": 5
+  }
+}
+```
+
+hook 不会替换或改写原 prompt。sidecar 不可用时，可执行程序返回合法的空 hook
+输出，Codex 会在没有注入 memory 的情况下继续。插件安装与 trust 自动化属于后续
+独立 packaging workflow；使用前仍需审查 hook 定义。
+
 ### 1. 安装依赖
 
 ```bash

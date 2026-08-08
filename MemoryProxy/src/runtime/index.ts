@@ -59,6 +59,8 @@ export interface RuntimeContextDiagnostics {
 
 export interface PrepareContextInput {
   identity: RuntimeIdentity;
+  /** Optional real user query for bounded turn-specific recall. */
+  query?: string;
   /** Resolve fresh context without persisting cache repairs (fork/read-only requests). */
   readOnly?: boolean;
 }
@@ -86,6 +88,7 @@ export type RuntimeAuthorizationDecision =
 export interface RuntimeContextRequest {
   binding: ResolvedRuntimeBinding;
   capabilities: RuntimeCapabilityFlags;
+  query?: string;
   readOnly?: boolean;
 }
 
@@ -179,6 +182,7 @@ export class MemoryRuntime implements MemoryRuntimeContract {
       context = await this.adapters.prepareContext({
         binding,
         capabilities,
+        ...(input.query === undefined ? {} : { query: requireRuntimeText(input.query, "query") }),
         readOnly: input.readOnly,
       });
     } catch (error: unknown) {

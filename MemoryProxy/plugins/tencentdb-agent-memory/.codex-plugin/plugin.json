@@ -1,0 +1,17 @@
+{
+  "name": "tencentdb-agent-memory",
+  "version": "0.1.0",
+  "description": "Inject durable TencentDB Agent Memory context into Codex sessions without proxying model traffic.",
+  "author": {
+    "name": "TencentDB Agent Memory contributors"
+  },
+  "interface": {
+    "displayName": "TencentDB Agent Memory",
+    "shortDescription": "Restore durable memory in Codex sessions.",
+    "longDescription": "Connects documented Codex lifecycle hooks to a loopback-only Agent Memory sidecar while Codex keeps using its subscription transport.",
+    "developerName": "TencentDB Agent Memory contributors",
+    "category": "Productivity",
+    "capabilities": ["Session memory", "Prompt recall"],
+    "defaultPrompt": "Use Agent Memory context for this project."
+  }
+}

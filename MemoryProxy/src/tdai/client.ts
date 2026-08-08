@@ -546,7 +546,7 @@ export class TdaiClient {
  * 让整个注入路径抛异常，用这个便捷函数把异常转成"拒绝"信号即可。
  */
 export async function checkAclOrDeny(
-  client: TdaiClient,
+  client: Pick<TdaiClient, "checkAcl">,
   params: AclCheckParams,
 ): Promise<AclCheckResult> {
   try {

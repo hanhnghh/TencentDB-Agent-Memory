@@ -1,7 +1,7 @@
 import type { AgentContext, ContextBlock, InjectionHook, HookPriority } from "../types.js";
 import { HOOK_PRIORITY } from "../types.js";
 import { getLastUserMessage, getMessageText } from "../context.js";
-import type { TdaiClient } from "../../tdai/client.js";
+import { checkAclOrDeny, type TdaiClient } from "../../tdai/client.js";
 import { getTdaiIdentity } from "../../tdai/identity.js";
 import { extractUserQueryText } from "../../common/user-query-extractor.js";
 import type { CoreSkillConfig } from "../../types.js";
@@ -64,10 +64,13 @@ export class TdaiL1RecallInjector implements InjectionHook {
       ? getMetadataClient(this.coreSkillCfg, spaceId, userKey)
       : null;
     const ctxs = await resolveFixedAssetCtxs(ctx, identity, mc);
+    const readableCtxs = this.aclClient
+      ? await filterReadableContexts(this.aclClient, userKey, ctxs)
+      : ctxs;
 
     // 并发对每个 ctx search L1
     const groups = await Promise.all(
-      ctxs.map(async (c) => {
+      readableCtxs.map(async (c) => {
         const items = await this.client.searchL1ForCtx(
           { teamId: c.teamId, userId: c.userId, agentId: c.agentId, agentName: c.agentName },
           query,
@@ -112,9 +115,27 @@ export class TdaiL1RecallInjector implements InjectionHook {
         metadata: {
           source: this.id,
           count: merged.length,
-          sources: ctxs.map((c) => c.agentId),
+          sources: readableCtxs.map((c) => c.agentId),
         },
       },
     ];
   }
+}
+
+async function filterReadableContexts<T extends { teamId: string; agentId: string }>(
+  client: Pick<TdaiClient, "checkAcl">,
+  userKey: string | undefined,
+  contexts: T[],
+): Promise<T[]> {
+  if (!userKey) return [];
+  const decisions = await Promise.all(contexts.map(async (context) => ({
+    context,
+    decision: await checkAclOrDeny(client, {
+      user_key: userKey,
+      asset_id: `chat_memory-${context.teamId}-${context.agentId}`,
+      action: "read",
+      agent_id: context.agentId,
+    }),
+  })));
+  return decisions.filter(({ decision }) => decision.allowed).map(({ context }) => context);
 }
