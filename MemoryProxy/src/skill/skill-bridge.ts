@@ -428,7 +428,8 @@ export function createSkillBridgeHandler(
     // Session must be initialized — IdFields come from there.
     const { sessionKey } = deriveSessionKey(c);
     const explicitSource = c.req.header("x-agent-source");
-    const requestedSpaceId = c.req.header("x-tdai-service-id")
+    const requestedSpaceId = c.req.header("x-tdai-service-id");
+    const recoverySpaceId = requestedSpaceId
       ?? config.tdai?.serviceId
       ?? config.coreSkill?.serviceId
       ?? "";
@@ -437,11 +438,11 @@ export function createSkillBridgeHandler(
       // §6.1 修复：跨 pod L2 fallthrough
       const auth = c.req.header("authorization") ?? c.req.header("Authorization") ?? "";
       const apiKey = extractBearerToken(auth);
-      if (apiKey && requestedSpaceId) {
-        console.log(`${TAG} session=${sessionKey} L1 miss → L2 fallthrough (apiKey=${apiKeyToKeyId(apiKey)} spaceId=${requestedSpaceId})`);
+      if (apiKey && recoverySpaceId) {
+        console.log(`${TAG} session=${sessionKey} L1 miss → L2 fallthrough (apiKey=${apiKeyToKeyId(apiKey)} spaceId=${recoverySpaceId})`);
         ids = await loadSessionIdsL2(
           apiKey,
-          requestedSpaceId,
+          recoverySpaceId,
           sessionKey,
           explicitSource,
         );
