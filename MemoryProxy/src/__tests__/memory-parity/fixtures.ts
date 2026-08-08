@@ -52,10 +52,20 @@ export interface NormalizationScenario {
     | "multiple-tools"
     | "failed-tool"
     | "empty-result"
-    | "large-result-boundary";
+    | "large-result-boundary"
+    | "local-exec"
+    | "apply-patch"
+    | "mcp-tool";
   proxyInputs: ProxyRoundInput[];
   hookInput: HookRoundInput;
   golden: NormalizedMessage[];
+}
+
+export interface HostedToolVisibilityFixture {
+  proxyInput: ProxyRoundInput;
+  hookInput: HookRoundInput;
+  proxyGolden: NormalizedMessage[];
+  hookGolden: NormalizedMessage[];
 }
 
 export const PARITY_IDENTITY = {
@@ -109,6 +119,8 @@ export const PARITY_TASK: TaskDetail = {
 };
 
 export const USER_PROMPT = "Giữ Unicode 🧠 và code:\n```ts\nconst café = true;\n```";
+export const INJECTED_MEMORY_CONTEXT =
+  "<system-reminder>injected memory context</system-reminder>";
 export const INTERMEDIATE_ASSISTANT = "I will inspect the workspace.";
 export const FINAL_ASSISTANT = "Done — the code block and Unicode are preserved.";
 
@@ -149,7 +161,7 @@ function createNormalizationScenario(input: {
           {
             role: "user",
             content: [
-              { type: "text", text: "<system-reminder>generated context</system-reminder>" },
+              { type: "text", text: INJECTED_MEMORY_CONTEXT },
               { type: "image", source: { type: "base64", data: "not-memory" } },
               { type: "text", text: input.userPrompt },
             ],
@@ -322,12 +334,125 @@ export const NORMALIZATION_SCENARIOS: NormalizationScenario[] = [
     }],
     assistant: "The large payload was preserved.",
   }),
+  createNormalizationScenario({
+    id: "local-exec",
+    userPrompt: "Run the local command",
+    tools: [{
+      toolCallId: "tool-local-exec",
+      toolName: "exec_command",
+      input: { cmd: "pwd" },
+      result: "/workspace\nexit: 0",
+      failed: false,
+    }],
+    assistant: "The local command completed.",
+  }),
+  createNormalizationScenario({
+    id: "apply-patch",
+    userPrompt: "Apply the focused patch",
+    tools: [{
+      toolCallId: "tool-apply-patch",
+      toolName: "apply_patch",
+      input: { patch: "*** Begin Patch\n*** End Patch" },
+      result: "Done!",
+      failed: false,
+    }],
+    assistant: "The patch was applied.",
+  }),
+  createNormalizationScenario({
+    id: "mcp-tool",
+    userPrompt: "Search shared memory",
+    tools: [{
+      toolCallId: "tool-mcp-search",
+      toolName: "mcp__memory__search",
+      input: { query: "parity contract" },
+      result: JSON.stringify({ matches: ["completed-round"] }),
+      failed: false,
+    }],
+    assistant: "The shared-memory result was found.",
+  }),
 ];
 
 const unicodeScenario = NORMALIZATION_SCENARIOS[0];
 export const COMPLETED_ROUND_GOLDEN = unicodeScenario.golden;
 export const PROXY_ROUND_INPUTS = unicodeScenario.proxyInputs;
 export const HOOK_ROUND_INPUT = unicodeScenario.hookInput;
+
+const HOSTED_TOOL_USER_PROMPT = "Find the current hosted result";
+const HOSTED_TOOL_ASSISTANT = "The hosted result is available.";
+const HOSTED_TOOL_CALL: NormalizedMessage = {
+  role: "tool_call",
+  content: JSON.stringify({ query: "current result" }),
+  tool_call_id: "tool-hosted-search",
+  tool_name: "web_search",
+};
+const HOSTED_TOOL_RESULT: NormalizedMessage = {
+  role: "tool_result",
+  content: "hosted result",
+  tool_call_id: "tool-hosted-search",
+};
+
+export const HOSTED_TOOL_VISIBILITY_FIXTURE: HostedToolVisibilityFixture = {
+  proxyInput: {
+    protocol: "anthropic",
+    agentSource: "claude-code",
+    messages: [
+      { role: "user", content: HOSTED_TOOL_USER_PROMPT },
+      {
+        role: "assistant",
+        content: [{
+          type: "tool_use",
+          id: "tool-hosted-search",
+          name: "web_search",
+          input: { query: "current result" },
+        }],
+      },
+      {
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: "tool-hosted-search",
+          content: HOSTED_TOOL_RESULT.content,
+        }],
+      },
+    ],
+    assistantMessage: {
+      role: "assistant",
+      content: [{ type: "text", text: HOSTED_TOOL_ASSISTANT }],
+    },
+  },
+  // Hosted tools may not emit PostToolUse. The hook-derived fixture therefore
+  // retains the completed conversational pair but makes no tool-capture claim.
+  hookInput: {
+    sessionStart: {
+      event: "SessionStart",
+      source: "startup",
+      session_id: PARITY_IDENTITY.sessionId,
+    },
+    prompt: {
+      event: "UserPromptSubmit",
+      session_id: PARITY_IDENTITY.sessionId,
+      turn_id: "turn-hosted-tool-omission",
+      prompt: HOSTED_TOOL_USER_PROMPT,
+    },
+    tools: [],
+    stop: {
+      event: "Stop",
+      session_id: PARITY_IDENTITY.sessionId,
+      turn_id: "turn-hosted-tool-omission",
+      assistant: HOSTED_TOOL_ASSISTANT,
+    },
+  },
+  proxyGolden: [
+    { role: "user", content: HOSTED_TOOL_USER_PROMPT },
+    HOSTED_TOOL_CALL,
+    HOSTED_TOOL_RESULT,
+    { role: "assistant", content: HOSTED_TOOL_ASSISTANT },
+  ],
+  hookGolden: [
+    { role: "user", content: HOSTED_TOOL_USER_PROMPT },
+    { role: "assistant", content: HOSTED_TOOL_ASSISTANT },
+  ],
+};
 
 export function normalizedHookRound(input: HookRoundInput): NormalizedMessage[] {
   return [
