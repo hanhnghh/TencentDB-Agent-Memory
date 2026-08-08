@@ -53,6 +53,11 @@ export interface ExtractLockHandle {
   token: string;    // 释放/续约凭证
 }
 
+export interface SessionMutexLease {
+  /** Fail closed when this holder no longer owns the serialization lease. */
+  assertOwned(): Promise<void>;
+}
+
 export interface ISkillAgentTaskQueue {
   // ── Agent queue ──
   /**
@@ -93,7 +98,7 @@ export interface ISkillAgentTaskQueue {
   withSessionMutex<T>(
     tuple: SessionTuple,
     opts: { lockTtlMs: number; waitDeadlineMs: number },
-    fn: () => Promise<T>,
+    fn: (lease: SessionMutexLease) => Promise<T>,
   ): Promise<T>;
 
   // ── extract-lock（Worker 独占 agent 抽取权） ──
@@ -204,7 +209,7 @@ export class LocalSkillAgentTaskQueue implements ISkillAgentTaskQueue {
   async withSessionMutex<T>(
     tuple: SessionTuple,
     opts: { lockTtlMs: number; waitDeadlineMs: number },
-    fn: () => Promise<T>,
+    fn: (lease: SessionMutexLease) => Promise<T>,
   ): Promise<T> {
     return this.withLocalMutex(
       this.sessionMutex,
@@ -218,7 +223,7 @@ export class LocalSkillAgentTaskQueue implements ISkillAgentTaskQueue {
     mutexes: Map<string, { token: string; expireAt: number }>,
     key: string,
     opts: { lockTtlMs: number; waitDeadlineMs: number },
-    fn: () => Promise<T>,
+    fn: (lease: SessionMutexLease) => Promise<T>,
   ): Promise<T> {
     const deadline = Date.now() + opts.waitDeadlineMs;
     while (true) {
@@ -229,7 +234,13 @@ export class LocalSkillAgentTaskQueue implements ISkillAgentTaskQueue {
         const token = randomUUID();
         mutexes.set(key, { token, expireAt: Number.POSITIVE_INFINITY });
         try {
-          return await fn();
+          return await fn({
+            assertOwned: async () => {
+              if (mutexes.get(key)?.token !== token) {
+                throw new Error(`[skill-agent-queue] session-mutex lease lost for ${key}`);
+              }
+            },
+          });
         } finally {
           const held = mutexes.get(key);
           if (held && held.token === token) mutexes.delete(key);
@@ -442,7 +453,7 @@ export class RedisSkillAgentTaskQueue implements ISkillAgentTaskQueue {
   async withSessionMutex<T>(
     tuple: SessionTuple,
     opts: { lockTtlMs: number; waitDeadlineMs: number },
-    fn: () => Promise<T>,
+    fn: (lease: SessionMutexLease) => Promise<T>,
   ): Promise<T> {
     return this.withRedisMutex(
       this.sessionMutexPrefix + serializeSessionTuple(tuple),
@@ -454,7 +465,7 @@ export class RedisSkillAgentTaskQueue implements ISkillAgentTaskQueue {
   private async withRedisMutex<T>(
     key: string,
     opts: { lockTtlMs: number; waitDeadlineMs: number },
-    fn: () => Promise<T>,
+    fn: (lease: SessionMutexLease) => Promise<T>,
   ): Promise<T> {
     const token = randomUUID();
     const deadline = Date.now() + opts.waitDeadlineMs;
@@ -493,10 +504,31 @@ export class RedisSkillAgentTaskQueue implements ISkillAgentTaskQueue {
           }, renewAfterMs);
         };
         scheduleRenewal();
-        try {
-          const result = await fn();
-          await renewal;
+        const assertOwned = async (): Promise<void> => {
           if (renewalFailure) throw renewalFailure;
+          let renewed: unknown;
+          try {
+            renewed = await this.client.eval(
+              LUA_RENEW,
+              1,
+              key,
+              token,
+              opts.lockTtlMs,
+            );
+          } catch (error) {
+            throw new Error(
+              `[skill-agent-queue] session-mutex ownership check failed for ${key}`,
+              { cause: error },
+            );
+          }
+          if (renewed !== 1) {
+            throw new Error(`[skill-agent-queue] session-mutex lease lost for ${key}`);
+          }
+        };
+        try {
+          const result = await fn({ assertOwned });
+          await renewal;
+          await assertOwned();
           return result;
         } finally {
           stopped = true;

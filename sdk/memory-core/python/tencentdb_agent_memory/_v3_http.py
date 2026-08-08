@@ -64,12 +64,16 @@ def _decode_response(resp: httpx.Response) -> dict:
     try:
         envelope = resp.json()
     except ValueError as exc:
-        message = resp.text or f"HTTP {resp.status_code} returned a non-JSON response"
         code = resp.status_code if resp.is_error else -1
         classification = _classify_failure(resp.status_code, code)
         if not resp.is_error:
             classification["kind"] = "invalid_response"
-        raise TDAMError(code, message, header_request_id, **classification) from exc
+        raise TDAMError(
+            code,
+            f"HTTP {resp.status_code} returned a non-JSON response",
+            header_request_id,
+            **classification,
+        ) from exc
 
     if not isinstance(envelope, dict):
         code = resp.status_code if resp.is_error else -1
@@ -152,8 +156,9 @@ class HttpStub(Stub):
                 kind="timeout" if is_timeout else "network",
                 retryable=True,
             ) from exc
-        logger.debug("Response %s %s", path, resp.text)
-        return _decode_response(resp)
+        result = _decode_response(resp)
+        logger.debug("Response %s status=%s", path, resp.status_code)
+        return result
 
     def close(self) -> None:
         if isinstance(self.client, httpx.Client):
@@ -200,8 +205,9 @@ class AsyncHttpStub:
                 kind="timeout" if is_timeout else "network",
                 retryable=True,
             ) from exc
-        logger.debug("Response %s %s", path, resp.text)
-        return _decode_response(resp)
+        result = _decode_response(resp)
+        logger.debug("Response %s status=%s", path, resp.status_code)
+        return result
 
     async def close(self) -> None:
         if isinstance(self.client, httpx.AsyncClient):

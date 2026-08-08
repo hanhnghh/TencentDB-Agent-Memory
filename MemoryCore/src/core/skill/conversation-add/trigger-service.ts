@@ -114,7 +114,7 @@ export class SkillTriggerService {
     return {
       archivedAtMs,
       archiveKey: this.buffer.archiveKey(session, archivedAtMs),
-      taskId: `skill-extract-task-${randomUUID().slice(0, 8)}`,
+      taskId: `skill-extract-task-${randomUUID()}`,
     };
   }
 

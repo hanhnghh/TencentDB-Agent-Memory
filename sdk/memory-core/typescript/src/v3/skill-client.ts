@@ -85,9 +85,12 @@ function isConversationAddData(value: unknown): value is SkillConversationAddDat
     if (typeof value.archived.archived_at_ms !== "number" || !Number.isFinite(value.archived.archived_at_ms)) {
       return false;
     }
-    if (!["tool_calls", "bytes", "compressed", "oversize"].includes(String(value.archived.reason))) {
+    if (typeof value.archived.reason !== "string" ||
+      !["tool_calls", "bytes", "compressed", "oversize"].includes(value.archived.reason)) {
       return false;
     }
+  } else if (value.archived !== undefined) {
+    return false;
   }
   return true;
 }

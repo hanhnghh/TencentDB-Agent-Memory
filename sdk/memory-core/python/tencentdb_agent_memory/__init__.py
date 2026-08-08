@@ -18,7 +18,13 @@
 >>> client.add_conversation(session_id="s1", messages=[...])
 """
 
-from .errors import ParamError, TDAMError
+from .errors import ParamError, TDAMError, TDAMFailureKind
 from .v2 import AsyncMemoryClient, MemoryClient
 
-__all__ = ["MemoryClient", "AsyncMemoryClient", "TDAMError", "ParamError"]
+__all__ = [
+    "MemoryClient",
+    "AsyncMemoryClient",
+    "TDAMError",
+    "TDAMFailureKind",
+    "ParamError",
+]

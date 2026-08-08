@@ -176,11 +176,12 @@ def test_async_transport_exposes_network_and_timeout_failures(error, kind):
 
 
 def test_malformed_success_is_a_typed_permanent_failure():
-    response = httpx.Response(200, content=b"not-json")
+    response = httpx.Response(200, content=b"secret-response-body")
     with pytest.raises(TDAMError) as caught:
         _decode_response(response)
     assert caught.value.kind == "invalid_response"
     assert caught.value.retryable is False
+    assert "secret-response-body" not in str(caught.value)
 
 
 def test_non_object_success_data_is_a_typed_permanent_failure():

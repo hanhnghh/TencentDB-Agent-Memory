@@ -19,7 +19,7 @@ function response(body: unknown, status = 200): Response {
 describe("CoreSkillClient conversation receipts", () => {
   it("sends source identity and exposes the durable receipt", async () => {
     let capturedInit: RequestInit | undefined;
-    const fetcher = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+    const fetcher: typeof fetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       capturedInit = init;
       return response({
         code: 0,
@@ -34,7 +34,7 @@ describe("CoreSkillClient conversation receipts", () => {
         },
       });
     });
-    const client = new CoreSkillClient(config, fetcher as typeof fetch);
+    const client = new CoreSkillClient(config, fetcher);
 
     const result = await client.addConversation({
       session_id: "session-1",
@@ -60,11 +60,12 @@ describe("CoreSkillClient conversation receipts", () => {
     [429, 4291, true, "rate_limit"],
     [503, 50001, true, "server"],
   ])("classifies HTTP %i failures for retry", async (status, code, retryable, kind) => {
-    const client = new CoreSkillClient(config, vi.fn(async () => response({
+    const fetcher: typeof fetch = vi.fn(async () => response({
       code,
       message: "failed",
       request_id: "request-1",
-    }, status)) as typeof fetch);
+    }, status));
+    const client = new CoreSkillClient(config, fetcher);
 
     const failure = await client.addConversation({
       session_id: "session-1",
@@ -91,7 +92,7 @@ describe("CoreSkillClient conversation receipts", () => {
   ])("classifies %s transport failures as retryable", async (transportError, kind) => {
     const client = new CoreSkillClient(
       config,
-      vi.fn(async () => { throw transportError; }) as typeof fetch,
+      vi.fn(async () => { throw transportError; }),
     );
 
     const failure = await client.addConversation({
@@ -116,7 +117,7 @@ describe("CoreSkillClient conversation receipts", () => {
   ])("classifies HTTP-200 business failure %i", async (code, kind, retryable) => {
     const client = new CoreSkillClient(
       config,
-      vi.fn(async () => response({ code, message: "failed", request_id: "request-business" })) as typeof fetch,
+      vi.fn(async () => response({ code, message: "failed", request_id: "request-business" })),
     );
 
     const failure = await client.addConversation({
@@ -140,7 +141,7 @@ describe("CoreSkillClient conversation receipts", () => {
   it("surfaces malformed success responses as typed permanent failures", async () => {
     const client = new CoreSkillClient(
       config,
-      vi.fn(async () => new Response("not-json", { status: 200 })) as typeof fetch,
+      vi.fn(async () => new Response("not-json", { status: 200 })),
     );
     const failure = await client.addConversation({
       session_id: "session-1",
@@ -154,12 +155,13 @@ describe("CoreSkillClient conversation receipts", () => {
       kind: "invalid_response",
       retryable: false,
     });
+    expect(String(failure)).not.toContain("not-json");
   });
 
   it("rejects a success envelope that omits the durable receipt", async () => {
     const client = new CoreSkillClient(
       config,
-      vi.fn(async () => response({ code: 0, data: { status: "ok" } })) as typeof fetch,
+      vi.fn(async () => response({ code: 0, data: { status: "ok" } })),
     );
     const failure = await client.addConversation({
       session_id: "session-1",
@@ -179,7 +181,7 @@ describe("CoreSkillClient conversation receipts", () => {
   it("rejects a non-object data payload in a generic success envelope", async () => {
     const client = new CoreSkillClient(
       config,
-      vi.fn(async () => response({ code: 0, data: [] })) as typeof fetch,
+      vi.fn(async () => response({ code: 0, data: [] })),
     );
     const failure = await client.post("/v3/skill/listing", {})
       .catch((error: unknown) => error);
@@ -194,7 +196,7 @@ describe("CoreSkillClient conversation receipts", () => {
   it("rejects a non-object response envelope", async () => {
     const client = new CoreSkillClient(
       config,
-      vi.fn(async () => response([])) as typeof fetch,
+      vi.fn(async () => response([])),
     );
 
     const failure = await client.post("/v3/skill/listing", {})

@@ -3,7 +3,6 @@
 import { Agent } from "undici";
 import { ParamError, TDAMError, type TDAMFailureKind } from "../errors.js";
 import type { HttpTransportOptions } from "../http.js";
-import type { ApiResponseEnvelope } from "../types.js";
 
 export class V3HttpTransport {
   private readonly endpoint: string;
@@ -57,7 +56,7 @@ export class V3HttpTransport {
       if (this.dispatcher) fetchOptions.dispatcher = this.dispatcher;
       let response: Response;
       try {
-        response = await fetch(`${this.endpoint}${path}`, fetchOptions as RequestInit);
+        response = await fetch(`${this.endpoint}${path}`, fetchOptions);
       } catch (error) {
         const timeout = error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
         throw new TDAMError(
@@ -74,20 +73,20 @@ export class V3HttpTransport {
         response.headers.get("x-trace-id") ??
         "";
 
-      let envelope: ApiResponseEnvelope<T>;
+      let parsed: unknown;
       try {
-        envelope = JSON.parse(responseText) as ApiResponseEnvelope<T>;
+        parsed = JSON.parse(responseText);
       } catch {
         const classification = classifyFailure(response.status, response.status);
         throw new TDAMError(
           response.ok ? -1 : response.status,
-          responseText || `HTTP ${response.status} returned a non-JSON response`,
+          `HTTP ${response.status} returned a non-JSON response`,
           headerRequestId,
           undefined,
           response.ok ? { ...classification, kind: "invalid_response" } : classification,
         );
       }
-      if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
+      if (!isRecord(parsed)) {
         const classification = classifyFailure(response.status, response.status);
         throw new TDAMError(
           response.ok ? -1 : response.status,
@@ -97,42 +96,49 @@ export class V3HttpTransport {
           response.ok ? { ...classification, kind: "invalid_response" } : classification,
         );
       }
+      const envelope = parsed;
 
       const businessCode = typeof envelope.code === "number" ? envelope.code : undefined;
       if (!response.ok || businessCode !== 0) {
         const code = businessCode && businessCode !== 0 ? businessCode : response.status;
         const details =
-          envelope.data && typeof envelope.data === "object"
-            ? (envelope.data as Record<string, unknown>)
-            : undefined;
+          isRecord(envelope.data) ? envelope.data : undefined;
         throw new TDAMError(
           code,
-          envelope.message || `HTTP ${response.status}`,
-          headerRequestId || envelope.request_id || "",
+          readString(envelope.message) ?? `HTTP ${response.status}`,
+          headerRequestId || readString(envelope.request_id) || "",
           details,
           classifyFailure(response.status, code),
         );
       }
 
-      if (!envelope.data || typeof envelope.data !== "object" || Array.isArray(envelope.data)) {
+      if (!isRecord(envelope.data)) {
         throw new TDAMError(
           -1,
           "API response data must be a JSON object",
-          headerRequestId || envelope.request_id || "",
+          headerRequestId || readString(envelope.request_id) || "",
           undefined,
           { kind: "invalid_response", retryable: false, httpStatus: response.status },
         );
       }
-      const result = envelope.data as T & { trace_id?: string };
+      const result = { ...envelope.data };
       const traceId = response.headers.get("x-trace-id");
-      if (traceId && result && typeof result === "object") {
-        (result as Record<string, unknown>).trace_id = traceId;
-      }
-      return result;
+      if (traceId) result.trace_id = traceId;
+      // `post<T>` is the SDK's low-level generic seam. Public clients with
+      // reliability-sensitive payloads validate this record before return.
+      return result as T & { trace_id?: string };
     } finally {
       clearTimeout(timer);
     }
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function readString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
 }
 
 function classifyFailure(httpStatus: number, code: number): {

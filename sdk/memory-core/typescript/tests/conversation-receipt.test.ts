@@ -9,6 +9,18 @@ function response(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status });
 }
 
+function parseRecord(value: string): Record<string, unknown> {
+  const parsed: unknown = JSON.parse(value);
+  if (!isRecord(parsed)) {
+    throw new Error("captured request body must be an object");
+  }
+  return parsed;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 const request = {
   session_id: "session-1",
   user_id: "user-1",
@@ -31,7 +43,7 @@ describe("TypeScript SDK skill conversation receipt", () => {
   it("sends event identity and returns the receipt", async () => {
     let body: Record<string, unknown> | undefined;
     vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
-      body = JSON.parse(String(init.body));
+      body = parseRecord(String(init.body));
       return response({ code: 0, data: {
         status: "ok",
         receipt: {
@@ -107,13 +119,14 @@ describe("TypeScript SDK skill conversation receipt", () => {
   });
 
   it("surfaces malformed success responses as typed permanent failures", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response("not-json", { status: 200 })));
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("secret-response-body", { status: 200 })));
     const failure = await client().conversationAdd(request).catch((error: unknown) => error);
     expect(failure).toMatchObject({
       name: "TDAMError",
       kind: "invalid_response",
       retryable: false,
     });
+    expect(String(failure)).not.toContain("secret-response-body");
   });
 
   it("rejects a success envelope that omits the durable receipt", async () => {

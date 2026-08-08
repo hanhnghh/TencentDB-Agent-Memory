@@ -348,16 +348,21 @@ export interface SkillConversationArchivedInfo {
    */
   reason: "tool_calls" | "bytes" | "compressed" | "oversize";
 }
-export interface SkillConversationAddData {
-  status: "ok" | "archived";
-  archived?: SkillConversationArchivedInfo;
-  receipt: {
-    receipt_id: string;
-    source_event_id?: string;
-    content_hash: string;
-    accepted_at_ms: number;
-  };
+
+export interface SkillConversationReceipt {
+  receipt_id: string;
+  source_event_id?: string;
+  content_hash: string;
+  accepted_at_ms: number;
 }
+
+export type SkillConversationAddData =
+  | { status: "ok"; receipt: SkillConversationReceipt }
+  | {
+    status: "archived";
+    archived: SkillConversationArchivedInfo;
+    receipt: SkillConversationReceipt;
+  };
 
 // ── /v3/skill/conversation/force-archive ──
 /**

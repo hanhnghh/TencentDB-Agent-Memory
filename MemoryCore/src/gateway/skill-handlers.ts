@@ -51,7 +51,10 @@ import { DEFAULT_COMPRESS_OPTIONS } from "../core/skill/conversation-add/message
 import { DEFAULT_OVERSIZE_OPTIONS } from "../core/skill/conversation-add/oversize-strategy.js";
 import { prepareArchivePayload } from "../core/skill/conversation-add/prepare-archive.js";
 import type { CompressibleMessage } from "../core/skill/conversation-add/message-compressor.js";
-import { SourceEventConflictError } from "../core/skill/conversation-add/add-handler.js";
+import {
+  HandlerValidationError,
+  SourceEventConflictError,
+} from "../core/skill/conversation-add/add-handler.js";
 import { trace } from "../core/report/trace.js";
 import { metricProducer } from "../core/report/kafka-metric-producer.js";
 import { obsLogger } from "../core/report/obs-logger.js";
@@ -864,9 +867,10 @@ export async function handleConversationAdd(
       // 透传 requestId 给 handler 内部分段 obsLogger 用；trigger.archive 也会再透传一层
       perfRequestId: requestId,
     });
+    const archived = out.status === "archived" ? out.archived : undefined;
     obsLogger.info("skill.handleConversationAdd.handler_handle", {
       req_id: requestId, dur_ms: Date.now() - t0Handle,
-      status: out.status, reason: out.archived?.reason,
+      status: out.status, reason: archived?.reason ?? "",
     });
 
     try {
@@ -876,16 +880,16 @@ export async function handleConversationAdd(
         team_id: input.team_id,
         agent_id: input.agent_id,
         status: out.status,
-        archived_task_id: out.archived?.task_id,
-        reason: out.archived?.reason,
+        archived_task_id: archived?.task_id,
+        reason: archived?.reason,
         msg_count: input.messages.length,
         success: true,
       });
     } catch { /* noop */ }
 
     obsLogger.info("skill.handleConversationAdd.done", { req_id: requestId, code: 0, dur_ms: Date.now() - t0, status: out.status,
-      reason: out.archived?.reason,
-      task_id: out.archived?.task_id,
+      reason: archived?.reason ?? "",
+      task_id: archived?.task_id ?? "",
       msg_count: input.messages.length, });
     return successEnvelope(out, requestId);
   } catch (err) {
@@ -904,13 +908,23 @@ export async function handleConversationAdd(
       });
     }
     // HandlerValidationError → 400；其他 → 500
-    const isValidation = err instanceof Error && err.name === "HandlerValidationError";
-    if (isValidation) {
-      obsLogger.error("skill.handleConversationAdd.done", { req_id: requestId, dur_ms: Date.now() - t0, field: (err as { field?: string }).field }, err instanceof Error ? err : undefined);
+    if (err instanceof HandlerValidationError) {
+      obsLogger.error("skill.handleConversationAdd.done", {
+        req_id: requestId,
+        dur_ms: Date.now() - t0,
+        field: err.field,
+      });
       return errorEnvelope(40001, err.message, requestId);
     }
-    deps.logger.warn(`${TAG} /v3/skill/conversation/add failed: ${(err as Error).message}`);
-    obsLogger.error("skill.handleConversationAdd.done", { req_id: requestId, dur_ms: Date.now() - t0 }, err instanceof Error ? err : undefined);
+    const errorType = err instanceof Error ? err.name : typeof err;
+    deps.logger.warn(
+      `${TAG} /v3/skill/conversation/add failed req_id=${requestId} error_type=${errorType}`,
+    );
+    obsLogger.error("skill.handleConversationAdd.done", {
+      req_id: requestId,
+      dur_ms: Date.now() - t0,
+      reason: errorType,
+    });
     return errorEnvelope(50001, "Skill conversation ingestion failed", requestId);
   }
 }
@@ -955,7 +969,7 @@ export async function handleForceArchive(
   };
 
   try {
-    return await wired.serializeSession(sess, async () => {
+    return await wired.serializeSession(sess, async (assertOwned) => {
       const state = await wired.buffer.readSessionState(sess);
       const current = state.current;
 
@@ -977,6 +991,7 @@ export async function handleForceArchive(
 
       // Preserve receipts while atomically replacing the buffered state.
       const nowMs = Date.now();
+      await assertOwned();
       await wired.buffer.writeSessionState(sess, {
         version: state.version + 1,
         current: { messages: [] },
@@ -1006,9 +1021,16 @@ export async function handleForceArchive(
       }, requestId);
     });
   } catch (err) {
-    deps.logger.warn(`${TAG} /v3/skill/conversation/force-archive failed: ${(err as Error).message} req_id=${requestId}`);
-    obsLogger.error("skill.handleForceArchive.done", { req_id: requestId, dur_ms: Date.now() - t0 }, err instanceof Error ? err : undefined);
-    return errorEnvelope(50001, (err as Error).message ?? "internal error", requestId);
+    const errorType = err instanceof Error ? err.name : typeof err;
+    deps.logger.warn(
+      `${TAG} /v3/skill/conversation/force-archive failed req_id=${requestId} error_type=${errorType}`,
+    );
+    obsLogger.error("skill.handleForceArchive.done", {
+      req_id: requestId,
+      dur_ms: Date.now() - t0,
+      reason: errorType,
+    });
+    return errorEnvelope(50001, "Skill conversation archive failed", requestId);
   }
 }
 

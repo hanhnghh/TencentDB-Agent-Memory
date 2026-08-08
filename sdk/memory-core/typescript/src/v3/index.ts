@@ -45,6 +45,7 @@ export type {
   SkillConversationAddData,
   SkillConversationAddRequest,
   SkillConversationArchivedInfo,
+  SkillConversationReceipt,
   SkillConversationForceArchiveData,
   SkillConversationForceArchiveRequest,
   SkillConversationMessage,

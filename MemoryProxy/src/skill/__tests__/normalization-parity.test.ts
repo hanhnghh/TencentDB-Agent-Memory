@@ -19,6 +19,18 @@ const TEST_CONFIG = {
   },
 };
 
+function parseRecord(value: string): Record<string, unknown> {
+  const parsed: unknown = JSON.parse(value);
+  if (!isRecord(parsed)) {
+    throw new Error("captured request body must be an object");
+  }
+  return parsed;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 async function captureCompletedRound(
   inputMessages: unknown[],
   protocol: "openai" | "anthropic",
@@ -26,8 +38,8 @@ async function captureCompletedRound(
   agentSource = "unknown",
 ): Promise<Array<Record<string, unknown>>> {
   let captured: Record<string, unknown> | undefined;
-  const fetcher = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-    captured = JSON.parse(String(init?.body)) as Record<string, unknown>;
+  const fetcher: typeof fetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+    captured = parseRecord(String(init?.body));
     return new Response(JSON.stringify({
       code: 0,
       data: {
@@ -41,7 +53,7 @@ async function captureCompletedRound(
       },
     }), { status: 200 });
   });
-  setCoreSkillClient(new CoreSkillClient(TEST_CONFIG.coreSkill, fetcher as typeof fetch));
+  setCoreSkillClient(new CoreSkillClient(TEST_CONFIG.coreSkill, fetcher));
   vi.spyOn(console, "log").mockImplementation(() => undefined);
 
   await triggerSkillExtractIfReady({
@@ -266,7 +278,7 @@ describe("observed legacy skill conversation normalization", () => {
 
   it("does not schedule ingestion for an intermediate OpenAI tool-call response", async () => {
     const fetcher = vi.fn();
-    setCoreSkillClient(new CoreSkillClient(TEST_CONFIG.coreSkill, fetcher as typeof fetch));
+    setCoreSkillClient(new CoreSkillClient(TEST_CONFIG.coreSkill, fetcher));
 
     await triggerSkillExtractIfReady({
       config: TEST_CONFIG,

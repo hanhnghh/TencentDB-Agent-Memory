@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
-import type { IncomingMessage, ServerResponse } from "node:http";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { IncomingMessage, ServerResponse } from "node:http";
+import { Socket } from "node:net";
 
 import type {
   IStorageBackend,
@@ -13,7 +14,6 @@ import { conversationAddRequestSchema } from "../../../gateway/skill-schemas.js"
 import { handleV2Route } from "../../../gateway/v2-router.js";
 import {
   handleConversationAdd,
-  makeSkillRouteTable,
 } from "../../../gateway/skill-handlers.js";
 import {
   LocalSkillAgentTaskQueue,
@@ -25,8 +25,13 @@ import { SkillConversationAddHandler } from "./add-handler.js";
 import { SkillTriggerService } from "./trigger-service.js";
 import { wireConversationAdd } from "./wire.js";
 
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
+
 class MemoryBackend implements IStorageBackend {
-  readonly type = "local" as const;
+  readonly type: "local" = "local";
   readonly objects = new Map<string, Buffer>();
   throwAfterSessionCommitOnce = false;
   failSessionCommitOnce = false;
@@ -140,6 +145,10 @@ class LeaseRedis implements RedisLike {
   async lrem(): Promise<number> { return 0; }
   async brpop(): Promise<[string, string] | null> { return null; }
   async rpop(): Promise<string | null> { return null; }
+
+  clearLeases(): void {
+    this.values.clear();
+  }
 }
 
 const baseInput = {
@@ -175,13 +184,13 @@ async function dispatchConversation(
   wired: ReturnType<typeof makeWired>["wired"],
   body: unknown,
 ): Promise<{ status: number; envelope: Record<string, unknown> }> {
-  const req = {
-    headers: {
-      authorization: "Bearer key",
-      "x-tdai-service-id": "space-1",
-    },
-  } as IncomingMessage;
-  const res = {} as ServerResponse;
+  const socket = new Socket();
+  const req = new IncomingMessage(socket);
+  req.headers = {
+    authorization: "Bearer key",
+    "x-tdai-service-id": "space-1",
+  };
+  const res = new ServerResponse(req);
   let sent: { status: number; envelope: Record<string, unknown> } | undefined;
   const deps = {
     getStore: () => undefined,
@@ -193,20 +202,40 @@ async function dispatchConversation(
     resolveConversationAdd: async () => wired,
   };
 
-  const handled = await handleV2Route(
-    req,
-    res,
-    "/v3/skill/conversation/add",
-    "POST",
-    async () => body,
-    (_response, status, payload) => {
-      sent = { status, envelope: payload as Record<string, unknown> };
-    },
-    deps,
-    makeSkillRouteTable() as unknown as NonNullable<Parameters<typeof handleV2Route>[7]>,
-  );
-  if (!handled || !sent) throw new Error("conversation route did not emit an HTTP response");
-  return sent;
+  try {
+    const handled = await handleV2Route(
+      req,
+      res,
+      "/v3/skill/conversation/add",
+      "POST",
+      async () => body,
+      (_response, status, payload) => {
+        sent = { status, envelope: requireRecord(payload, "HTTP response envelope") };
+      },
+      deps,
+      {
+        "/v3/skill/conversation/add": (routeBody, auth, requestId) => (
+          handleConversationAdd(routeBody, auth, requestId, deps)
+        ),
+      },
+    );
+    if (!handled || !sent) throw new Error("conversation route did not emit an HTTP response");
+    return sent;
+  } finally {
+    res.destroy();
+    socket.destroy();
+  }
+}
+
+function requireRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!isRecord(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  return value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 describe("skill conversation ingestion duplicate safety", () => {
@@ -229,7 +258,8 @@ describe("skill conversation ingestion duplicate safety", () => {
         },
       },
     });
-    expect((response.envelope.data as { receipt: Record<string, unknown> }).receipt)
+    const data = requireRecord(response.envelope.data, "success data");
+    expect(requireRecord(data.receipt, "conversation receipt"))
       .not.toHaveProperty("source_event_id");
   });
 
@@ -450,7 +480,8 @@ describe("skill conversation ingestion duplicate safety", () => {
         },
       },
     });
-    expect((result.data as { receipt: { source_event_id?: string } }).receipt)
+    const data = requireRecord(result.data, "success data");
+    expect(requireRecord(data.receipt, "conversation receipt"))
       .not.toHaveProperty("source_event_id");
     await expect(wired.buffer.readCurrent(baseInput)).resolves.toEqual({
       messages: baseInput.messages,
@@ -497,6 +528,52 @@ describe("skill conversation ingestion duplicate safety", () => {
     await expect(wired.buffer.readCurrent(baseInput)).resolves.toEqual({
       messages: baseInput.messages,
     });
+  });
+
+  it("fails closed when durable session state has an invalid boundary shape", async () => {
+    const backend = new MemoryBackend();
+    const { wired } = makeWired(backend);
+    backend.objects.set(
+      wired.buffer.stateKey(baseInput),
+      Buffer.from(JSON.stringify({
+        version: 1,
+        current: { messages: [] },
+        meta: {
+          session_id: baseInput.session_id,
+          space_id: baseInput.space_id,
+          user_id: baseInput.user_id,
+          team_id: baseInput.team_id,
+          agent_id: baseInput.agent_id,
+          tool_call_count: 0,
+          byte_count: 0,
+        },
+        receipts: [],
+      })),
+    );
+
+    await expect(wired.buffer.readSessionState(baseInput))
+      .rejects.toThrow("Corrupt skill conversation session state");
+  });
+
+  it("encodes storage identity segments without tuple collisions or traversal", () => {
+    const { wired } = makeWired();
+    const slashInUser = wired.buffer.stateKey({
+      ...baseInput,
+      user_id: "user/segment",
+      team_id: "team",
+    });
+    const slashInTeam = wired.buffer.stateKey({
+      ...baseInput,
+      user_id: "user",
+      team_id: "segment/team",
+    });
+    const traversal = wired.buffer.stateKey({ ...baseInput, session_id: ".." });
+
+    expect(slashInUser).not.toBe(slashInTeam);
+    expect(slashInUser).toContain("user%2Fsegment");
+    expect(slashInTeam).toContain("segment%2Fteam");
+    expect(traversal).toContain("%2E%2E");
+    expect(traversal).not.toContain("/../");
   });
 
   it("maps changed-content replay to the public conflict envelope", async () => {
@@ -580,13 +657,19 @@ describe("skill conversation ingestion duplicate safety", () => {
     const backend = new MemoryBackend();
     backend.failSessionCommitOnce = true;
     const { wired } = makeWired(backend);
+    const warnings: string[] = [];
     const result = await handleConversationAdd(
       { ...baseInput, source_event_id: "event-1" },
       { apiKey: "key", serviceId: "space-1" },
       "request-1",
       {
         getSkillCore: () => undefined,
-        logger: { debug() {}, info() {}, warn() {}, error() {} },
+        logger: {
+          debug() {},
+          info() {},
+          warn(message) { warnings.push(message); },
+          error() {},
+        },
         resolveConversationAdd: async () => wired,
       },
     );
@@ -594,6 +677,8 @@ describe("skill conversation ingestion duplicate safety", () => {
     expect(result).toMatchObject({ code: 50001 });
     expect(result.message).not.toContain("secret-storage-path");
     expect(result.message).not.toContain("credentials");
+    expect(warnings.join("\n")).not.toContain("secret-storage-path");
+    expect(warnings.join("\n")).not.toContain("credentials");
   });
 
   it("serializes concurrent appends in one session without losing either event", async () => {
@@ -659,25 +744,65 @@ describe("skill conversation ingestion duplicate safety", () => {
   });
 
   it("keeps the same-session mutex exclusive after its initial lease duration", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
     const queue = new LocalSkillAgentTaskQueue();
+    const releaseFirst = createDeferred();
     let active = 0;
     let maxActive = 0;
-    const enter = async (holdMs: number) => queue.withSessionMutex(
+    const first = queue.withSessionMutex(
       baseInput,
       { lockTtlMs: 5, waitDeadlineMs: 100 },
       async () => {
         active += 1;
         maxActive = Math.max(maxActive, active);
-        await new Promise((resolve) => setTimeout(resolve, holdMs));
+        await releaseFirst.promise;
         active -= 1;
       },
     );
 
-    const first = enter(30);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    await Promise.all([first, enter(1)]);
+    vi.setSystemTime(10);
+    const second = queue.withSessionMutex(
+      baseInput,
+      { lockTtlMs: 5, waitDeadlineMs: 100 },
+      async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        active -= 1;
+      },
+    );
 
     expect(maxActive).toBe(1);
+    releaseFirst.resolve();
+    await first;
+    await vi.advanceTimersByTimeAsync(10);
+    await second;
+
+    expect(maxActive).toBe(1);
+  });
+
+  it("fails closed before committing when session-lock ownership is lost", async () => {
+    const backend = new MemoryBackend();
+    const buffer = new SkillBufferStorage({ storage: new StorageAdapter(backend) });
+    const queue = new LocalSkillAgentTaskQueue();
+    const trigger = new SkillTriggerService({ buffer, queue });
+    const handler = new SkillConversationAddHandler({
+      buffer,
+      trigger,
+      serialize: (_session, fn) => fn(async () => {
+        throw new Error("simulated session lease loss");
+      }),
+    });
+
+    await expect(handler.handle({
+      ...baseInput,
+      source_event_id: "lost-lease",
+    })).rejects.toThrow("simulated session lease loss");
+    await expect(buffer.readSessionState(baseInput)).resolves.toMatchObject({
+      version: 0,
+      current: { messages: [] },
+      receipts: {},
+    });
   });
 
   it.each([
@@ -690,16 +815,15 @@ describe("skill conversation ingestion duplicate safety", () => {
     const queue = new LocalSkillAgentTaskQueue();
     let active = 0;
     let maxActive = 0;
-    let bothEntered!: () => void;
-    const bothEnteredPromise = new Promise<void>((resolve) => { bothEntered = resolve; });
+    const bothEntered = createDeferred();
     const enter = async (session: typeof baseInput) => queue.withSessionMutex(
       session,
       { lockTtlMs: 1_000, waitDeadlineMs: 1_000 },
       async () => {
         active += 1;
         maxActive = Math.max(maxActive, active);
-        if (active === 2) bothEntered();
-        await bothEnteredPromise;
+        if (active === 2) bothEntered.resolve();
+        await bothEntered.promise;
         active -= 1;
       },
     );
@@ -713,28 +837,58 @@ describe("skill conversation ingestion duplicate safety", () => {
   });
 
   it("renews the distributed same-session mutex while work is active", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
     const queue = new RedisSkillAgentTaskQueue({
       client: new LeaseRedis(),
       keyPrefix: "test",
     });
+    const releaseFirst = createDeferred();
     let active = 0;
     let maxActive = 0;
-    const enter = async (holdMs: number) => queue.withSessionMutex(
+    const first = queue.withSessionMutex(
       baseInput,
       { lockTtlMs: 30, waitDeadlineMs: 300 },
       async () => {
         active += 1;
         maxActive = Math.max(maxActive, active);
-        await new Promise((resolve) => setTimeout(resolve, holdMs));
+        await releaseFirst.promise;
         active -= 1;
       },
     );
 
-    const first = enter(90);
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    await Promise.all([first, enter(1)]);
+    await vi.advanceTimersByTimeAsync(90);
+    const second = queue.withSessionMutex(
+      baseInput,
+      { lockTtlMs: 30, waitDeadlineMs: 300 },
+      async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        active -= 1;
+      },
+    );
 
     expect(maxActive).toBe(1);
+    releaseFirst.resolve();
+    await first;
+    await vi.advanceTimersByTimeAsync(50);
+    await second;
+
+    expect(maxActive).toBe(1);
+  });
+
+  it("detects a lost distributed lease through the public mutex guard", async () => {
+    const redis = new LeaseRedis();
+    const queue = new RedisSkillAgentTaskQueue({ client: redis, keyPrefix: "test" });
+
+    await expect(queue.withSessionMutex(
+      baseInput,
+      { lockTtlMs: 1_000, waitDeadlineMs: 1_000 },
+      async (lease) => {
+        redis.clearLeases();
+        await lease.assertOwned();
+      },
+    )).rejects.toThrow("session-mutex lease lost");
   });
 
   it("uses distinct archive keys when consecutive archives share a wall-clock millisecond", async () => {
@@ -754,7 +908,7 @@ describe("skill conversation ingestion duplicate safety", () => {
       serialize: (session, fn) => queue.withSessionMutex(
         session,
         { lockTtlMs: 1_000, waitDeadlineMs: 1_000 },
-        fn,
+        (lease) => fn(lease.assertOwned),
       ),
     });
 
@@ -779,6 +933,66 @@ describe("skill conversation ingestion duplicate safety", () => {
     await expect(buffer.readArchive(second.archived.archive_key)).resolves.toMatchObject({
       messages: [{ content: "b" }],
     });
+  });
+
+  it("rejects an archive-key replay when the stored content differs", async () => {
+    const backend = new MemoryBackend();
+    const buffer = new SkillBufferStorage({ storage: new StorageAdapter(backend) });
+    await buffer.writeArchive(baseInput, 42, {
+      messages: [{ role: "user", content: "first" }],
+    });
+
+    await expect(buffer.writeArchive(baseInput, 42, {
+      messages: [{ role: "user", content: "different" }],
+    })).rejects.toThrow("Skill archive collision");
+    await expect(buffer.readArchive(buffer.archiveKey(baseInput, 42))).resolves.toEqual({
+      messages: [{ role: "user", content: "first" }],
+    });
+  });
+
+  it("overwrites stored task identity with the scoped agent tuple", async () => {
+    const backend = new MemoryBackend();
+    const buffer = new SkillBufferStorage({ storage: new StorageAdapter(backend) });
+    backend.objects.set(buffer.tasksKey(baseInput), Buffer.from(JSON.stringify({
+      team_id: "forged-team",
+      agent_id: "forged-agent",
+      updated_at_ms: 42,
+      tasks: [{
+        task_id: "extract-1",
+        session_id: baseInput.session_id,
+        space_id: "forged-space",
+        user_id: "forged-user",
+        team_id: "forged-team",
+        agent_id: "forged-agent",
+        archive_key: buffer.archiveKey(baseInput, 42),
+        archived_at_ms: 42,
+        enqueued_at_ms: 42,
+      }, {
+        task_id: "extract-cross-scope",
+        session_id: baseInput.session_id,
+        space_id: "forged-space",
+        user_id: "forged-user",
+        team_id: "forged-team",
+        agent_id: "forged-agent",
+        archive_key: "skill_buffer/another-user/team/agent/session/data-42.jsonl",
+        archived_at_ms: 42,
+        enqueued_at_ms: 42,
+      }],
+    })));
+
+    const tasks = await buffer.readTasks(baseInput);
+
+    expect(tasks).toMatchObject({
+      team_id: baseInput.team_id,
+      agent_id: baseInput.agent_id,
+      tasks: [{
+        space_id: baseInput.space_id,
+        user_id: baseInput.user_id,
+        team_id: baseInput.team_id,
+        agent_id: baseInput.agent_id,
+      }],
+    });
+    expect(tasks.tasks).toHaveLength(1);
   });
 
   it("preserves observed legacy tool-call counting and paired archive payloads", async () => {
@@ -877,7 +1091,7 @@ describe("skill conversation ingestion duplicate safety", () => {
       serialize: (session, fn) => queue.withSessionMutex(
         session,
         { lockTtlMs: 1_000, waitDeadlineMs: 1_000 },
-        fn,
+        (lease) => fn(lease.assertOwned),
       ),
     });
 
@@ -906,3 +1120,11 @@ describe("skill conversation ingestion duplicate safety", () => {
     ]);
   });
 });
+
+function createDeferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolvePromise: () => void = () => undefined;
+  const promise = new Promise<void>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return { promise, resolve: resolvePromise };
+}

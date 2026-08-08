@@ -150,16 +150,16 @@ export interface ConversationAddArchived {
   reason: "tool_calls" | "bytes" | "compressed" | "oversize";
 }
 
-export interface ConversationAddResult {
-  status: "ok" | "archived";
-  archived?: ConversationAddArchived;
-  receipt: {
-    receipt_id: string;
-    source_event_id?: string;
-    content_hash: string;
-    accepted_at_ms: number;
-  };
+export interface ConversationReceipt {
+  receipt_id: string;
+  source_event_id?: string;
+  content_hash: string;
+  accepted_at_ms: number;
 }
+
+export type ConversationAddResult =
+  | { status: "ok"; receipt: ConversationReceipt }
+  | { status: "archived"; archived: ConversationAddArchived; receipt: ConversationReceipt };
 
 /** Input for /v3/skill/conversation/force-archive — 手动强制归档。 */
 export interface ForceArchiveInput {
@@ -194,15 +194,6 @@ export interface ListingResult {
   mode: "full" | "search";
   listing: string;
   hits: Array<{ skill_id: string; version: number; name: string }>;
-}
-
-/** Core gateway envelope (mirrors `tdai-memory-plugin/src/gateway/v2-router.ts:145-150`). */
-interface CoreEnvelope<T> {
-  code: number;
-  message?: string;
-  request_id?: string;
-  data?: T;
-  error?: { code: number; message: string };
 }
 
 export type CoreSkillFailureKind =
@@ -384,7 +375,7 @@ export class CoreSkillClient {
     } catch (err) {
       const isTimeout = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
       throw new CoreSkillClientError(
-        `${TAG} ${path} fetch failed: ${(err as Error).message}`,
+        `${TAG} ${path} fetch failed: ${errorMessage(err)}`,
         isTimeout ? "timeout" : "network",
         true,
         undefined,
@@ -396,10 +387,10 @@ export class CoreSkillClient {
     }
 
     const text = await resp.text().catch(() => "");
-    let env: CoreEnvelope<T>;
+    let parsed: unknown;
     try {
-      env = JSON.parse(text) as CoreEnvelope<T>;
-    } catch (err) {
+      parsed = JSON.parse(text);
+    } catch {
       const retryable = resp.status === 408 || resp.status === 429 || resp.status >= 500;
       const kind: CoreSkillFailureKind = resp.status === 408
         ? "timeout"
@@ -413,17 +404,16 @@ export class CoreSkillClient {
                 ? "client"
                 : "invalid_response";
       throw new CoreSkillClientError(
-        `${TAG} ${path} non-JSON response: ${(err as Error).message}`,
+        `${TAG} ${path} returned a non-JSON response`,
         kind,
         retryable,
         resp.status,
         undefined,
         "",
         undefined,
-        { cause: err },
       );
     }
-    if (!env || typeof env !== "object" || Array.isArray(env)) {
+    if (!isRecord(parsed)) {
       const retryable = resp.status === 408 || resp.status === 429 || resp.status >= 500;
       throw new CoreSkillClientError(
         `${TAG} ${path} response envelope must be a JSON object`,
@@ -432,9 +422,13 @@ export class CoreSkillClient {
         resp.status,
       );
     }
+    const env = parsed;
 
     if (!resp.ok || env.code !== 0) {
-      const msg = env.error?.message ?? env.message ?? `code=${env.code}`;
+      const nestedError = isRecord(env.error) ? env.error : undefined;
+      const msg = readString(nestedError?.message)
+        ?? readString(env.message)
+        ?? `code=${String(env.code)}`;
       const code = typeof env.code === "number" ? env.code : resp.status;
       const kind: CoreSkillFailureKind = resp.status === 408
         ? "timeout"
@@ -448,16 +442,14 @@ export class CoreSkillClient {
                 ? "client"
                 : "envelope";
       const retryable = resp.status === 408 || resp.status === 429 || code === 4291 || resp.status >= 500 || code >= 50000;
-      const details = env.data && typeof env.data === "object"
-        ? env.data as Record<string, unknown>
-        : undefined;
+      const details = isRecord(env.data) ? env.data : undefined;
       throw new CoreSkillClientError(
         `${TAG} ${path} failed (${code}): ${msg}`,
         kind,
         retryable,
         resp.status,
         code,
-        env.request_id ?? "",
+        readString(env.request_id) ?? "",
         details,
       );
     }
@@ -469,15 +461,26 @@ export class CoreSkillClient {
         false,
         resp.status,
         env.code,
-        env.request_id ?? "",
+        readString(env.request_id) ?? "",
       );
     }
+    // `post<T>` is the intentionally low-level generic seam used by legacy
+    // endpoint wrappers. Endpoints with a reliability contract, including
+    // conversation ingestion, validate their payload before exposing it.
     return env.data as T;
   }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function readString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function isConversationAddResult(value: unknown): value is ConversationAddResult {
@@ -498,9 +501,12 @@ function isConversationAddResult(value: unknown): value is ConversationAddResult
     if (typeof value.archived.archived_at_ms !== "number" || !Number.isFinite(value.archived.archived_at_ms)) {
       return false;
     }
-    if (!["tool_calls", "bytes", "compressed", "oversize"].includes(String(value.archived.reason))) {
+    if (typeof value.archived.reason !== "string" ||
+      !["tool_calls", "bytes", "compressed", "oversize"].includes(value.archived.reason)) {
       return false;
     }
+  } else if (value.archived !== undefined) {
+    return false;
   }
   return true;
 }

@@ -36,14 +36,8 @@ import {
   findLastFinalAssistant,
   isFinalAnswer,
   normalizeConversation,
+  type RawMessage,
 } from "./normalize-conversation.js";
-
-/** loose message shape 供本模块内部用 */
-interface IncomingMsg {
-  role?: string;
-  content?: unknown;
-  tool_calls?: unknown[];
-}
 
 export interface TriggerInput {
   config: ProxyConfig;
@@ -78,14 +72,14 @@ export async function triggerSkillExtractIfReady(input: TriggerInput): Promise<v
     if (input.assetCapabilities?.skill === false) return;
     if (!sessionKey || !sessionInfo) return;
 
-    const userId = sessionInfo.user_id as string | undefined;
-    const teamId = sessionInfo.team_id as string | undefined;
-    const agentId = sessionInfo.agent_id as string | undefined;
+    const userId = readOptionalString(sessionInfo.user_id);
+    const teamId = readOptionalString(sessionInfo.team_id);
+    const agentId = readOptionalString(sessionInfo.agent_id);
     if (!userId || !teamId || !agentId) return;
 
     if (!config.coreSkill?.endpoint || !config.coreSkill?.serviceToken) return;
 
-    const spaceId = sessionInfo.space_id as string | undefined;
+    const spaceId = readOptionalString(sessionInfo.space_id);
     if (!spaceId) {
       console.warn(
         `[skill-conversation-add] skipped: no space_id on sessionInfo session=${sessionKey}`,
@@ -93,12 +87,11 @@ export async function triggerSkillExtractIfReady(input: TriggerInput): Promise<v
       return;
     }
 
-    const msgs: IncomingMsg[] = Array.isArray(inputMessages)
-      ? (inputMessages as IncomingMsg[])
+    const rawMsgs: RawMessage[] = Array.isArray(inputMessages)
+      ? inputMessages.filter(isRawMessage)
       : [];
-    const rawAsst = (assistantMessage as Record<string, unknown>) ?? {};
+    const rawAsst = assistantMessage ?? {};
     const hasAsst = Boolean(rawAsst && (rawAsst.role || rawAsst.content || rawAsst.tool_calls));
-    const rawMsgs = msgs as unknown[] as Array<Record<string, unknown>>;
 
     // ── round-level 触发 gate ──
     // 只有 final answer 才继续；含 tool_use / tool_calls 的中间态直接返回。
@@ -133,6 +126,11 @@ export async function triggerSkillExtractIfReady(input: TriggerInput): Promise<v
     const sourceEventId = `proxy:${sha256(JSON.stringify({
       agent_source: input.agentSource,
       protocol: input.protocol,
+      space_id: spaceId,
+      user_id: userId,
+      team_id: teamId,
+      agent_id: agentId,
+      task_id: readOptionalString(sessionInfo.task_id),
       session_id: sessionKey,
       turn_sequence: turnSequence,
     }))}`;
@@ -148,7 +146,7 @@ export async function triggerSkillExtractIfReady(input: TriggerInput): Promise<v
           user_id: userId,
           team_id: teamId,
           agent_id: agentId,
-          task_id: sessionInfo.task_id as string | undefined,
+          task_id: readOptionalString(sessionInfo.task_id),
           source_event_id: sourceEventId,
           content_hash: contentHash,
           messages: turnMessages,
@@ -192,4 +190,12 @@ export { countToolCalls };
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function readOptionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function isRawMessage(value: unknown): value is RawMessage {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }

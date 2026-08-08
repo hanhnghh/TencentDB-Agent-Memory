@@ -89,7 +89,10 @@ export interface WiredConversationAdd {
   sink: SkillCandidatesSink;
   queue: ISkillAgentTaskQueue;
   buffer: SkillBufferStorage;
-  serializeSession<T>(session: SessionKey, fn: () => Promise<T>): Promise<T>;
+  serializeSession<T>(
+    session: SessionKey,
+    fn: (assertOwned: () => Promise<void>) => Promise<T>,
+  ): Promise<T>;
   /** 结束时调 —— 关 worker */
   stop(): Promise<void>;
 }
@@ -119,13 +122,16 @@ export function wireConversationAdd(deps: WireConversationAddDeps): WiredConvers
   // [obs] SkillTriggerService / SkillConversationAddHandler 内部走 obsLogger 底座，
   // 不再需要注入 logger —— obsLogger 自带 FileLogger + 后端 + try/catch 降级。
   const trigger = new SkillTriggerService({ buffer, queue });
-  const serializeSession = <T>(session: SessionKey, fn: () => Promise<T>) => queue.withSessionMutex(
+  const serializeSession = <T>(
+    session: SessionKey,
+    fn: (assertOwned: () => Promise<void>) => Promise<T>,
+  ) => queue.withSessionMutex(
     session,
     {
       lockTtlMs: deps.sessionLockTtlMs ?? 120_000,
       waitDeadlineMs: deps.sessionLockWaitDeadlineMs ?? 120_000,
     },
-    fn,
+    (lease) => fn(lease.assertOwned),
   );
   const handler = new SkillConversationAddHandler({
     buffer,

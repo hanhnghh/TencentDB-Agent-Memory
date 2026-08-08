@@ -85,18 +85,7 @@ export interface AddConversationInput {
   perfRequestId?: string;
 }
 
-export interface AddConversationResult {
-  /** 语义状态：ok=正常追加 / archived=触发了归档。 */
-  status: "ok" | "archived";
-  archived?: {
-    task_id: string;
-    archived_at_ms: number;
-    archive_key: string;
-    /** normal 达阈值触发 / compressed 必触发 / oversize 兜底后触发 */
-    reason: "tool_calls" | "bytes" | "compressed" | "oversize";
-  };
-  receipt: ConversationReceipt;
-}
+export type AddConversationResult = StoredConversationAddResult;
 
 export interface HandlerThresholds {
   /** tool_call 累计阈值。默认 10。 */
@@ -121,7 +110,10 @@ export interface SkillConversationAddHandlerOptions {
   oversizeOptions?: Partial<OversizeOptions>;
   now?: () => number;
   /** Server-side serialization seam; production wiring supplies a distributed lock. */
-  serialize?: <T>(session: SessionKey, fn: () => Promise<T>) => Promise<T>;
+  serialize?: <T>(
+    session: SessionKey,
+    fn: (assertOwned: () => Promise<void>) => Promise<T>,
+  ) => Promise<T>;
 }
 
 export class HandlerValidationError extends Error {
@@ -151,8 +143,12 @@ export class SkillConversationAddHandler {
   private readonly compressOptions: CompressOptions;
   private readonly oversizeOptions: OversizeOptions;
   private readonly now: () => number;
-  private readonly serialize: <T>(session: SessionKey, fn: () => Promise<T>) => Promise<T>;
+  private readonly serialize: <T>(
+    session: SessionKey,
+    fn: (assertOwned: () => Promise<void>) => Promise<T>,
+  ) => Promise<T>;
   private readonly localTails = new Map<string, Promise<void>>();
+  private readonly localOwners = new Map<string, symbol>();
 
   constructor(opts: SkillConversationAddHandlerOptions) {
     this.buffer = opts.buffer;
@@ -173,30 +169,36 @@ export class SkillConversationAddHandler {
       agent_id: input.agent_id,
       session_id: input.session_id,
     };
-    return this.serialize(sess, () => this.handleSerialized(input, sess));
+    return this.serialize(
+      sess,
+      (assertOwned) => this.handleSerialized(input, sess, assertOwned),
+    );
   }
 
   private async handleSerialized(
     input: AddConversationInput,
     sess: SessionKey,
+    assertOwned: () => Promise<void>,
   ): Promise<AddConversationResult> {
     const rid = input.perfRequestId;
     let state = await this.buffer.readSessionState(sess);
-    state = await this.flushPendingArchives(sess, state, input.perfRequestId);
+    state = await this.flushPendingArchives(sess, state, assertOwned, input.perfRequestId);
 
     const fingerprint = fingerprintInput(input);
     const sourceEventId = input.source_event_id;
     const eventKey = sourceEventId ? sourceEventKey(sourceEventId) : undefined;
-    const existing = eventKey ? state.receipts[eventKey] : undefined;
-    if (existing) {
-      if (existing.fingerprint !== fingerprint) {
-        throw new SourceEventConflictError(
-          sourceEventId,
-          existing.result.receipt.content_hash,
-          input.content_hash ?? fingerprint,
-        );
+    if (sourceEventId) {
+      const existing = state.receipts[sourceEventKey(sourceEventId)];
+      if (existing) {
+        if (existing.fingerprint !== fingerprint) {
+          throw new SourceEventConflictError(
+            sourceEventId,
+            existing.result.receipt.content_hash,
+            input.content_hash ?? fingerprint,
+          );
+        }
+        return existing.result;
       }
-      return existing.result;
     }
 
     const rawBytes = totalMessagesBytes(input.messages);
@@ -211,7 +213,7 @@ export class SkillConversationAddHandler {
 
     const t0Prep = Date.now();
     const prepared = prepareArchivePayload(
-      state.current.messages as OversizeMessage[],
+      state.current.messages,
       input.messages,
       {
         compress: this.compressOptions,
@@ -252,7 +254,7 @@ export class SkillConversationAddHandler {
     let nextMeta: SessionMeta;
 
     if (shouldArchive) {
-      const reason: NonNullable<AddConversationResult["archived"]>["reason"] = usedOversize
+      const reason: Extract<AddConversationResult, { status: "archived" }>["archived"]["reason"] = usedOversize
         ? "oversize"
         : useCompress
           ? "compressed"
@@ -289,12 +291,12 @@ export class SkillConversationAddHandler {
           task_id: plan.taskId,
           archived_at_ms: plan.archivedAtMs,
           archive_key: plan.archiveKey,
-          messages: combinedMessages as Array<Record<string, unknown>>,
+          messages: combinedMessages,
           task_ref_id: input.task_id,
         },
       };
     } else {
-      nextCurrent = { messages: combinedMessages as Array<Record<string, unknown>> };
+      nextCurrent = { messages: combinedMessages };
       nextMeta = {
         session_id: sess.session_id,
         space_id: sess.space_id,
@@ -318,6 +320,7 @@ export class SkillConversationAddHandler {
       receipts: { ...state.receipts, [receiptKey]: storedEvent },
     };
     const t0Commit = Date.now();
+    await assertOwned();
     await this.buffer.writeSessionState(sess, committed);
     obsLogger.info("skill.add_handler.write_back", {
       req_id: rid ?? "",
@@ -328,19 +331,21 @@ export class SkillConversationAddHandler {
       source_event_id: input.source_event_id ?? "",
     });
 
-    await this.flushPendingArchives(sess, committed, input.perfRequestId);
+    await this.flushPendingArchives(sess, committed, assertOwned, input.perfRequestId);
     return result;
   }
 
   private async flushPendingArchives(
     sess: SessionKey,
     state: ConversationSessionState,
+    assertOwned: () => Promise<void>,
     perfRequestId?: string,
   ): Promise<ConversationSessionState> {
     let changed = false;
     for (const event of Object.values(state.receipts)) {
       const pending = event.pending_archive;
       if (!pending) continue;
+      await assertOwned();
       await this.trigger.archive({
         session: sess,
         bufferAtTrigger: { messages: pending.messages },
@@ -357,28 +362,39 @@ export class SkillConversationAddHandler {
     }
     if (!changed) return state;
     const completed = { ...state, version: state.version + 1 };
+    await assertOwned();
     await this.buffer.writeSessionState(sess, completed);
     return completed;
   }
 
-  private async withLocalSessionLock<T>(sess: SessionKey, fn: () => Promise<T>): Promise<T> {
+  private async withLocalSessionLock<T>(
+    sess: SessionKey,
+    fn: (assertOwned: () => Promise<void>) => Promise<T>,
+  ): Promise<T> {
     const key = `${sess.space_id}|${sess.user_id}|${sess.team_id}|${sess.agent_id}|${sess.session_id}`;
     const previous = this.localTails.get(key) ?? Promise.resolve();
-    let release!: () => void;
-    const current = new Promise<void>((resolve) => { release = resolve; });
-    const tail = previous.then(() => current);
+    const current = createDeferred();
+    const tail = previous.then(() => current.promise);
     this.localTails.set(key, tail);
     await previous;
+    const owner = Symbol(key);
+    this.localOwners.set(key, owner);
+    const assertOwned = async (): Promise<void> => {
+      if (this.localOwners.get(key) !== owner) {
+        throw new Error(`Skill conversation session lock lost for ${key}`);
+      }
+    };
     try {
-      return await fn();
+      return await fn(assertOwned);
     } finally {
-      release();
+      if (this.localOwners.get(key) === owner) this.localOwners.delete(key);
+      current.resolve();
       if (this.localTails.get(key) === tail) this.localTails.delete(key);
     }
   }
 
   private validate(input: AddConversationInput): void {
-    const required: Array<keyof AddConversationInput> = [
+    const required: Array<"session_id" | "space_id" | "user_id" | "team_id" | "agent_id"> = [
       "session_id",
       "space_id",
       "user_id",
@@ -390,7 +406,7 @@ export class SkillConversationAddHandler {
       if (typeof v !== "string" || v.length === 0) {
         throw new HandlerValidationError(String(f), `${String(f)} is required and must be non-empty string`);
       }
-      if ((v as string).includes(ID_FORBIDDEN_CHAR)) {
+      if (v.includes(ID_FORBIDDEN_CHAR)) {
         throw new HandlerValidationError(
           String(f),
           `${String(f)} must not contain '|' (reserved for agent tuple)`,
@@ -420,15 +436,14 @@ export class SkillConversationAddHandler {
         "content_hash must be a non-empty string of at most 256 characters",
       );
     }
-    for (let i = 0; i < input.messages.length; i++) {
-      const m = input.messages[i]!;
-      if (!VALID_ROLES.has(m.role as CompressibleRole)) {
+    for (const [i, m] of input.messages.entries()) {
+      if (!VALID_ROLES.has(m.role)) {
         throw new HandlerValidationError(`messages[${i}].role`, `invalid role: ${m.role}`);
       }
       if (typeof m.content !== "string") {
         throw new HandlerValidationError(`messages[${i}].content`, "content must be string");
       }
-      if (TOOL_PAIR_ROLES.has(m.role as CompressibleRole)) {
+      if (TOOL_PAIR_ROLES.has(m.role)) {
         // tool_call_id 是**必须**的（tool_call 和 tool_result 通过它配对）
         // tool_name 是**可选**的：Anthropic 协议 tool_use block 里有 name, OpenAI 协议
         //   role=tool 消息本身没有 tool_name 字段, 只有 tool_call_id。要求 tool_name
@@ -461,7 +476,7 @@ function totalMessagesBytes(msgs: CompressibleMessage[]): number {
 
 function countRoles(msgs: CompressibleMessage[], roles: ReadonlySet<CompressibleRole>): number {
   let n = 0;
-  for (const m of msgs) if (roles.has(m.role as CompressibleRole)) n++;
+  for (const m of msgs) if (roles.has(m.role)) n++;
   return n;
 }
 
@@ -479,9 +494,24 @@ function sourceEventKey(sourceEventId: string): string {
 
 function stableStringify(value: unknown): string {
   if (value === undefined) return "null";
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (value === null || typeof value !== "object") {
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) throw new Error("Unsupported value in conversation fingerprint");
+    return serialized;
+  }
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
-  const record = value as Record<string, unknown>;
-  const keys = Object.keys(record).filter((key) => record[key] !== undefined).sort();
-  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(",")}}`;
+  const entries = Object.entries(value)
+    .filter(([, entryValue]) => entryValue !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right));
+  return `{${entries.map(([key, entryValue]) => (
+    `${JSON.stringify(key)}:${stableStringify(entryValue)}`
+  )).join(",")}}`;
+}
+
+function createDeferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolvePromise: () => void = () => undefined;
+  const promise = new Promise<void>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return { promise, resolve: resolvePromise };
 }

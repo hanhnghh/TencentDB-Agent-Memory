@@ -62,7 +62,7 @@ export function prepareArchivePayload(
   // ② 拼接
   const combined: OversizeMessage[] = [
     ...existing,
-    ...(compressed as unknown as OversizeMessage[]),
+    ...compressed.map(toOversizeMessage),
   ];
 
   // ③ 判断是否需要 oversize 兜底 —— 仅在 forceCompress 路径下触发，跟原
@@ -82,6 +82,10 @@ export function prepareArchivePayload(
     usedCompress,
     usedOversize: out.truncated,
   };
+}
+
+function toOversizeMessage(message: CompressibleMessage): OversizeMessage {
+  return { ...message };
 }
 
 function totalMessagesBytes(msgs: Array<{ role: string; content: string }>): number {
