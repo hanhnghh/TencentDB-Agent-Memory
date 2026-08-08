@@ -2,7 +2,8 @@
 
 ← Back to [README.md](./README.md) · 简体中文: [INSTALL_CN.md](./INSTALL_CN.md)
 
-This document covers three installation modes:
+This document covers the full stack in all three MemoryProxy runtime modes,
+plus component-specific installation:
 
 1. **Full three-in-one stack**: `memory-core` + `memory-hub` + `proxy` in one
    shot (recommended — lets coding agents like Claude Code plug directly into
@@ -22,11 +23,11 @@ consume team memory / knowledge / skills through the proxy:
 git clone https://github.com/TencentCloud/TencentDB-Agent-Memory.git
 cd TencentDB-Agent-Memory/deploy/global-images
 
-# 2) Prepare .env (fill in real LLM values)
+# 2) Prepare .env (select proxy/hooks/both and fill only active dependencies)
 cp .env.example .env
 $EDITOR .env
 #   MEMORY_LLM_BASE_URL   / MEMORY_LLM_API_KEY   / MEMORY_LLM_MODEL     ← used internally by memory + hub
-#   PROXY_UPSTREAM_URL    / PROXY_UPSTREAM_API_KEY / PROXY_UPSTREAM_MODEL ← upstream the proxy forwards to
+#   PROXY_UPSTREAM_* ← required only for proxy/both; key depends on server-key/client-key
 
 # 3) Dry-run validation (optional; also does a live LLM probe — use --skip-llm to skip)
 ./verify.sh
@@ -57,6 +58,40 @@ Default ports:
 | Panel UI    | `8125` | team memory control panel                            |
 | Knowledge   | `8424` | wiki / code-graph service                            |
 | Proxy       | `8096` | LLM request proxy (Anthropic / OpenAI dual-protocol) |
+
+### Choose proxy, hooks, or both
+
+Set `PROXY_RUNTIME_MODE=proxy`, `hooks`, or `both` in `.env` before running
+`verify.sh` / `start-all.sh`:
+
+- `proxy` is backward-compatible and exposes the public proxy on `8096`.
+- `hooks` exposes only the Codex lifecycle endpoint on `127.0.0.1:8097`; it
+  starts and passes container health without `PROXY_UPSTREAM_URL`,
+  `PROXY_UPSTREAM_MODEL`, or `PROXY_UPSTREAM_API_KEY`.
+- `both` shares one runtime, SQLite store, and durable outbox while keeping the
+  public proxy and host-loopback hook endpoints separate.
+
+Proxy and `both` support both credential contracts. `server-key` requires the
+global `PROXY_UPSTREAM_API_KEY`; `client-key` requires that variable to be empty
+so the request's Authorization is passed through. For example:
+
+```bash
+PROXY_RUNTIME_MODE=hooks                  # no PROXY_UPSTREAM_* required
+# or
+PROXY_RUNTIME_MODE=proxy
+PROXY_UPSTREAM_AUTH_MODE=client-key       # leave PROXY_UPSTREAM_API_KEY empty
+```
+
+Keep the three credential roles separate: `MEMORY_LLM_API_KEY` is for internal
+memory distillation, `PROXY_UPSTREAM_API_KEY` is only for server-key model
+forwarding, and `MEMORY_HUB_USER_KEY` is the user credential used by Codex
+binding. The latter belongs in protected user state and never in project config.
+After installing and binding from `MemoryProxy`, verify Core, binding, and outbox
+readiness independently:
+
+```bash
+npm run codex -- doctor
+```
 
 ---
 

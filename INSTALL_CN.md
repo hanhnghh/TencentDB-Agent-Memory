@@ -2,7 +2,7 @@
 
 ← 返回 [README_CN.md](./README_CN.md) · English: [INSTALL.md](./INSTALL.md)
 
-本文覆盖三种安装形态：
+本文覆盖 MemoryProxy 的三种 runtime mode，以及组件级安装形态：
 1. **完整三件套**：`memory-core` + `memory-hub` + `proxy` 一键起（推荐，能让 Claude Code 之类的 coding agent 直接用上团队记忆 / 知识 / skill 注入）
 2. **只装 Memory Hub**：已有 Memory Core 运行在本机时的轻量部署
 3. **通过 Proxy 使用 Claude Code**：把 coding agent 挂到 proxy 上
@@ -19,11 +19,11 @@
 git clone https://github.com/TencentCloud/TencentDB-Agent-Memory.git
 cd TencentDB-Agent-Memory/deploy/global-images
 
-# 2) 准备 .env（把 LLM 相关字段填成真值）
+# 2) 准备 .env（选择 proxy/hooks/both，只填写 active dependencies）
 cp .env.example .env
 $EDITOR .env
 #   MEMORY_LLM_BASE_URL   / MEMORY_LLM_API_KEY   / MEMORY_LLM_MODEL     ← memory + hub 内部用
-#   PROXY_UPSTREAM_URL    / PROXY_UPSTREAM_API_KEY / PROXY_UPSTREAM_MODEL ← proxy 转发到的上游
+#   PROXY_UPSTREAM_* ← 仅 proxy/both 需要；key 由 server-key/client-key 决定
 
 # 3) 干跑校验（可选；会真做 LLM 通路预检，加 --skip-llm 跳过）
 ./verify.sh
@@ -53,6 +53,38 @@ $EDITOR .env
 | Panel UI    | `8125` | 团队记忆管理面板 |
 | Knowledge   | `8424` | Wiki / Code-Graph 服务 |
 | Proxy       | `8096` | LLM 请求代理（Anthropic / OpenAI 双协议） |
+
+### 选择 proxy、hooks 或 both
+
+运行 `verify.sh` / `start-all.sh` 前，在 `.env` 设置
+`PROXY_RUNTIME_MODE=proxy`、`hooks` 或 `both`：
+
+- `proxy` 保持向后兼容，在 `8096` 暴露 public proxy。
+- `hooks` 只在 `127.0.0.1:8097` 暴露 Codex lifecycle endpoint；即使没有
+  `PROXY_UPSTREAM_URL`、`PROXY_UPSTREAM_MODEL` 和
+  `PROXY_UPSTREAM_API_KEY` 也能启动并通过容器健康检查。
+- `both` 共用一个 runtime、SQLite store 和 durable outbox，同时把 public
+  proxy 与 host-loopback hook endpoint 分开。
+
+`proxy`/`both` 保留两种凭据 contract：`server-key` 要求全局
+`PROXY_UPSTREAM_API_KEY`；`client-key` 要求该变量留空，从而透传每个请求的
+Authorization。例如：
+
+```bash
+PROXY_RUNTIME_MODE=hooks                  # 不需要任何 PROXY_UPSTREAM_*
+# 或
+PROXY_RUNTIME_MODE=proxy
+PROXY_UPSTREAM_AUTH_MODE=client-key       # PROXY_UPSTREAM_API_KEY 留空
+```
+
+三类凭据不可混用：`MEMORY_LLM_API_KEY` 只供内部记忆提炼，
+`PROXY_UPSTREAM_API_KEY` 只供 server-key 模型转发，`MEMORY_HUB_USER_KEY`
+则用于 Codex bind。最后一种必须放在受保护的用户级状态中，不能写入项目配置。
+从 `MemoryProxy` 安装并 bind 后，用 doctor 分别查看 Core、binding 和 outbox：
+
+```bash
+npm run codex -- doctor
+```
 
 ---
 

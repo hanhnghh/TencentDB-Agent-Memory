@@ -5,16 +5,57 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 项目根目录（scripts/ 的上一级），src/index.ts 与 config.yaml 都在这里
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PID_FILE="$SCRIPT_DIR/context-proxy.pid"
-DAEMON_PID_FILE="$SCRIPT_DIR/context-proxy-daemon.pid"
-LOG_DIR="$SCRIPT_DIR/logs"
+STATE_DIR="${PROXY_STATE_DIR:-$SCRIPT_DIR}"
+PID_FILE="$STATE_DIR/context-proxy.pid"
+DAEMON_PID_FILE="$STATE_DIR/context-proxy-daemon.pid"
+LOG_DIR="${PROXY_LOG_DIR:-$STATE_DIR/logs}"
 LOG_FILE="$LOG_DIR/$(date +%Y-%m-%d).log"
 DAEMON_LOG="$LOG_DIR/daemon.log"
-CONFIG_FILE="$PROJECT_ROOT/config.yaml"
+CONFIG_FILE="${PROXY_CONFIG_FILE:-$PROJECT_ROOT/config.yaml}"
 
-# 从 config.yaml 读取端口（默认 8096）
-PROXY_PORT="$(grep -E '^\s*port:' "$CONFIG_FILE" 2>/dev/null | head -1 | awk '{print $2}')"
+# 从指定 YAML section 读取简单 scalar；只用于进程管理/health，完整校验仍由
+# src/config.ts 在启动边界负责。
+_yaml_section_value() {
+  local section="$1" key="$2"
+  awk -v section="$section" -v key="$key" '
+    $0 ~ "^" section ":[[:space:]]*($|#)" { active=1; next }
+    active && /^[^[:space:]#]/ { exit }
+    active && $0 ~ "^  " key ":[[:space:]]*" {
+      sub("^  " key ":[[:space:]]*", "")
+      sub("[[:space:]]*#.*$", "")
+      print
+      exit
+    }
+  ' "$CONFIG_FILE" 2>/dev/null
+}
+
+_yaml_nested_value() {
+  local section="$1" subsection="$2" key="$3"
+  awk -v section="$section" -v subsection="$subsection" -v key="$key" '
+    $0 ~ "^" section ":[[:space:]]*($|#)" { in_section=1; next }
+    in_section && /^[^[:space:]#]/ { exit }
+    in_section && $0 ~ "^  " subsection ":[[:space:]]*($|#)" { nested=1; next }
+    nested && $0 ~ "^    " key ":[[:space:]]*" {
+      sub("^    " key ":[[:space:]]*", "")
+      sub("[[:space:]]*#.*$", "")
+      print
+      exit
+    }
+  ' "$CONFIG_FILE" 2>/dev/null
+}
+
+CONFIG_RUNTIME_MODE="$(_yaml_section_value runtime mode)"
+RUNTIME_MODE="${PROXY_RUNTIME_MODE:-${CONFIG_RUNTIME_MODE:-proxy}}"
+PROXY_PORT="$(_yaml_section_value server port)"
 PROXY_PORT="${PROXY_PORT:-8096}"
+HOOK_PORT="$(_yaml_nested_value runtime hooks port)"
+HOOK_PORT="${HOOK_PORT:-8097}"
+case "$RUNTIME_MODE" in
+  proxy) HEALTH_PORT="$PROXY_PORT"; ACTIVE_PORTS=("$PROXY_PORT") ;;
+  hooks) HEALTH_PORT="$HOOK_PORT"; ACTIVE_PORTS=("$HOOK_PORT") ;;
+  both) HEALTH_PORT="$PROXY_PORT"; ACTIVE_PORTS=("$PROXY_PORT" "$HOOK_PORT") ;;
+  *) echo "[context-proxy] ERROR: runtime mode must be proxy, hooks, or both" >&2; exit 1 ;;
+esac
 
 # 守护进程配置（可通过环境变量覆盖）
 DAEMON_CHECK_INTERVAL="${DAEMON_CHECK_INTERVAL:-5}"       # 健康检查间隔（秒）
@@ -37,6 +78,7 @@ _find_node() {
   # 1. 优先尝试 NVM，强制激活并定位 Node v22
   for s in "$HOME/.nvm/nvm.sh" /usr/local/nvm/nvm.sh; do
     if [[ -f "$s" ]]; then
+      # shellcheck disable=SC1090 # nvm location is discovered at runtime
       source "$s" 2>/dev/null
       p="$(nvm which 22 2>/dev/null || nvm which default 2>/dev/null)"
       [[ -n "$p" ]] && { echo "$p"; return; }
@@ -58,7 +100,8 @@ _find_node() {
 }
 
 NODE_BIN="$(_find_node)" || { echo "[context-proxy] ERROR: node not found" >&2; exit 1; }
-export PATH="$(dirname "$NODE_BIN"):$PATH"
+NODE_DIR="$(dirname "$NODE_BIN")"
+export PATH="$NODE_DIR:$PATH"
 
 _is_running() {
   [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
@@ -70,16 +113,16 @@ cmd_start() {
     return 0
   fi
 
-  echo "[context-proxy] starting..."
+  echo "[context-proxy] starting (mode=$RUNTIME_MODE)..."
   cd "$PROJECT_ROOT"
-  nohup "$NODE_BIN" --import tsx/esm src/index.ts --config "$CONFIG_FILE" \
+  nohup "$NODE_BIN" --import tsx/esm src/index.ts --config "$CONFIG_FILE" --mode "$RUNTIME_MODE" \
     >> "$LOG_FILE" 2>&1 &
   echo $! > "$PID_FILE"
 
   # 等待启动
   local i=0
   while (( i < 10 )); do
-    if curl -sf http://localhost:${PROXY_PORT}/health > /dev/null 2>&1; then
+    if curl -sf "http://127.0.0.1:${HEALTH_PORT}/health" > /dev/null 2>&1; then
       echo "[context-proxy] started (pid=$(cat "$PID_FILE"))"
       echo "[context-proxy] log: $LOG_FILE"
       return 0
@@ -104,8 +147,11 @@ cmd_stop() {
     kill "$pid" 2>/dev/null || true
     rm -f "$PID_FILE"
   fi
-  # 兜底：确保端口释放
-  fuser -k ${PROXY_PORT}/tcp 2>/dev/null || true
+  # 兜底：确保 active listeners 都释放。
+  local active_port
+  for active_port in "${ACTIVE_PORTS[@]}"; do
+    fuser -k "${active_port}/tcp" 2>/dev/null || true
+  done
   sleep 1
   if [[ -n "$pid" ]]; then
     echo "[context-proxy] stopped (pid=$pid)"
@@ -126,21 +172,23 @@ cmd_status() {
     local pid
     pid=$(cat "$PID_FILE")
     echo "[context-proxy] running (pid=$pid)"
-    curl -s http://localhost:${PROXY_PORT}/health | python3 -m json.tool 2>/dev/null || \
-      curl -s http://localhost:${PROXY_PORT}/health
+    curl -s "http://127.0.0.1:${HEALTH_PORT}/health" | python3 -m json.tool 2>/dev/null || \
+      curl -s "http://127.0.0.1:${HEALTH_PORT}/health"
   else
     echo "[context-proxy] not running"
   fi
 }
 
 cmd_log() {
-  local today_log="$LOG_DIR/$(date +%Y-%m-%d).log"
+  local today_log
+  today_log="$LOG_DIR/$(date +%Y-%m-%d).log"
   if [[ -f "$today_log" ]]; then
     tail -f "$today_log"
   else
     echo "[context-proxy] No log for today yet: $today_log"
     # Fallback: show latest log file
     local latest
+    # shellcheck disable=SC2012 # log filenames are generated by this script
     latest="$(ls -t "$LOG_DIR"/*.log 2>/dev/null | head -1)"
     [[ -n "$latest" ]] && echo "[context-proxy] Latest log: $latest" && tail -f "$latest"
   fi

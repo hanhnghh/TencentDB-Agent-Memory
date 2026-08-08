@@ -67,11 +67,13 @@ FROM node:22-slim AS runtime
 
 # 使用 Debian 官方 apt 源（deb.debian.org）。如构建缓慢，可自行替换为镜像源。
 
-# Runtime essentials only（curl 供 HEALTHCHECK；tini 负责信号处理）
+# Runtime essentials only（curl 供 HEALTHCHECK；socat 只把容器内 loopback
+# hook listener 中继到宿主机的 loopback publish；tini 负责信号处理）
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
         curl \
+        socat \
         tini \
         ca-certificates
 
@@ -85,6 +87,7 @@ COPY --from=deps-builder /app /app
 
 # 数据 / 日志目录（可作为 K8s PVC 挂载）
 RUN mkdir -p /data/tdai-memory-proxy /data/config /app/logs && \
+    chmod 755 /app/scripts/container-entrypoint.sh && \
     chown -R app:app /app /data
 
 USER app
@@ -94,18 +97,22 @@ USER app
 # 敏感凭证通过环境变量注入（env 优先级高于配置文件）
 ENV NODE_ENV=production \
     PROXY_DB_PATH=/data/tdai-memory-proxy/proxy.db \
+    PROXY_OUTBOX_PATH=/data/tdai-memory-proxy/proxy.db \
+    PROXY_HEALTH_PORT=8096 \
+    PROXY_HOOK_PORT=8097 \
+    PROXY_HOOK_BRIDGE_PORT=18097 \
     NODE_OPTIONS="--max-old-space-size=1536"
 
-EXPOSE 8096
+EXPOSE 8096 8097 18097
 
 # K8s-friendly health check（liveness/readiness 仍建议在 Deployment 单独定义，
 # 这里是本地运行时兜底）。
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=15s \
-    CMD curl -fsS http://127.0.0.1:8096/health || exit 1
+    CMD curl -fsS "http://127.0.0.1:${PROXY_HEALTH_PORT}/health" || exit 1
 
 # tini 作 PID 1，使 SIGTERM/SIGKILL 干净传给 Node 及其子进程，并回收僵尸进程。
 # tsx 是运行时依赖，可直接执行 TypeScript。
-ENTRYPOINT ["/usr/bin/tini", "--", "node", "--import", "tsx/esm", "src/index.ts"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/scripts/container-entrypoint.sh"]
 
 # 默认配置文件路径（可被 docker run 追加参数覆盖）
 CMD ["--config", "/data/config.yaml"]

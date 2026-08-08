@@ -37,7 +37,7 @@
 git clone https://github.com/Tencent/TencentDB-Agent-Memory.git
 cd TencentDB-Agent-Memory/deploy/global-images
 cp .env.example .env
-$EDITOR .env       # 填入两组 LLM 参数（memory 组 + proxy 组）
+$EDITOR .env       # 选择 proxy/hooks/both；hooks 不需要 PROXY_UPSTREAM_* 参数
 ./start-all.sh     # 一键起；结束会打印 claude 可直接复制的一行命令
 ```
 

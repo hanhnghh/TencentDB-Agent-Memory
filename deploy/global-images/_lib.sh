@@ -48,6 +48,60 @@ require_vars() {
   fi
 }
 
+# Normalize and validate the MemoryProxy deployment mode shared by launch and
+# verification scripts. These variables intentionally describe the proxy
+# transport only; internal memory-model and Memory Hub credentials are separate.
+load_proxy_mode() {
+  PROXY_RUNTIME_MODE="${PROXY_RUNTIME_MODE:-proxy}"
+  PROXY_UPSTREAM_AUTH_MODE="${PROXY_UPSTREAM_AUTH_MODE:-server-key}"
+  PROXY_HOOK_PORT="${PROXY_HOOK_PORT:-8097}"
+  PROXY_VOLUME="${PROXY_VOLUME:-tdai-memory-proxy-data}"
+
+  case "$PROXY_RUNTIME_MODE" in
+    proxy|hooks|both) ;;
+    *) die "PROXY_RUNTIME_MODE 必须是 proxy、hooks 或 both。" ;;
+  esac
+  case "$PROXY_UPSTREAM_AUTH_MODE" in
+    server-key|client-key) ;;
+    *) die "PROXY_UPSTREAM_AUTH_MODE 必须是 server-key 或 client-key。" ;;
+  esac
+}
+
+proxy_transport_enabled() {
+  [[ "$PROXY_RUNTIME_MODE" == "proxy" || "$PROXY_RUNTIME_MODE" == "both" ]]
+}
+
+hook_transport_enabled() {
+  [[ "$PROXY_RUNTIME_MODE" == "hooks" || "$PROXY_RUNTIME_MODE" == "both" ]]
+}
+
+require_proxy_deployment_vars() {
+  require_vars PROXY_IMAGE
+  if proxy_transport_enabled; then
+    require_vars PROXY_PORT PROXY_UPSTREAM_URL PROXY_UPSTREAM_MODEL
+    require_host_port "$PROXY_PORT" PROXY_PORT
+    if [[ "$PROXY_UPSTREAM_AUTH_MODE" == "server-key" ]]; then
+      require_vars PROXY_UPSTREAM_API_KEY
+    elif [[ -n "${PROXY_UPSTREAM_API_KEY:-}" ]]; then
+      die "client-key passthrough 模式要求 PROXY_UPSTREAM_API_KEY 留空，避免意外覆盖客户端 Authorization。"
+    fi
+  fi
+  if hook_transport_enabled; then
+    require_vars PROXY_HOOK_PORT
+    require_host_port "$PROXY_HOOK_PORT" PROXY_HOOK_PORT
+  fi
+  if [[ "$PROXY_RUNTIME_MODE" == "both" && "$PROXY_PORT" == "$PROXY_HOOK_PORT" ]]; then
+    die "both mode requires different host ports for proxy and hooks."
+  fi
+}
+
+require_host_port() {
+  local value="$1" label="$2"
+  if [[ ! "$value" =~ ^[0-9]+$ ]] || (( 10#$value < 1 || 10#$value > 65535 )); then
+    die "$label 必须是 1 到 65535 的整数。"
+  fi
+}
+
 # 找到可用 docker 命令（兼容 Homebrew 独立安装 + colima）
 # 优先级：PATH 中的 docker → Homebrew apple silicon → Homebrew intel → /usr/local
 # Homebrew Cellar 路径下按版本 glob，取最新（sort -V），避免硬编码具体小版本号。
@@ -59,6 +113,7 @@ find_docker() {
   local candidate
   for prefix in /opt/homebrew/Cellar/docker /usr/local/Cellar/docker; do
     if [[ -d "$prefix" ]]; then
+      # shellcheck disable=SC2012 # version names are Homebrew-controlled
       candidate=$(ls -1 "$prefix" 2>/dev/null | sort -V | tail -n1)
       if [[ -n "$candidate" && -x "$prefix/$candidate/bin/docker" ]]; then
         echo "$prefix/$candidate/bin/docker"
@@ -145,6 +200,11 @@ print_endpoints() {
   printf "  │ Knowledge API  http://localhost:%-24s│\n" "${KNOWLEDGE_PORT}/v3/"
   printf "  │ Knowledge Docs http://localhost:%-24s│\n" "${KNOWLEDGE_PORT}/docs"
   printf "  │ Memory Core     http://localhost:%-24s│\n" "${MEMORY_CORE_PORT}/"
-  printf "  │ Proxy          http://localhost:%-24s│\n" "${PROXY_PORT}/"
+  if proxy_transport_enabled; then
+    printf "  │ Proxy          http://localhost:%-24s│\n" "${PROXY_PORT}/"
+  fi
+  if hook_transport_enabled; then
+    printf "  │ Codex hooks    http://127.0.0.1:%-24s│\n" "${PROXY_HOOK_PORT}/"
+  fi
   echo "  └─────────────────────────────────────────────────────────┘"
 }

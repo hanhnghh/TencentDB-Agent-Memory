@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 单独拉起 proxy（context-proxy，端口 8096）。
+# 单独拉起 MemoryProxy（proxy、hooks 或 both）。
 #
 # proxy 的转发上游走 PROXY_UPSTREAM_URL（与 memory 组的 MEMORY_LLM_* 独立）。
 # proxy 会调 memory:8420 做鉴权 / skill / tdai memory 注入；调 memory-hub:8125
@@ -8,8 +8,8 @@
 # 用法：
 #   ./start-proxy.sh
 #
-# 需要以下 proxy 组参数（写在 .env）：
-#   PROXY_UPSTREAM_URL / PROXY_UPSTREAM_API_KEY / PROXY_UPSTREAM_MODEL
+# `hooks` 不需要任何 PROXY_UPSTREAM_* 参数；proxy/both 根据
+# PROXY_UPSTREAM_AUTH_MODE 选择 server-key 或 client-key passthrough。
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,12 +17,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_lib.sh"
 
 load_env
-require_vars \
-  PROXY_IMAGE PROXY_PORT \
-  PROXY_UPSTREAM_URL PROXY_UPSTREAM_API_KEY PROXY_UPSTREAM_MODEL
+load_proxy_mode
+require_proxy_deployment_vars
 
-# 与 memory-core 保持一致的 gateway 内部凭据（默认 local，仅本地体验）
-MEMORY_CORE_GATEWAY_API_KEY="${MEMORY_CORE_GATEWAY_API_KEY:-local}"
+# 与 memory-core 保持一致；显式空值表示本地部署关闭 Gateway Bearer gate。
+MEMORY_CORE_GATEWAY_API_KEY="${MEMORY_CORE_GATEWAY_API_KEY-}"
 
 CONTAINER=tdai-proxy
 NETWORK=tdai-memory-stack
@@ -73,17 +72,32 @@ fi
 
 bool() { [[ "$1" == "1" ]] && echo "true" || echo "false"; }
 
-info "生成 proxy config → $CONFIG_FILE  (auth=$(bool $PROXY_ENABLE_AUTH) session-init=$(bool $PROXY_ENABLE_SESSION_INIT) tdai=$(bool $PROXY_ENABLE_TDAI))"
+UPSTREAM_URL=""
+UPSTREAM_API_KEY=""
+if proxy_transport_enabled; then
+  UPSTREAM_URL="$PROXY_UPSTREAM_URL"
+  if [[ "$PROXY_UPSTREAM_AUTH_MODE" == "server-key" ]]; then
+    UPSTREAM_API_KEY="$PROXY_UPSTREAM_API_KEY"
+  fi
+fi
+
+info "生成 proxy config → $CONFIG_FILE  (mode=$PROXY_RUNTIME_MODE upstream-auth=$PROXY_UPSTREAM_AUTH_MODE auth=$(bool "$PROXY_ENABLE_AUTH") session-init=$(bool "$PROXY_ENABLE_SESSION_INIT") tdai=$(bool "$PROXY_ENABLE_TDAI"))"
 cat > "$CONFIG_FILE" <<YAML
 # 由 start-proxy.sh 自动生成 —— 每次启动覆盖，请不要手动改。
+runtime:
+  mode: ${PROXY_RUNTIME_MODE}
+  hooks:
+    host: 127.0.0.1
+    port: 8097
+
 server:
   host: 0.0.0.0
   port: 8096
   forwardTimeoutMs: 600000
 
 upstream:
-  url: "${PROXY_UPSTREAM_URL}"
-  apiKey: "${PROXY_UPSTREAM_API_KEY}"
+  url: "${UPSTREAM_URL}"
+  apiKey: "${UPSTREAM_API_KEY}"
 
 log:
   file: ""
@@ -92,7 +106,7 @@ log:
 
 # tdai 内核对接（用于 injection / skill / auth 拉取）
 tdai:
-  enabled: $(bool $PROXY_ENABLE_TDAI)
+  enabled: $(bool "$PROXY_ENABLE_TDAI")
   endpoint: "http://memory-core:8420"
   apiKey: "${MEMORY_CORE_GATEWAY_API_KEY}"
   serviceId: default
@@ -108,12 +122,12 @@ skill:
   serviceToken: "${MEMORY_CORE_GATEWAY_API_KEY}"
 
 auth:
-  enabled: $(bool $PROXY_ENABLE_AUTH)
+  enabled: $(bool "$PROXY_ENABLE_AUTH")
   url: "http://memory-core:8420"
   timeoutMs: 5000
 
 sessionInit:
-  enabled: $(bool $PROXY_ENABLE_SESSION_INIT)
+  enabled: $(bool "$PROXY_ENABLE_SESSION_INIT")
   maxRetries: 3
   injectAgentContext: true
   injectTaskContext: true
@@ -138,17 +152,48 @@ injection:
 
 redis:
   enabled: false
+
+storage:
+  enabled: true
+  backend: sqlite
+  sqlite:
+    dbPath: /data/tdai-memory-proxy/proxy.db
 YAML
 
-info "启动 proxy (image=$PROXY_IMAGE, port=$PROXY_PORT)"
+HEALTH_PORT=8096
+HOOK_BRIDGE_ENABLED=0
+PORT_ARGS=()
+if proxy_transport_enabled; then
+  PORT_ARGS+=( -p "${PROXY_PORT}:8096" )
+fi
+if hook_transport_enabled; then
+  PORT_ARGS+=( -p "127.0.0.1:${PROXY_HOOK_PORT}:18097" )
+  HOOK_BRIDGE_ENABLED=1
+  if [[ "$PROXY_RUNTIME_MODE" == "hooks" ]]; then
+    HEALTH_PORT=8097
+  fi
+fi
+
+info "启动 MemoryProxy (image=$PROXY_IMAGE, mode=$PROXY_RUNTIME_MODE)"
 $DOCKER run -d --name "$CONTAINER" \
   --network "$NETWORK" \
   --network-alias proxy \
   --add-host=host.docker.internal:host-gateway \
-  -p "${PROXY_PORT}:8096" \
+  "${PORT_ARGS[@]}" \
+  -e "PROXY_HEALTH_PORT=${HEALTH_PORT}" \
+  -e "PROXY_HOOK_BRIDGE_ENABLED=${HOOK_BRIDGE_ENABLED}" \
+  -e PROXY_HOOK_PORT=8097 \
+  -e PROXY_HOOK_BRIDGE_PORT=18097 \
+  -e PROXY_DB_PATH=/data/tdai-memory-proxy/proxy.db \
+  -e PROXY_OUTBOX_PATH=/data/tdai-memory-proxy/proxy.db \
+  -v "${PROXY_VOLUME}:/data/tdai-memory-proxy" \
   -v "$CONFIG_FILE:/data/config.yaml:ro" \
   "$PROXY_IMAGE" >/dev/null
 
 wait_healthy "$CONTAINER" 90
-ok "proxy 已启动 → http://localhost:${PROXY_PORT}/"
-ok "  用法：把 coding agent 的 API base 指向 http://localhost:${PROXY_PORT}"
+if proxy_transport_enabled; then
+  ok "proxy listener 已启动 → http://localhost:${PROXY_PORT}/"
+fi
+if hook_transport_enabled; then
+  ok "hook listener 已启动 → http://127.0.0.1:${PROXY_HOOK_PORT}/"
+fi

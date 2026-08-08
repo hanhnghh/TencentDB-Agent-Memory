@@ -17,10 +17,14 @@ fi
 
 # .env 不存在时也允许运行（用默认卷名兜底）
 if [[ -f "$ENV_FILE" ]]; then
-  set -a; source "$ENV_FILE"; set +a
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
 fi
 MEMORY_CORE_VOLUME="${MEMORY_CORE_VOLUME:-tdai-memory-core-data}"
 PANEL_VOLUME="${PANEL_VOLUME:-tdai-panel-data}"
+PROXY_VOLUME="${PROXY_VOLUME:-tdai-memory-proxy-data}"
 
 for c in tdai-proxy tdai-memory-hub tdai-memory-core; do
   if $DOCKER ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$c"; then
@@ -33,13 +37,19 @@ done
 
 if (( PURGE == 1 )); then
   warn "--purge 已启用：删除 volume + 网络 + admin key 文件"
-  for v in "$MEMORY_CORE_VOLUME" "$PANEL_VOLUME"; do
+  for v in "$MEMORY_CORE_VOLUME" "$PANEL_VOLUME" "$PROXY_VOLUME"; do
     if $DOCKER volume inspect "$v" >/dev/null 2>&1; then
-      $DOCKER volume rm "$v" >/dev/null && ok "已删除 volume $v" || warn "删除 volume $v 失败"
+      if $DOCKER volume rm "$v" >/dev/null; then
+        ok "已删除 volume $v"
+      else
+        warn "删除 volume $v 失败"
+      fi
     fi
   done
   if $DOCKER network inspect tdai-memory-stack >/dev/null 2>&1; then
-    $DOCKER network rm tdai-memory-stack >/dev/null && ok "已删除网络 tdai-memory-stack" || true
+    if $DOCKER network rm tdai-memory-stack >/dev/null; then
+      ok "已删除网络 tdai-memory-stack"
+    fi
   fi
   # admin key 与 volume 强绑定，purge volume 必须同步清 key，否则下次启动会读到
   # 旧 key 但 volume 是新的，auth 校验会失败。

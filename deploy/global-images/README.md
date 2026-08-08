@@ -29,9 +29,9 @@
 # 1) 准备 .env
 cp .env.example .env
 
-# 2) 编辑 .env，把两组 LLM 参数填成真值
-#    - MEMORY_LLM_*   → memory-core + memory-hub 内部用
-#    - PROXY_UPSTREAM_* → proxy 转发到的上游 LLM
+# 2) 选择 PROXY_RUNTIME_MODE=proxy|hooks|both，再填写该 mode 需要的值
+#    - MEMORY_LLM_* 始终供 memory-core + memory-hub 内部使用
+#    - hooks 不需要 PROXY_UPSTREAM_*；proxy/both 才需要
 $EDITOR .env
 
 # 3) 干跑校验（不启动容器）
@@ -43,13 +43,53 @@ $EDITOR .env
 ./start-all.sh
 ```
 
+## Runtime modes and credential boundaries
+
+`PROXY_RUNTIME_MODE` selects one of three independently validated deployments:
+
+| Mode | Listeners | Required proxy values |
+|---|---|---|
+| `proxy` (default) | public proxy on `PROXY_PORT` | URL/model plus the selected auth mode |
+| `hooks` | Codex hooks on host `127.0.0.1:8097` by default (`PROXY_HOOK_PORT`) | none of `PROXY_UPSTREAM_URL`, `PROXY_UPSTREAM_MODEL`, `PROXY_UPSTREAM_API_KEY` |
+| `both` | public proxy plus the separate loopback hook endpoint | same proxy requirements as `proxy` |
+
+For `server-key`, set `PROXY_UPSTREAM_AUTH_MODE=server-key` and provide
+`PROXY_UPSTREAM_API_KEY`. For existing client credential passthrough, select
+`client-key` and leave `PROXY_UPSTREAM_API_KEY` empty. The generated YAML then
+keeps `upstream.apiKey` empty, so each request's Authorization reaches upstream.
+
+The credential roles do not substitute for one another:
+
+- `MEMORY_LLM_API_KEY` is used only by the internal memory/knowledge model.
+- `PROXY_UPSTREAM_API_KEY` is used only for `server-key` proxy forwarding.
+- `MEMORY_HUB_USER_KEY` authorizes Codex project binding. It is not required to
+  start the sidecar and must stay in protected user-level state, not project config.
+
+`verify.sh` always validates the internal memory model. It omits the upstream
+probe only in hooks-only mode; client-key mode performs an unauthenticated
+reachability probe without pretending to validate a user's key. After installing
+and binding the Codex plugin, run the existing doctor from `MemoryProxy`:
+
+```bash
+npm run codex -- doctor
+```
+
+Doctor reports MemoryCore reachability, binding validity, and durable outbox
+health independently. The image health check selects port `8097` in hooks-only
+mode and `8096` otherwise. In a container, the actual hook listener remains on
+container loopback; a small signal-forwarding relay is published only as
+`127.0.0.1:${PROXY_HOOK_PORT}` on the host. The named `PROXY_VOLUME` persists
+the SQLite journal/outbox across container replacement.
+
 ## LLM 通路预检
 
-`verify.sh` 默认会预检两组 LLM 通路（`--skip-llm` 关掉）：
+`verify.sh` 默认预检内部 memory LLM；proxy/both 还会按 upstream auth mode
+预检 proxy 通路（`--skip-llm` 可关闭）：
 
 - **OpenAI 兼容协议**：`GET {base}/models`，只验证 API key + URL，**不消耗任何 token**
 - **Anthropic 协议**：`POST {base}/v1/messages` 发 `max_tokens=1` 的最小消息，消耗 ≤ 10 token
-- **memory 组** 与 **proxy 组** 独立验；若两组配置完全相同，自动跳过重复检查
+- `hooks` 不探测 proxy upstream；`client-key` 只探测可达性，不发送部署 key
+- **memory 组** 与 server-key **proxy 组** 独立验；若配置相同，跳过重复检查
 - **容器已运行时**，额外从容器内 exec 一次 curl，验证"容器 → LLM"的网络可达性（一些企业代理/DNS 隔离环境下宿主机可达但容器不可达）
 
 失败例子：
@@ -69,7 +109,7 @@ $EDITOR .env
 - Memory Gateway：<http://localhost:8420/>
 - Proxy：<http://localhost:8096/>
 
-## 两组独立参数
+## 独立的模型参数与用户凭据
 
 **这是脚本设计的核心** —— memory 组和 proxy 组的 LLM 完全独立，可以指向不同供应商 / 不同模型。
 
@@ -91,7 +131,7 @@ proxy 接到用户请求后转发到这组端点。
 | 变量 | 说明 | 示例 |
 |---|---|---|
 | `PROXY_UPSTREAM_URL` | 转发目标 base URL | `https://api.deepseek.com/v1` |
-| `PROXY_UPSTREAM_API_KEY` | 转发用 API Key | `sk-xxxxxxxx` |
+| `PROXY_UPSTREAM_API_KEY` | server-key 转发用；client-key 必须留空 | `sk-xxxxxxxx` |
 | `PROXY_UPSTREAM_MODEL` | 面向用户的模型 ID | `deepseek-chat` |
 
 > 两组可以填相同值（都指向同一个 LLM），也可以完全不同：例如 memory 组用便宜模型做 embedding，proxy 组用强模型做主对话。
@@ -100,20 +140,18 @@ proxy 接到用户请求后转发到这组端点。
 
 ## 内部凭据（生产环境必看）
 
-三件套之间用 `MEMORY_CORE_GATEWAY_API_KEY` 互相认证，首次启动还会通过
-`init-admin` 建一个 `system_admin` 账户。为了**零配置本地体验**，脚本默认值是：
+三件套之间可用 `MEMORY_CORE_GATEWAY_API_KEY` 认证，首次启动还会通过
+`init-admin` 建一个 `system_admin` 账户。本地模板默认关闭 Gateway Bearer gate：
 
 | 变量 | 默认值 | 用途 |
 |---|---|---|
-| `MEMORY_CORE_GATEWAY_API_KEY` | `local` | memory-hub / proxy → memory-core 的 Bearer |
+| `MEMORY_CORE_GATEWAY_API_KEY` | 空 | memory-hub / proxy → memory-core 的可选 Bearer |
 | `MEMORY_CORE_ADMIN_USERNAME` | `admin` | 初始化的 system_admin 用户名 |
-| `MEMORY_CORE_ADMIN_USER_KEY` | `admin` | 该 admin 用户的登录 key |
+| `.admin-key` | 自动随机生成 | Memory Hub 登录/bind 使用的 user key 文件 |
 
-> 这三个默认值只适合个人本地跑通流程。**生产/联调/公网暴露前必须替换成随机长串**，
-> 否则任何拿到端口的人都能拿到 system_admin 权限。
->
-> 在 `.env` 里取消对应三行的注释并覆盖即可（`_lib.sh` 会 `require_vars`
-> 校验其他必填项，但这三个变量因为有默认兜底，脚本会在启动时打 `[warn]` 提醒你换）。
+> 空 Gateway key 只适合受信任的本地网络。公网部署前必须加网络隔离；当前 legacy
+> proxy auth verifier 还不能在启用 Gateway Bearer gate 时工作，详见 `.env.example`
+> 的限制说明。`.admin-key` 已随机生成，仍应按 secret 文件保护，不能提交。
 
 ## 独立使用每个组件
 
@@ -122,7 +160,7 @@ proxy 接到用户请求后转发到这组端点。
 ```bash
 ./start-memory-core.sh       # 只跑内核 gateway（8420）
 ./start-memory-hub.sh   # 只跑面板 + 知识（8125 + 8424）；需要 MEMORY_LLM_* 参数
-./start-proxy.sh        # 只跑 proxy（8096）；需要 PROXY_UPSTREAM_* 参数
+./start-proxy.sh        # 按 PROXY_RUNTIME_MODE 启动；hooks 不需要 PROXY_UPSTREAM_*
 ```
 
 依赖关系：
@@ -137,8 +175,10 @@ proxy 接到用户请求后转发到这组端点。
 
 - `tdai-memory-core-data`（named volume）→ memory-core 的 SQLite / 记忆数据
 - `tdai-panel-data`（named volume）→ memory-hub 里 knowledge 的 SQLite / git clone / wiki 文件
+- `tdai-memory-proxy-data`（named volume）→ proxy SQLite + durable outbox
 
-`docker volume rm` 之前数据一直保留。改名可在 `.env` 里改 `MEMORY_CORE_VOLUME` / `PANEL_VOLUME`。
+`docker volume rm` 之前数据一直保留。卷名可通过 `MEMORY_CORE_VOLUME`、
+`PANEL_VOLUME` 和 `PROXY_VOLUME` 分别修改。
 
 ## 停止 / 清理
 
@@ -159,13 +199,14 @@ memory-hub 内部有两个进程（panel + knowledge），日志分别在容器�
 
 ## 端口冲突
 
-如果 `8125` / `8420` / `8424` / `8096` 与本地已有服务冲突，直接在 `.env` 改：
+如果 `8125` / `8420` / `8424` / `8096` / `8097` 与本地已有服务冲突，直接在 `.env` 改：
 
 ```bash
 MEMORY_CORE_PORT=18420
 PANEL_PORT=18125
 KNOWLEDGE_PORT=18424
 PROXY_PORT=18096
+PROXY_HOOK_PORT=18097
 # knowledge 对外可达地址要跟着 KNOWLEDGE_PORT 走
 KNOWLEDGE_PUBLIC_BASE_URL=http://host.docker.internal:18424/v3
 ```
@@ -201,7 +242,8 @@ gateway_endpoint）就把 `MEMORY_HUB_PROXY_PUBLIC_URL` 显式设为空字符串
 检查 `.env` 里 `KNOWLEDGE_PUBLIC_BASE_URL` 是不是含 `/v3` —— 缺 `/v3` panel 会报错。
 
 **Q: proxy 转发返回 401？**
-`PROXY_UPSTREAM_API_KEY` 无效或 `PROXY_UPSTREAM_URL` 不匹配。用 `docker logs tdai-proxy` 看错误。
+server-key 下检查 `PROXY_UPSTREAM_API_KEY`；client-key 下检查客户端请求携带的
+Authorization。两种模式都应确认 `PROXY_UPSTREAM_URL`，并查看 `docker logs tdai-proxy`。
 
 **Q: 如何在容器外访问宿主机上其它服务（Ollama、Langfuse 等）？**
 脚本已默认 `--add-host=host.docker.internal:host-gateway`。容器内用 `http://host.docker.internal:<port>` 即可。

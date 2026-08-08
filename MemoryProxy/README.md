@@ -347,7 +347,10 @@ npm run dev:config
 
 ### Background script `proxy.sh`
 
-Always uses `./config.yaml`, auto-detects the `node` path (nvm / fnm compatible), and writes logs by date to `logs/YYYY-MM-DD.log`.
+Uses `./config.yaml` by default, reads `runtime.mode` plus the active listener
+ports, and probes the hook port in `hooks` mode or proxy port in `proxy`/`both`.
+`PROXY_RUNTIME_MODE` and `PROXY_CONFIG_FILE` can override mode/config for source
+launches. It auto-detects `node` (nvm / fnm compatible) and writes dated logs.
 
 ```bash
 ./proxy.sh start          # start in background
@@ -359,6 +362,8 @@ Always uses `./config.yaml`, auto-detects the `node` path (nvm / fnm compatible)
 ./proxy.sh daemon         # daemon mode (auto-restart on crash)
 ./proxy.sh daemon-stop
 ./proxy.sh daemon-status
+
+PROXY_RUNTIME_MODE=hooks ./proxy.sh start  # source hooks-only override
 ```
 
 ## Client configuration

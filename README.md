@@ -36,7 +36,7 @@ Start all three services in one go (`memory-core` + `memory-hub` + `proxy`):
 git clone https://github.com/Tencent/TencentDB-Agent-Memory.git
 cd TencentDB-Agent-Memory/deploy/global-images
 cp .env.example .env
-$EDITOR .env       # Fill in two sets of LLM parameters (memory group + proxy group)
+$EDITOR .env       # Select proxy/hooks/both; hooks needs no PROXY_UPSTREAM_* values
 ./start-all.sh     # Launch everything with one command; when finished, it prints a one-liner you can paste directly into Claude
 ```
 

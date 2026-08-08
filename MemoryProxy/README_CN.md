@@ -323,7 +323,10 @@ npm run dev:config
 
 ### 后台管理脚本 `proxy.sh`
 
-固定使用 `./config.yaml`，自动查找 `node` 路径（兼容 nvm / fnm），日志按日期写入 `logs/YYYY-MM-DD.log`。
+默认使用 `./config.yaml`，读取 `runtime.mode` 和 active listener 端口：`hooks`
+检查 hook port，`proxy`/`both` 检查 proxy port。源码启动时可用
+`PROXY_RUNTIME_MODE` / `PROXY_CONFIG_FILE` 覆盖 mode/config。脚本会自动查找
+`node`（兼容 nvm / fnm），日志按日期写入。
 
 ```bash
 ./proxy.sh start          # 后台启动
@@ -335,6 +338,8 @@ npm run dev:config
 ./proxy.sh daemon         # 守护进程模式（崩溃自动拉起）
 ./proxy.sh daemon-stop
 ./proxy.sh daemon-status
+
+PROXY_RUNTIME_MODE=hooks ./proxy.sh start  # 源码 hooks-only override
 ```
 
 ## 客户端配置

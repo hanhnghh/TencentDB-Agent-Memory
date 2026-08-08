@@ -17,13 +17,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_lib.sh"
 
 load_env
+load_proxy_mode
 require_vars \
   MEMORY_HUB_IMAGE PANEL_PORT KNOWLEDGE_PORT PANEL_VOLUME \
   MEMORY_LLM_BASE_URL MEMORY_LLM_API_KEY MEMORY_LLM_MODEL \
   KNOWLEDGE_PUBLIC_BASE_URL
 
-# 与 memory-core 保持一致的 gateway 内部凭据（默认 local，仅本地体验）
-MEMORY_CORE_GATEWAY_API_KEY="${MEMORY_CORE_GATEWAY_API_KEY:-local}"
+# 与 memory-core 保持一致；显式空值表示本地部署关闭 Gateway Bearer gate。
+MEMORY_CORE_GATEWAY_API_KEY="${MEMORY_CORE_GATEWAY_API_KEY-}"
 
 # Panel UI "客户端接入地址"卡片显示的 base URL（供 CodeBuddy / ClaudeCode 拷贝使用）。
 # 开源本地部署 core 和 proxy 分开跑，客户端要接的是 proxy，不是 core/gateway。
@@ -58,7 +59,9 @@ detect_host_ip() {
   echo "localhost"
 }
 
-if [[ -z "${MEMORY_HUB_PROXY_PUBLIC_URL+x}" ]]; then
+if ! proxy_transport_enabled; then
+  MEMORY_HUB_PROXY_PUBLIC_URL=""
+elif [[ -z "${MEMORY_HUB_PROXY_PUBLIC_URL+x}" ]]; then
   # 未设 → 用探测出的 IP + PROXY_PORT 拼默认值
   _host_ip=$(detect_host_ip)
   MEMORY_HUB_PROXY_PUBLIC_URL="http://${_host_ip}:${PROXY_PORT:-8096}"

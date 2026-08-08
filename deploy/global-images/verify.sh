@@ -37,7 +37,7 @@ done
 
 ERRORS=0
 WARNS=0
-CURL=/usr/bin/curl
+CURL="${CURL:-/usr/bin/curl}"
 
 # ─── LLM 通路检查函数 ───────────────────────────────────────────────
 # check_llm_openai <label> <base_url> <api_key> <model>
@@ -138,6 +138,20 @@ check_llm_group() {
   esac
 }
 
+# Client-key passthrough has no deployment credential to validate. Probe only
+# network/HTTP reachability and accept authenticated HTTP responses such as 401.
+check_proxy_upstream_reachable() {
+  local base="$1" code
+  base="${base%/}"
+  code=$("$CURL" -sS --max-time 10 -o /dev/null -w "%{http_code}" \
+    "${base}/models" 2>/dev/null || echo "000")
+  if [[ "$code" == "000" ]]; then
+    warn "proxy 组上游不可达（client-key passthrough）"
+    return 1
+  fi
+  ok "proxy 组上游网络可达（client-key passthrough，HTTP ${code}）"
+}
+
 # 容器内 curl 验证（可选，容器已运行时才做）
 check_llm_from_container() {
   local container="$1" label="$2" base="$3" key="$4" model="$5" proto="${6:-openai}"
@@ -187,17 +201,35 @@ if [[ ! -f "$ENV_FILE" ]]; then
   echo "${C_RED}[error]${C_RST} $ENV_FILE 不存在。执行：cp .env.example .env" >&2
 else
   ok ".env 存在"
-  set -a; source "$ENV_FILE"; set +a
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+  load_proxy_mode
+  info "deployment mode: $PROXY_RUNTIME_MODE"
 
   # 3. 必填参数
   MISSING=()
-  for var in \
+  REQUIRED_VARS=(
     MEMORY_CORE_IMAGE MEMORY_HUB_IMAGE PROXY_IMAGE \
-    MEMORY_CORE_PORT PANEL_PORT KNOWLEDGE_PORT PROXY_PORT \
+    MEMORY_CORE_PORT PANEL_PORT KNOWLEDGE_PORT \
     MEMORY_CORE_VOLUME PANEL_VOLUME \
     MEMORY_LLM_BASE_URL MEMORY_LLM_API_KEY MEMORY_LLM_MODEL \
-    KNOWLEDGE_PUBLIC_BASE_URL \
-    PROXY_UPSTREAM_URL PROXY_UPSTREAM_API_KEY PROXY_UPSTREAM_MODEL; do
+    KNOWLEDGE_PUBLIC_BASE_URL
+  )
+  if proxy_transport_enabled; then
+    REQUIRED_VARS+=(PROXY_PORT PROXY_UPSTREAM_URL PROXY_UPSTREAM_MODEL)
+    if [[ "$PROXY_UPSTREAM_AUTH_MODE" == "server-key" ]]; then
+      REQUIRED_VARS+=(PROXY_UPSTREAM_API_KEY)
+    elif [[ -n "${PROXY_UPSTREAM_API_KEY:-}" ]]; then
+      ERRORS=$((ERRORS+1))
+      echo "${C_RED}[error]${C_RST} client-key passthrough 要求 PROXY_UPSTREAM_API_KEY 留空" >&2
+    fi
+  fi
+  if hook_transport_enabled; then
+    REQUIRED_VARS+=(PROXY_HOOK_PORT)
+  fi
+  for var in "${REQUIRED_VARS[@]}"; do
     val="${!var:-}"
     if [[ -z "$val" || "$val" == "REPLACE_ME" ]]; then
       MISSING+=("$var")
@@ -208,6 +240,13 @@ else
     echo "${C_RED}[error]${C_RST} 以下必填参数未设置：${MISSING[*]}" >&2
   else
     ok "所有必填参数已填写"
+  fi
+  if hook_transport_enabled; then
+    if [[ -n "${MEMORY_HUB_USER_KEY:-}" && "${MEMORY_HUB_USER_KEY}" != "REPLACE_ME" ]]; then
+      ok "Memory Hub user key: configured for Codex binding"
+    else
+      info "Memory Hub user key: not set (required for binding, not sidecar startup)"
+    fi
   fi
 
   # 4. 镜像是否本地存在
@@ -223,7 +262,10 @@ else
   done
 
   # 5. 端口占用（仅提醒）
-  for port_var in MEMORY_CORE_PORT PANEL_PORT KNOWLEDGE_PORT PROXY_PORT; do
+  PORT_VARS=(MEMORY_CORE_PORT PANEL_PORT KNOWLEDGE_PORT)
+  if proxy_transport_enabled; then PORT_VARS+=(PROXY_PORT); fi
+  if hook_transport_enabled; then PORT_VARS+=(PROXY_HOOK_PORT); fi
+  for port_var in "${PORT_VARS[@]}"; do
     port="${!port_var:-}"
     if [[ -z "$port" ]]; then continue; fi
     if lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
@@ -253,19 +295,29 @@ else
       "$MEMORY_LLM_BASE_URL" "$MEMORY_LLM_API_KEY" "$MEMORY_LLM_MODEL" \
       "${MEMORY_LLM_PROTOCOL:-openai}"
 
-    # proxy 组（如果与 memory 组值完全一样，说明用户填的是同一份，只验 1 次即可）
-    if [[ "$PROXY_UPSTREAM_URL" == "$MEMORY_LLM_BASE_URL" && \
-          "$PROXY_UPSTREAM_API_KEY" == "$MEMORY_LLM_API_KEY" && \
-          "$PROXY_UPSTREAM_MODEL" == "$MEMORY_LLM_MODEL" ]]; then
-      ok "proxy 组 与 memory 组完全相同，跳过重复检查"
-    else
-      # proxy 组默认按 openai 协议（与 config.yaml 一致）
-      if ! check_llm_group "proxy 组" "$PROXY_UPSTREAM_URL" "$PROXY_UPSTREAM_API_KEY" \
-           "$PROXY_UPSTREAM_MODEL" openai; then
-        ERRORS=$((ERRORS+1))
+    if proxy_transport_enabled; then
+      # proxy 组（如果与 memory 组值完全一样，说明用户填的是同一份，只验 1 次即可）
+      if [[ "$PROXY_UPSTREAM_AUTH_MODE" == "server-key" && \
+            "$PROXY_UPSTREAM_URL" == "$MEMORY_LLM_BASE_URL" && \
+            "$PROXY_UPSTREAM_API_KEY" == "$MEMORY_LLM_API_KEY" && \
+            "$PROXY_UPSTREAM_MODEL" == "$MEMORY_LLM_MODEL" ]]; then
+        ok "proxy 组 与 memory 组完全相同，跳过重复检查"
+      elif [[ "$PROXY_UPSTREAM_AUTH_MODE" == "client-key" ]]; then
+        info "proxy 组使用 client-key passthrough；仅检查上游可达性，不探测用户凭据"
+        if ! check_proxy_upstream_reachable "$PROXY_UPSTREAM_URL"; then
+          ERRORS=$((ERRORS+1))
+        fi
+      else
+        # proxy 组默认按 openai 协议（与 config.yaml 一致）
+        if ! check_llm_group "proxy 组" "$PROXY_UPSTREAM_URL" "$PROXY_UPSTREAM_API_KEY" \
+             "$PROXY_UPSTREAM_MODEL" openai; then
+          ERRORS=$((ERRORS+1))
+        fi
+        check_llm_from_container tdai-proxy "proxy 组 (from container)" \
+          "$PROXY_UPSTREAM_URL" "$PROXY_UPSTREAM_API_KEY" "$PROXY_UPSTREAM_MODEL" openai
       fi
-      check_llm_from_container tdai-proxy "proxy 组 (from container)" \
-        "$PROXY_UPSTREAM_URL" "$PROXY_UPSTREAM_API_KEY" "$PROXY_UPSTREAM_MODEL" openai
+    else
+      ok "hooks-only mode: proxy upstream probe disabled"
     fi
   fi
 fi
