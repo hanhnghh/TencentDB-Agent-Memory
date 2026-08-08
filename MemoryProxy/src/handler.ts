@@ -1216,7 +1216,9 @@ export async function handleChatCompletions(
     }
 
     if (tdaiClient && isExtractionAllowed(config, "tdai-memory")) {
-      await recordTdaiTurn(tdaiClient, tdaiIdentity, tdaiUserMessage, assistantContentForTdai(assistantMessage));
+      await recordTdaiTurn(tdaiClient, tdaiIdentity, tdaiUserMessage, assistantContentForTdai(assistantMessage), {
+        sourceEventId: `proxy:${sessionKey}:turn:${lf.turnSeq}`,
+      });
     } else if (tdaiClient) {
       logExtractionSkipped(config, "tdai-memory", sessionKey);
     }
@@ -1639,6 +1641,7 @@ function createUsageTapTransform(ctx: TapContext): TransformStream<Uint8Array, U
         withL0Retry(() => recordTdaiTurn(
           ctx.tdaiClient!, ctx.tdaiIdentity, ctx.tdaiUserMessage,
           outputMessageContent(outputMessage),
+          { sourceEventId: `proxy:${ctx.sessionKeyForSkill}:turn:${lf.turnSeq}` },
         )).catch((err: unknown) => pipe.error("TDAI_L0", err))
       );
     } else if (ctx.tdaiClient) {

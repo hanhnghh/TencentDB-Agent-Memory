@@ -1,4 +1,5 @@
 export { MemoryClient } from "./client.js";
+export { ParamError, TDAMError, TDAMResponseError, TDAMTransportError } from "../errors.js";
 export { SkillClient, type SkillClientConfig } from "./skill-client.js";
 export { SkillErrorCode, type SkillErrorCodeValue } from "./skill-types.js";
 export type {

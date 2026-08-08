@@ -22,7 +22,6 @@ export {
   conversationRoleSchema,
   paginationSchema,
   conversationItemSchema,
-  conversationAddDataSchema,
   conversationQueryRequestSchema,
   conversationQueryDataSchema,
   conversationDeleteDataSchema,
@@ -55,7 +54,6 @@ export type {
   ConversationRole,
   Pagination,
   ConversationAddRequest,
-  ConversationAddData,
   ConversationQueryRequest,
   ConversationQueryData,
   ConversationDeleteData,
@@ -112,9 +110,27 @@ import {
 /** conversationAdd with session_id defaulting to compatibility bucket. */
 export const conversationAddRequestSchema = z.object({
   session_id: z.string().min(1).default(DEFAULT_ISOLATION_ID),
+  source_event_id: z.string().trim().min(1).max(512).optional(),
+  content_hash: z.string().trim().min(1).max(256).optional(),
   messages: z.array(_conversationItemSchema).min(1).max(100),
 });
 export type ConversationAddRequest = z.infer<typeof conversationAddRequestSchema>;
+
+export const conversationReceiptSchema = z.object({
+  source_event_id: z.string(),
+  content_hash: z.string(),
+  status: z.enum(["committed", "duplicate"]),
+  committed_at: z.string(),
+});
+export type ConversationReceipt = z.infer<typeof conversationReceiptSchema>;
+
+export const conversationAddDataSchema = z.object({
+  accepted_ids: z.array(z.string()),
+  accepted_versions: z.array(z.string()),
+  total_count: z.number().int(),
+  receipt: conversationReceiptSchema.optional(),
+});
+export type ConversationAddData = z.infer<typeof conversationAddDataSchema>;
 
 // ============================
 // Count endpoints (sdk-v3.yaml)

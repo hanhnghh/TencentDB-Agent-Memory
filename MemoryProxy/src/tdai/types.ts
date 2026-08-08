@@ -63,6 +63,19 @@ export interface TdaiMessage {
   content: string;
 }
 
+export interface TdaiConversationReceipt {
+  source_event_id: string;
+  content_hash: string;
+  status: "committed" | "duplicate";
+  committed_at: string;
+}
+
+export interface TdaiConversationWriteResult {
+  acceptedIds: string[];
+  totalCount: number;
+  receipts: TdaiConversationReceipt[];
+}
+
 export interface TdaiL1Memory {
   id: string;
   type?: string;

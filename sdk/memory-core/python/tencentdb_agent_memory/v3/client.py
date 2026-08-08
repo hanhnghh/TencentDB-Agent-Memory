@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional
 
 from .._http import Stub
 from .._v3_http import AsyncHttpStub, HttpStub
-from ..errors import ParamError
+from ..errors import ParamError, TDAMResponseError
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,30 @@ _UNSET = object()
 
 def _strip_none(d: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
+
+
+def _validate_conversation_add_result(data: Any, source_event_id: Optional[str]) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        raise TDAMResponseError("conversation/add response data must be an object")
+    if (
+        not isinstance(data.get("accepted_ids"), list)
+        or not isinstance(data.get("accepted_versions"), list)
+        or not isinstance(data.get("total_count"), int)
+    ):
+        raise TDAMResponseError("conversation/add returned malformed receipt data")
+    if source_event_id is not None:
+        receipt = data.get("receipt")
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("source_event_id") != source_event_id
+            or not isinstance(receipt.get("content_hash"), str)
+            or receipt.get("status") not in ("committed", "duplicate")
+            or not isinstance(receipt.get("committed_at"), str)
+        ):
+            raise TDAMResponseError(
+                "conversation/add returned a malformed or mismatched source-event receipt"
+            )
+    return data
 
 
 def _validate_construction(team_id: str, agent_id: str, user_id: str) -> None:
@@ -195,16 +219,21 @@ class MemoryClient:
         messages: List[Dict[str, Any]],
         *,
         session_id: Optional[str] = None,
+        source_event_id: Optional[str] = None,
+        content_hash: Optional[str] = None,
     ) -> Dict[str, Any]:
         """``POST /v3/conversation/add`` — 写入必填 session_id（构造或调用二选一）。"""
-        return self._stub.post(
+        data = self._stub.post(
             f"{_V3}/conversation/add",
             _strip_none({
                 **self._iso.base_body(),
                 "session_id": self._iso.resolve_session_for_write(session_id),
+                "source_event_id": source_event_id,
+                "content_hash": content_hash,
                 "messages": messages,
             }),
         )
+        return _validate_conversation_add_result(data, source_event_id)
 
     def query_conversation(
         self,
@@ -539,16 +568,21 @@ class AsyncMemoryClient:
         messages: List[Dict[str, Any]],
         *,
         session_id: Optional[str] = None,
+        source_event_id: Optional[str] = None,
+        content_hash: Optional[str] = None,
     ) -> Dict[str, Any]:
         """``POST /v3/conversation/add`` — 写入必填 session_id（构造或调用二选一）。"""
-        return await self._stub.post(
+        data = await self._stub.post(
             f"{_V3}/conversation/add",
             _strip_none({
                 **self._iso.base_body(),
                 "session_id": self._iso.resolve_session_for_write(session_id),
+                "source_event_id": source_event_id,
+                "content_hash": content_hash,
                 "messages": messages,
             }),
         )
+        return _validate_conversation_add_result(data, source_event_id)
 
     async def query_conversation(
         self,

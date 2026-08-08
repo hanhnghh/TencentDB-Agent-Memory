@@ -26,6 +26,9 @@ class TDAMError(Exception):
         self.message = message
         self.request_id = request_id
         self.details = dict(details) if details else None
+        digits = str(abs(int(code)))
+        normalized = int(digits[:3]) if len(digits) > 3 else code
+        self.retryable = normalized in (408, 429) or normalized >= 500
 
     def __str__(self) -> str:
         if self.request_id:
@@ -38,3 +41,21 @@ class TDAMError(Exception):
 
 class ParamError(Exception):
     """Raised when caller-supplied parameters are invalid."""
+
+
+class TDAMTransportError(TDAMError):
+    """Typed retryable network/timeout failure."""
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(408 if kind == "timeout" else -1, message)
+        self.kind = kind
+        self.retryable = True
+
+
+class TDAMResponseError(TDAMError):
+    """Typed malformed-response failure."""
+
+    def __init__(self, message: str, request_id: str = "") -> None:
+        super().__init__(-1, message, request_id)
+        self.kind = "malformed"
+        self.retryable = True

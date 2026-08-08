@@ -47,11 +47,21 @@ export interface ConversationItem {
 
 export interface ConversationAddRequest extends IdFields {
   session_id: string;
+  source_event_id?: string;
+  content_hash?: string;
   messages: ConversationItem[];
+}
+export interface ConversationReceipt {
+  source_event_id: string;
+  content_hash: string;
+  status: "committed" | "duplicate";
+  committed_at: string;
 }
 export interface ConversationAddData {
   accepted_ids: string[];
+  accepted_versions: string[];
   total_count: number;
+  receipt?: ConversationReceipt;
 }
 
 export interface ConversationQueryRequest extends IdFields {

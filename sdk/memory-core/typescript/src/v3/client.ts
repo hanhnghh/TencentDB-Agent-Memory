@@ -1,4 +1,4 @@
-import { ParamError } from "../errors.js";
+import { ParamError, TDAMResponseError } from "../errors.js";
 import { V3HttpTransport } from "./http.js";
 import type { Transport } from "../client.js";
 import type {
@@ -159,12 +159,35 @@ export class MemoryClient {
 
   // -- L0 Conversation ---------------------------------------------------
 
-  addConversation(params: V3ConversationAddRequest): Promise<V3ConversationAddData> {
-    return this.http.post(`${V3}/conversation/add`, stripUndefined({
+  async addConversation(params: V3ConversationAddRequest): Promise<V3ConversationAddData> {
+    const data = await this.http.post<V3ConversationAddData>(`${V3}/conversation/add`, stripUndefined({
       ...this.iso.baseBody(),
       session_id: this.iso.resolveSessionForWrite(params.session_id),
+      source_event_id: params.source_event_id,
+      content_hash: params.content_hash,
       messages: params.messages,
     }));
+    if (
+      !data
+      || !Array.isArray(data.accepted_ids)
+      || !Array.isArray(data.accepted_versions)
+      || typeof data.total_count !== "number"
+    ) {
+      throw new TDAMResponseError("conversation/add returned malformed receipt data");
+    }
+    if (params.source_event_id !== undefined) {
+      const receipt = data.receipt;
+      if (
+        !receipt
+        || receipt.source_event_id !== params.source_event_id
+        || typeof receipt.content_hash !== "string"
+        || (receipt.status !== "committed" && receipt.status !== "duplicate")
+        || typeof receipt.committed_at !== "string"
+      ) {
+        throw new TDAMResponseError("conversation/add returned a malformed or mismatched source-event receipt");
+      }
+    }
+    return data;
   }
 
   queryConversation(params: V3ConversationQueryRequest = {}): Promise<V3ConversationQueryData> {

@@ -173,6 +173,31 @@ meta.delete_knowledge(["wiki-docs", "cg-repo-1"], team_id="team-1")
 
 > Note: these are **management-plane CRUD** (metadata only). Actually searching wiki content, reading pages, or syncing repos is the Knowledge Service data-plane's job (`service_url` → `:8421`), not this client.
 
+## Retry-safe v3 conversation ingestion
+
+The strict-isolation v3 client accepts an optional stable source event ID and
+returns a durable receipt. Reuse the same ID only when retrying the same
+conversation payload after a timeout or lost acknowledgement.
+
+```python
+from tencentdb_agent_memory.v3 import MemoryClient
+
+client = MemoryClient(
+    endpoint="http://127.0.0.1:8420",
+    api_key="your-api-key",
+    service_id="your-memory-space-id",
+    team_id="team-1",
+    agent_id="agent-1",
+    user_id="user-1",
+    session_id="sess-1",
+)
+write = client.add_conversation(
+    [{"role": "user", "content": "Hello"}],
+    source_event_id="codex:sess-1:turn:7",
+)
+print(write["receipt"])  # committed, or duplicate on a safe replay
+```
+
 ## Error Handling
 
 All non-zero `code` responses raise `TDAMError`:
@@ -185,6 +210,10 @@ try:
 except TDAMError as e:
     print(f"code={e.code} message={e.message} request_id={e.request_id}")
 ```
+
+`TDAMError.retryable` is true for 408, 429, and 5xx failures. Network and
+timeout failures use `TDAMTransportError`; malformed success responses use
+`TDAMResponseError`. Permanent 4xx failures are not retryable.
 
 ## Build & Pack
 

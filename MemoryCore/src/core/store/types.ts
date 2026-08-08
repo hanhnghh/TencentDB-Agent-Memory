@@ -159,6 +159,32 @@ export interface L0Record {
   timestamp: number;
 }
 
+/** Durable proof that one source event was applied to L0. */
+export interface L0IngestionReceipt {
+  sourceEventId: string;
+  /** Caller-provided content hash, or the server payload hash when omitted. */
+  contentHash: string;
+  /** Server-computed canonical hash; prevents a reused client hash hiding changed content. */
+  payloadHash: string;
+  acceptedIds: string[];
+  acceptedVersions: string[];
+  committedAt: string;
+}
+
+export interface L0IngestionInput {
+  /** Tenant/session-scoped hash of sourceEventId; safe to use as a storage key. */
+  receiptKey: string;
+  sourceEventId: string;
+  contentHash: string;
+  payloadHash: string;
+  records: Array<{ record: L0Record; embedding?: Float32Array }>;
+}
+
+export type L0IngestionCommitResult =
+  | { status: "committed" | "duplicate"; receipt: L0IngestionReceipt }
+  | { status: "conflict"; receipt: L0IngestionReceipt }
+  | { status: "failed" };
+
 /** Result from an L0 vector similarity search. */
 export interface L0SearchResult {
   record_id: string;
@@ -570,6 +596,13 @@ export interface IMemoryStore {
   // ── L0 Write ─────────────────────────────────────────────
 
   upsertL0(record: L0Record, embedding?: Float32Array): MaybePromise<boolean>;
+  getL0IngestionReceipt(receiptKey: string): MaybePromise<L0IngestionReceipt | undefined>;
+  /**
+   * Apply a source event and persist its receipt. Implementations must return
+   * `duplicate` for an already committed identical event and `conflict` when
+   * the same scoped event key is reused with different content.
+   */
+  commitL0Ingestion(input: L0IngestionInput): MaybePromise<L0IngestionCommitResult>;
   /** Update only the vector embedding for an existing L0 record (sqlite background path). */
   updateL0Embedding?(recordId: string, embedding: Float32Array): MaybePromise<boolean>;
   deleteL0(recordId: string, filter?: IsolationFilter): MaybePromise<boolean>;

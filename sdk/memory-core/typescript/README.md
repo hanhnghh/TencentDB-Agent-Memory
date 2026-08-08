@@ -29,13 +29,15 @@ const client = new MemoryClient({
   sessionId: "sess-1",                // 可选：省略/清空后 L0/L1 跨 session 聚合
 });
 
-// L0：写对话
-await client.addConversation({
+// L0：写对话；稳定的 source_event_id 让超时/丢失 acknowledgement 后可安全重试
+const write = await client.addConversation({
+  source_event_id: "codex:sess-1:turn:7",
   messages: [
     { role: "user", content: "Hello" },
     { role: "assistant", content: "Hi!" },
   ],
 });
+console.log(write.receipt); // committed on first delivery, duplicate on a safe replay
 
 // L0：查
 const l0 = await client.queryConversation({ limit: 20, offset: 0 });
@@ -156,6 +158,10 @@ try {
   }
 }
 ```
+
+`TDAMError.retryable` is true for 408, 429, and 5xx failures. Network and
+timeout failures use `TDAMTransportError`; malformed success responses use
+`TDAMResponseError`. Permanent 4xx failures are not retryable.
 
 ## Build & Pack
 

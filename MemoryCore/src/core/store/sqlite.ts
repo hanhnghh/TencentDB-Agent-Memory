@@ -31,6 +31,9 @@ import type {
   IMemoryStore,
   StoreCapabilities,
   L0Record,
+  L0IngestionCommitResult,
+  L0IngestionInput,
+  L0IngestionReceipt,
   L1SearchResult,
   L1FtsResult,
   L0SearchResult,
@@ -741,6 +744,17 @@ export class VectorStore implements IMemoryStore {
         message_text TEXT NOT NULL,
         recorded_at TEXT DEFAULT '',
         timestamp INTEGER DEFAULT 0
+      )
+    `);
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS l0_ingestion_receipts (
+        receipt_key TEXT PRIMARY KEY,
+        source_event_id TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        accepted_ids_json TEXT NOT NULL,
+        accepted_versions_json TEXT NOT NULL,
+        committed_at TEXT NOT NULL
       )
     `);
 
@@ -1859,6 +1873,80 @@ export class VectorStore implements IMemoryStore {
         `${TAG} [L0-upsert] FAILED (non-fatal) id=${record.id}: ${err instanceof Error ? err.message : String(err)}`,
       );
       return false;
+    }
+  }
+
+  getL0IngestionReceipt(receiptKey: string): L0IngestionReceipt | undefined {
+    const row = this.db.prepare(`
+      SELECT source_event_id, content_hash, payload_hash, accepted_ids_json,
+             accepted_versions_json, committed_at
+      FROM l0_ingestion_receipts WHERE receipt_key = ?
+    `).get(receiptKey) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    return {
+      sourceEventId: String(row.source_event_id),
+      contentHash: String(row.content_hash),
+      payloadHash: String(row.payload_hash),
+      acceptedIds: JSON.parse(String(row.accepted_ids_json)) as string[],
+      acceptedVersions: JSON.parse(String(row.accepted_versions_json)) as string[],
+      committedAt: String(row.committed_at),
+    };
+  }
+
+  commitL0Ingestion(input: L0IngestionInput): L0IngestionCommitResult {
+    if (this.degraded) return { status: "failed" };
+
+    const classifyExisting = (receipt: L0IngestionReceipt): L0IngestionCommitResult => ({
+      status: receipt.contentHash === input.contentHash && receipt.payloadHash === input.payloadHash
+        ? "duplicate"
+        : "conflict",
+      receipt,
+    });
+
+    try {
+      const existing = this.getL0IngestionReceipt(input.receiptKey);
+      if (existing) return classifyExisting(existing);
+
+      // Deterministic record IDs make replay safe if a process stops after a
+      // subset is durable but before the receipt row is inserted.
+      for (const entry of input.records) {
+        if (!this.upsertL0(entry.record, entry.embedding)) return { status: "failed" };
+      }
+
+      const receipt: L0IngestionReceipt = {
+        sourceEventId: input.sourceEventId,
+        contentHash: input.contentHash,
+        payloadHash: input.payloadHash,
+        acceptedIds: input.records.map(({ record }) => record.id),
+        acceptedVersions: input.records.map(() => "v1"),
+        committedAt: new Date().toISOString(),
+      };
+      try {
+        this.db.prepare(`
+          INSERT INTO l0_ingestion_receipts (
+            receipt_key, source_event_id, content_hash, payload_hash,
+            accepted_ids_json, accepted_versions_json, committed_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          input.receiptKey,
+          receipt.sourceEventId,
+          receipt.contentHash,
+          receipt.payloadHash,
+          JSON.stringify(receipt.acceptedIds),
+          JSON.stringify(receipt.acceptedVersions),
+          receipt.committedAt,
+        );
+        return { status: "committed", receipt };
+      } catch {
+        // A concurrent identical request may have won the unique-key race.
+        const raced = this.getL0IngestionReceipt(input.receiptKey);
+        return raced ? classifyExisting(raced) : { status: "failed" };
+      }
+    } catch (err) {
+      this.logger?.warn(
+        `${TAG} [L0-ingestion] FAILED event=${input.sourceEventId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return { status: "failed" };
     }
   }
 

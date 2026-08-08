@@ -1,7 +1,7 @@
 /** Strict HTTP transport used exclusively by v3 SDK clients. */
 
 import { Agent } from "undici";
-import { ParamError, TDAMError } from "../errors.js";
+import { ParamError, TDAMError, TDAMResponseError, TDAMTransportError } from "../errors.js";
 import type { HttpTransportOptions } from "../http.js";
 import type { ApiResponseEnvelope } from "../types.js";
 
@@ -65,12 +65,23 @@ export class V3HttpTransport {
       let envelope: ApiResponseEnvelope<T>;
       try {
         envelope = JSON.parse(responseText) as ApiResponseEnvelope<T>;
-      } catch {
-        throw new TDAMError(
-          response.ok ? -1 : response.status,
+      } catch (err) {
+        if (!response.ok) {
+          throw new TDAMError(
+            response.status,
+            responseText || `HTTP ${response.status} returned a non-JSON response`,
+            headerRequestId,
+          );
+        }
+        throw new TDAMResponseError(
           responseText || `HTTP ${response.status} returned a non-JSON response`,
           headerRequestId,
+          { cause: err },
         );
+      }
+
+      if (!envelope || typeof envelope !== "object" || typeof envelope.code !== "number") {
+        throw new TDAMResponseError("API response must be an envelope with a numeric code", headerRequestId);
       }
 
       const businessCode = typeof envelope.code === "number" ? envelope.code : undefined;
@@ -94,6 +105,14 @@ export class V3HttpTransport {
         (result as Record<string, unknown>).trace_id = traceId;
       }
       return result;
+    } catch (err) {
+      if (err instanceof TDAMError) throw err;
+      const timedOut = controller.signal.aborted;
+      throw new TDAMTransportError(
+        timedOut ? "timeout" : "network",
+        timedOut ? `Request timed out after ${this.timeout}ms` : "Network request failed",
+        { cause: err },
+      );
     } finally {
       clearTimeout(timer);
     }

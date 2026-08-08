@@ -8,7 +8,7 @@ from typing import Dict, Optional
 import httpx
 
 from ._http import Stub
-from .errors import ParamError, TDAMError
+from .errors import ParamError, TDAMError, TDAMResponseError, TDAMTransportError
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +45,16 @@ def _decode_response(resp: httpx.Response) -> dict:
         envelope = resp.json()
     except ValueError as exc:
         message = resp.text or f"HTTP {resp.status_code} returned a non-JSON response"
-        raise TDAMError(resp.status_code if resp.is_error else -1, message, header_request_id) from exc
+        if resp.is_error:
+            raise TDAMError(resp.status_code, message, header_request_id) from exc
+        raise TDAMResponseError(message, header_request_id) from exc
 
     if not isinstance(envelope, dict):
-        raise TDAMError(-1, "API response must be a JSON object", header_request_id)
+        raise TDAMResponseError("API response must be a JSON object", header_request_id)
 
     code = envelope.get("code")
+    if not isinstance(code, int):
+        raise TDAMResponseError("API response envelope must contain a numeric code", header_request_id)
     if resp.is_error or code != 0:
         effective_code = code if isinstance(code, int) and code != 0 else resp.status_code
         payload = envelope.get("data")
@@ -64,7 +68,7 @@ def _decode_response(resp: httpx.Response) -> dict:
 
     result = envelope.get("data") or {}
     if not isinstance(result, dict):
-        raise TDAMError(-1, "API response data must be a JSON object", header_request_id)
+        raise TDAMResponseError("API response data must be a JSON object", header_request_id)
     trace_id = resp.headers.get("x-trace-id")
     if trace_id:
         result["trace_id"] = trace_id
@@ -96,12 +100,17 @@ class HttpStub(Stub):
             self.headers["x-tdai-user-key"] = user_key
 
     def post(self, path: str, body: dict, timeout: Optional[float] = None) -> dict:
-        resp = self.client.post(
-            url=f"{self.endpoint}{path}",
-            json=body,
-            headers=self.headers,
-            timeout=timeout or self.client.timeout,
-        )
+        try:
+            resp = self.client.post(
+                url=f"{self.endpoint}{path}",
+                json=body,
+                headers=self.headers,
+                timeout=timeout or self.client.timeout,
+            )
+        except httpx.TimeoutException as exc:
+            raise TDAMTransportError("timeout", f"POST {path} timed out") from exc
+        except httpx.RequestError as exc:
+            raise TDAMTransportError("network", f"POST {path} network failure") from exc
         logger.debug("Response %s %s", path, resp.text)
         return _decode_response(resp)
 
@@ -135,12 +144,17 @@ class AsyncHttpStub:
             self.headers["x-tdai-user-key"] = user_key
 
     async def post(self, path: str, body: dict, timeout: Optional[float] = None) -> dict:
-        resp = await self.client.post(
-            url=f"{self.endpoint}{path}",
-            json=body,
-            headers=self.headers,
-            timeout=timeout or self.client.timeout,
-        )
+        try:
+            resp = await self.client.post(
+                url=f"{self.endpoint}{path}",
+                json=body,
+                headers=self.headers,
+                timeout=timeout or self.client.timeout,
+            )
+        except httpx.TimeoutException as exc:
+            raise TDAMTransportError("timeout", f"POST {path} timed out") from exc
+        except httpx.RequestError as exc:
+            raise TDAMTransportError("network", f"POST {path} network failure") from exc
         logger.debug("Response %s %s", path, resp.text)
         return _decode_response(resp)
 

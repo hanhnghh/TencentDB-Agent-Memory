@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
+
 import type { TdaiClient } from "./client.js";
-import type { TdaiIdentity, TdaiMessage } from "./types.js";
+import type { TdaiConversationWriteResult, TdaiIdentity, TdaiMessage } from "./types.js";
 import { extractUserQueryText } from "../common/user-query-extractor.js";
 
 /**
@@ -29,13 +31,28 @@ export function extractLatestUserMessage(messages: unknown[]): TdaiMessage | nul
   return null;
 }
 
-export async function recordTdaiTurn(client: TdaiClient, identity: TdaiIdentity | null, userMessage: TdaiMessage | null, assistantContent: string | null | undefined): Promise<void> {
-  if (!identity || !userMessage) return;
+export async function recordTdaiTurn(
+  client: Pick<TdaiClient, "addConversation">,
+  identity: TdaiIdentity | null,
+  userMessage: TdaiMessage | null,
+  assistantContent: string | null | undefined,
+  options: { sourceEventId?: string; contentHash?: string } = {},
+): Promise<TdaiConversationWriteResult | undefined> {
+  if (!identity || !userMessage) return undefined;
   const messages: TdaiMessage[] = [userMessage];
   if (assistantContent?.trim()) {
     messages.push({ role: "assistant", content: assistantContent });
   }
-  await client.addConversation(identity, messages);
+  const payloadHash = createHash("sha256")
+    .update(JSON.stringify(messages.map(({ role, content }) => [role, content])))
+    .digest("hex");
+  const sourceEventId = options.sourceEventId
+    ? `${options.sourceEventId}:payload:${payloadHash.slice(0, 24)}`
+    : undefined;
+  return client.addConversation(identity, messages, {
+    ...options,
+    sourceEventId,
+  });
 }
 
 function extractContentText(content: unknown): string {

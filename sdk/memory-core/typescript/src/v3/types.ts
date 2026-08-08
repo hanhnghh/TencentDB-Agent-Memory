@@ -52,6 +52,8 @@ export interface V3IsolationOverrides {
 
 export interface V3ConversationAddRequest {
   session_id?: string;
+  source_event_id?: string;
+  content_hash?: string;
   messages: ConversationItem[];
 }
 export type V3ConversationAddData = ConversationAddData;
