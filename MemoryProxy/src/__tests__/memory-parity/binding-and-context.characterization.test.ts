@@ -87,6 +87,18 @@ describe("memory parity: identity and binding", () => {
       PARITY_IDENTITY.agentSource,
       PARITY_IDENTITY.sessionId,
     )).resolves.toBeNull();
+    await expect(repo.getBySessionId(
+      OTHER_PARITY_IDENTITY.spaceId,
+      PARITY_IDENTITY.userId,
+      PARITY_IDENTITY.agentSource,
+      PARITY_IDENTITY.sessionId,
+    )).resolves.toBeNull();
+    await expect(repo.getBySessionId(
+      PARITY_IDENTITY.spaceId,
+      PARITY_IDENTITY.userId,
+      OTHER_PARITY_IDENTITY.agentSource,
+      PARITY_IDENTITY.sessionId,
+    )).resolves.toBeNull();
   });
 
   it("recovers the approved Team/Agent/Task binding without a remote service", async () => {

@@ -162,5 +162,19 @@ describe("memory parity: prewarm, cache, and context order", () => {
       PARITY_IDENTITY.sessionId,
       "memory",
     )).resolves.toBeNull();
+    await expect(cache.get(
+      "another-space",
+      PARITY_IDENTITY.userId,
+      PARITY_IDENTITY.agentSource,
+      PARITY_IDENTITY.sessionId,
+      "memory",
+    )).resolves.toBeNull();
+    await expect(cache.get(
+      PARITY_IDENTITY.spaceId,
+      PARITY_IDENTITY.userId,
+      "another-agent-source",
+      PARITY_IDENTITY.sessionId,
+      "memory",
+    )).resolves.toBeNull();
   });
 });

@@ -153,6 +153,23 @@ describe("memory parity: approved completed-round target", () => {
       inputMessages: fixture.messages,
       assistantMessage: fixture.assistantMessage,
       protocol: fixture.protocol,
+      assetCapabilities: {
+        skill: false,
+        llm_wiki: true,
+        code_graph: true,
+        chat_memory: true,
+      },
+    });
+    expect(requests).toHaveLength(0);
+
+    await triggerSkillExtractIfReady({
+      config,
+      sessionKey: PARITY_IDENTITY.sessionId,
+      agentSource: fixture.agentSource,
+      sessionInfo,
+      inputMessages: fixture.messages,
+      assistantMessage: fixture.assistantMessage,
+      protocol: fixture.protocol,
     });
 
     expect(requests).toHaveLength(1);
