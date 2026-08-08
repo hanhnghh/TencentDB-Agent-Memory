@@ -371,7 +371,18 @@ export interface AgentUpstreamEntry {
 }
 
 /** Top-level proxy configuration (merged from config file + CLI args). */
+export type RuntimeMode = "proxy" | "hooks" | "both";
+
+export interface RuntimeConfig {
+  mode: RuntimeMode;
+  hooks: {
+    host: string;
+    port: number;
+  };
+}
+
 export interface ProxyConfig {
+  runtime: RuntimeConfig;
   server: {
     host: string; // default: "0.0.0.0"
     port: number; // default: 8096
@@ -645,6 +656,13 @@ export interface CreditPricingConfig {
 
 /** Raw YAML config file shape (all fields optional). */
 export interface RawYamlConfig {
+  runtime?: {
+    mode?: RuntimeMode | string;
+    hooks?: {
+      host?: string;
+      port?: number;
+    };
+  };
   server?: {
     host?: string;
     port?: number;

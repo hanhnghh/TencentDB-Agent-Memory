@@ -2,11 +2,21 @@
 
 import { readFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
-import type { CostGuardConfig, ProxyConfig, RawYamlConfig } from "./types.js";
+import type {
+  CostGuardConfig,
+  ProxyConfig,
+  RawYamlConfig,
+  RuntimeMode,
+} from "./types.js";
+import { validateRuntimeConfig } from "./runtime/mode.js";
 
 const DEFAULT_UPSTREAM = "https://llm-upstream.example.com/v2/chat/completions";
 
 export const DEFAULT_CONFIG: ProxyConfig = {
+  runtime: {
+    mode: "proxy",
+    hooks: { host: "127.0.0.1", port: 8097 },
+  },
   server: { host: "0.0.0.0", port: 8096, forwardTimeoutMs: 600_000 },
   upstream: { url: DEFAULT_UPSTREAM, apiKey: "", agents: {} },
   log: {
@@ -179,6 +189,7 @@ export function loadYamlConfig(filePath: string): RawYamlConfig {
 /** CLI override options (all optional). */
 export interface CliOverrides {
   configFile?: string;
+  runtimeMode?: RuntimeMode;
   host?: string;
   port?: number;
   upstreamUrl?: string;
@@ -261,8 +272,16 @@ function parseUpstreamAgents(
 export function buildConfig(overrides: CliOverrides = {}): ProxyConfig {
   const configPath = overrides.configFile || "config.yaml";
   const yaml = loadYamlConfig(configPath);
+  const configuredRuntimeMode = parseConfiguredRuntimeMode(yaml.runtime?.mode);
 
-  return {
+  const config: ProxyConfig = {
+    runtime: {
+      mode: overrides.runtimeMode ?? configuredRuntimeMode ?? DEFAULT_CONFIG.runtime.mode,
+      hooks: {
+        host: yaml.runtime?.hooks?.host ?? DEFAULT_CONFIG.runtime.hooks.host,
+        port: yaml.runtime?.hooks?.port ?? DEFAULT_CONFIG.runtime.hooks.port,
+      },
+    },
     server: {
       host: overrides.host ?? yaml.server?.host ?? DEFAULT_CONFIG.server.host,
       port: overrides.port ?? yaml.server?.port ?? DEFAULT_CONFIG.server.port,
@@ -498,6 +517,13 @@ export function buildConfig(overrides: CliOverrides = {}): ProxyConfig {
         ?? DEFAULT_CONFIG.ccRequestRouting.enabled,
     },
   };
+  return validateRuntimeConfig(config);
+}
+
+function parseConfiguredRuntimeMode(value: unknown): RuntimeMode | undefined {
+  if (value === undefined) return undefined;
+  if (value === "proxy" || value === "hooks" || value === "both") return value;
+  throw new Error("runtime.mode must be one of: proxy, hooks, both");
 }
 
 /**
@@ -528,6 +554,13 @@ export function parseArgv(argv: string[]): CliOverrides {
     switch (arg) {
       case "--config":
         overrides.configFile = next;
+        i++;
+        break;
+      case "--mode":
+        if (next !== "proxy" && next !== "hooks" && next !== "both") {
+          throw new Error(`Invalid runtime mode: ${next ?? "(missing)"}`);
+        }
+        overrides.runtimeMode = next;
         i++;
         break;
       case "--host":

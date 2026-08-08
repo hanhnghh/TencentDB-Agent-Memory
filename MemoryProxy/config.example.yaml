@@ -19,6 +19,16 @@
 #   后可切到 ProxyStorage（COS/SQLite/FS/Memory）。详见 storage: 段。
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ── Runtime mode ──────────────────────────────────────────────────────────────
+# proxy (default): public LLM forwarding listener only
+# hooks:           local Codex hook sidecar only; upstream URL/key are unused
+# both:            both listeners sharing one memory runtime and durable store
+runtime:
+  mode: proxy
+  hooks:
+    host: 127.0.0.1       # loopback-only; non-loopback values are rejected
+    port: 8097            # must differ from server.port in both mode
+
 
 # ── 服务监听 ─────────────────────────────────────────────────────────────────
 server:

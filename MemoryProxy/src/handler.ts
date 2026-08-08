@@ -56,7 +56,7 @@ import {
   classifyMemoryRuntimePrepareError,
   sessionInfoFromRuntime,
 } from "./runtime/proxy-boundary.js";
-import type { ProxyMemoryRuntimeProvider } from "./runtime/proxy-production.js";
+import type { MemoryRuntimeProvider } from "./runtime/production.js";
 import { log } from "./report/log.js";
 
 /**
@@ -408,7 +408,7 @@ async function forwardWithRetry(
 export async function handleChatCompletions(
   c: Context,
   config: ProxyConfig,
-  memoryRuntimeProvider?: ProxyMemoryRuntimeProvider,
+  memoryRuntimeProvider?: MemoryRuntimeProvider,
 ): Promise<Response> {
   const startTime = new Date().toISOString();
   const traceId = uuidv7();

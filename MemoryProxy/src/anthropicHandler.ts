@@ -59,7 +59,7 @@ import {
   AnthropicStreamAccumulator,
   buildAnthropicCompletedRound,
 } from "./runtime/anthropic-adapter.js";
-import type { ProxyMemoryRuntimeProvider } from "./runtime/proxy-production.js";
+import type { MemoryRuntimeProvider } from "./runtime/production.js";
 import {
   classifyMemoryRuntimePrepareError,
   sessionInfoFromRuntime,
@@ -511,7 +511,7 @@ async function forwardWithRetry(
 export async function handleAnthropicMessages(
   c: Context,
   config: ProxyConfig,
-  memoryRuntimeProvider?: ProxyMemoryRuntimeProvider,
+  memoryRuntimeProvider?: MemoryRuntimeProvider,
 ): Promise<Response> {
   const startTime = new Date().toISOString();
   const traceId = uuidv7();

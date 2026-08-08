@@ -11,23 +11,35 @@ import { createInstanceDestroyHandler } from "./routes/instance-destroy.js";
 import { createRateLimitHandlers } from "./routes/rate-limits.js";
 import { hasCostGuardMarker } from "./routes/whitelist.js";
 import { tryActivateStorage, tryActivateRedis } from "./injection/index.js";
-import { getEffectiveBackend } from "./storage/factory.js";
 import type { ProxyConfig } from "./types.js";
 import type {
-  ProxyMemoryRuntimeProvider,
-} from "./runtime/proxy-production.js";
+  MemoryRuntimeProvider,
+} from "./runtime/production.js";
+import { RuntimeHealth } from "./runtime/health.js";
 
 export interface CreateAppOptions {
-  memoryRuntimeProvider?: ProxyMemoryRuntimeProvider;
+  memoryRuntimeProvider?: MemoryRuntimeProvider;
+  runtimeHealth?: RuntimeHealth;
 }
 
 export function createApp(config: ProxyConfig, options: CreateAppOptions = {}): Hono {
   const app = new Hono();
   const memoryRuntimeProvider = options.memoryRuntimeProvider;
+  const runtimeHealth = options.runtimeHealth ?? new RuntimeHealth(
+    config,
+    memoryRuntimeProvider,
+  );
+  if (!options.runtimeHealth) {
+    runtimeHealth.markListenerReady("proxy", config.server.host, config.server.port);
+  }
   const handleOpenAI = (c: Parameters<typeof handleChatCompletions>[0]) =>
     handleChatCompletions(c, config, memoryRuntimeProvider);
   const handleAnthropic = (c: Parameters<typeof handleAnthropicMessages>[0]) =>
     handleAnthropicMessages(c, config, memoryRuntimeProvider);
+
+  // Hook lifecycle traffic belongs exclusively to the loopback listener.
+  // Reserve the namespace before the public POST catch-all can forward it.
+  app.all("/hooks/*", (c) => c.json({ error: "not_found" }, 404));
 
   // Eagerly activate storage/bindingRepo so bridge-only requests (no main
   // /v1/messages hits yet) can still recover session state via L2 fallthrough
@@ -66,28 +78,8 @@ export function createApp(config: ProxyConfig, options: CreateAppOptions = {}): 
   // 的内存"这种数据一致性事故。sqlite 也算 process-local——多节点各自本地
   // 文件也是不共享的。见 docs/design/2026-07-13-proxy-multinode-state-audit.md P0-2。
   app.get("/health", async (c) => {
-    const eff = getEffectiveBackend();
-    const wantsShared = config.storage?.enabled && eff.requested === "cos";
-    const degraded = wantsShared && eff.effective !== eff.requested;
-    const body = {
-      status: degraded ? "degraded" : "ok",
-      version: "0.2.0",
-      upstream: config.upstream.url,
-      opik: config.opik.enabled ? config.opik.url : "disabled",
-      costGuard: config.costGuard.enabled ? "enabled" : "disabled",
-      rateLimit: config.rateLimit.tpm > 0 || config.rateLimit.qpm > 0 ? "enabled" : "disabled",
-      storage: {
-        enabled: !!config.storage?.enabled,
-        requested: eff.requested,
-        effective: eff.effective,
-        degraded,
-        ...(eff.error ? { lastError: eff.error } : {}),
-      },
-      ...(memoryRuntimeProvider?.health
-        ? { memoryRuntime: await memoryRuntimeProvider.health() }
-        : {}),
-    };
-    return c.json(body, degraded ? 503 : 200);
+    const body = await runtimeHealth.snapshot();
+    return c.json(body, body.durableStore.storage.degraded ? 503 : 200);
   });
 
   // Whoami: resolve API key → key ID (plain text, easy to use with curl)

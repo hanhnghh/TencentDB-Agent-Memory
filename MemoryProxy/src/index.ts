@@ -9,119 +9,25 @@ if (!process.version.startsWith("v22.")) {
   process.exit(1);
 }
 
-import { serve } from "@hono/node-server";
 import { buildConfig, parseArgv } from "./config.js";
-import { createApp } from "./server.js";
-import { setExtensionDebug, shutdownGuard } from "./guard-adapter.js";
-import { initLogger, shutdownLogger, log } from "./report/log.js";
-import { initClickHouse, shutdownClickHouse } from "./clickhouse.js";
-import { initLangfuse, shutdownLangfuse } from "./langfuse.js";
-import { initAuth } from "./auth.js";
-import { initSystemUsers } from "./systemUser.js";
-import { checkConnectivity } from "./connectivity.js";
-import { initProxyStorage, getEffectiveBackend } from "./storage/factory.js";
-import {
-  createProxyMemoryRuntime,
-  isProxyMemoryRuntimeRequired,
-} from "./runtime/proxy-production.js";
+import { log } from "./report/log.js";
+import { startRuntime } from "./runtime/startup.js";
 
 const overrides = parseArgv(process.argv);
 const config = buildConfig(overrides);
-
-// ── Initialize structured logging system ─────────────────────────────────────
-initLogger({
-  level: config.log.level === "debug" ? "debug" : "info",
-  filePath: config.log.file || "",
-  rotate: config.log.rotate,
-  backend: config.log.backend,
+const running = await startRuntime(config);
+const health = await running.health.snapshot();
+log.info("runtime.started", {
+  mode: health.mode,
+  proxyReady: health.listeners.proxy.ready,
+  hookReady: health.listeners.hooks.ready,
+  durableStoreReady: health.durableStore.ready,
 });
-
-// Enable extension debug logging if log.level === "debug"
-setExtensionDebug(config.log.level === "debug");
-
-// ── Initialize ClickHouse writer ─────────────────────────────────────────────
-initClickHouse(config.clickhouse);
-
-// ── Initialize Langfuse tracing (official SDK) ───────────────────────────────
-initLangfuse(config).catch((err: unknown) => {
-  log.warn("langfuse.init_error", { error: String(err) });
-});
-
-// ── Initialize auth client (user_key verification + user_id resolution) ──────
-initAuth(config.auth);
-
-// ── Register internal service accounts (bypass whole pipeline on match) ──────
-initSystemUsers(config.systemUsers);
-
-// ── Initialize ProxyStorage (dynamic import cost-guard for kernel-sts COS) ──
-// 必须 await —— dynamic import 是 async 的；不 await 直接进 createApp 会
-// 让首个 cos 请求 fallback 到 sqlite（backend 已经拿到但 _kernelStsFactory null）
-await initProxyStorage(config.storage);
-const effectiveStorage = getEffectiveBackend();
-if (config.storage.enabled && config.storage.backend === "cos" && effectiveStorage.effective !== "cos") {
-  log.warn("storage.degraded", {
-    requested: effectiveStorage.requested,
-    effective: effectiveStorage.effective,
-    reason: effectiveStorage.error,
-    note: "cost-guard submodule missing or shark unreachable — cos falling back",
-  });
-}
-
-const proxyMemoryRuntime = isProxyMemoryRuntimeRequired(config)
-  ? await createProxyMemoryRuntime(config)
-  : undefined;
-const app = createApp(config, {
-  memoryRuntimeProvider: proxyMemoryRuntime?.provider,
-});
-
-log.info("server.starting", {
-  host: config.server.host,
-  port: config.server.port,
-  upstream: config.upstream.url,
-  logFile: config.log.file || "(disabled)",
-  logLevel: config.log.level,
-  opik: config.opik.enabled ? config.opik.url : "disabled",
-  langfuse: config.langfuse.enabled ? config.langfuse.host : "disabled",
-  clickhouse: config.clickhouse.enabled ? config.clickhouse.url : "disabled",
-  costGuard: config.costGuard.enabled ? "enabled" : "disabled",
-  rateLimit: config.rateLimit.tpm > 0 || config.rateLimit.qpm > 0
-    ? `${config.rateLimit.tpm} TPM / ${config.rateLimit.qpm} QPM`
-    : "disabled",
-  sessionInit: config.sessionInit.enabled ? "enabled" : "disabled",
-  injection: config.injection.enabled ? config.injection.injectors.join(",") : "disabled",
-  tdai: config.tdai.enabled ? config.tdai.endpoint : "disabled",
-  coreSkill: config.coreSkill.serviceToken ? config.coreSkill.endpoint : "disabled",
-  skillRuntime: `allowLlmWrite=${config.skillRuntime.allowLlmWrite}`,
-  auth: config.auth.enabled ? config.auth.url : "disabled",
-  systemUsers: config.systemUsers.length > 0
-    ? config.systemUsers.map((u) => u.name || "unnamed").join(",")
-    : "disabled",
-});
-
-serve(
-  {
-    fetch: app.fetch,
-    hostname: config.server.host,
-    port: config.server.port,
-  },
-  ({ address, port }) => {
-    log.info("server.listening", { address, port });
-
-    // ── Startup connectivity check (fire-and-forget, never blocks) ───────
-    checkConnectivity(config).catch((err: unknown) => {
-      log.warn("connectivity.check_error", { error: String(err) });
-    });
-  },
-);
 
 // ── Graceful shutdown ────────────────────────────────────────────────────────
 async function gracefulShutdown(signal: "SIGTERM" | "SIGINT"): Promise<void> {
-  log.info("server.shutdown", { signal });
-  await shutdownGuard();
-  await proxyMemoryRuntime?.shutdown();
-  await shutdownLangfuse();
-  await shutdownClickHouse();
-  await shutdownLogger();
+  log.info("runtime.shutdown", { signal, mode: config.runtime.mode });
+  await running.stop();
   process.exit(0);
 }
 

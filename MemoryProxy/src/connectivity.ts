@@ -4,18 +4,24 @@
  */
 
 import { log } from "./report/log.js";
+import type { ConnectivityStatus } from "./runtime/health.js";
 import type { ProxyConfig } from "./types.js";
 
 const TIMEOUT = 5000;
 
-export async function checkConnectivity(config: ProxyConfig): Promise<void> {
-  const probes: Record<string, Promise<string>> = {};
+export async function checkConnectivity(
+  config: ProxyConfig,
+): Promise<Record<string, ConnectivityStatus>> {
+  const probes: Record<string, Promise<ConnectivityStatus>> = {};
+  const summary: Record<string, ConnectivityStatus> = {};
+  const forwardingEnabled = config.runtime.mode !== "hooks";
 
   // Upstream LLM
-  probes["upstream"] = probe(config.upstream.url);
+  if (forwardingEnabled) probes["upstream"] = probe(config.upstream.url);
+  else summary["upstream"] = "disabled";
 
   // ClickHouse
-  if (config.clickhouse.enabled && config.clickhouse.url) {
+  if (forwardingEnabled && config.clickhouse.enabled && config.clickhouse.url) {
     const ch = config.clickhouse;
     const headers: Record<string, string> = {};
     if (ch.user) headers["X-ClickHouse-User"] = ch.user;
@@ -29,32 +35,41 @@ export async function checkConnectivity(config: ProxyConfig): Promise<void> {
   }
 
   // Opik
-  if (config.opik.enabled && config.opik.url) {
+  if (forwardingEnabled && config.opik.enabled && config.opik.url) {
     probes["opik"] = probe(`${config.opik.url.replace(/\/+$/, "")}/is-alive/ping`);
   }
 
   // Langfuse
-  if (config.langfuse.enabled && config.langfuse.host) {
+  if (forwardingEnabled && config.langfuse.enabled && config.langfuse.host) {
     probes["langfuse"] = probe(`${config.langfuse.host.replace(/\/+$/, "")}/api/public/health`);
   }
 
   // Auth
-  if (config.auth.enabled && config.auth.url) {
+  if (forwardingEnabled && config.auth.enabled && config.auth.url) {
     probes["auth"] = probe(config.auth.url);
   }
 
   // Credit report
-  if (config.creditReport.url) {
+  if (forwardingEnabled && config.creditReport.url) {
     probes["creditReport"] = probe(config.creditReport.url);
+  } else summary["creditReport"] = "disabled";
+
+  if (config.coreSkill.endpoint && config.coreSkill.serviceToken) {
+    probes["memoryCore"] = probe(config.coreSkill.endpoint);
+  }
+  if (config.tdai.enabled && config.tdai.endpoint) {
+    probes["tdai"] = probe(config.tdai.endpoint);
+  }
+  if (config.knowledge.enabled && config.knowledge.endpoint) {
+    probes["knowledge"] = probe(config.knowledge.endpoint);
   }
 
   // Await all
-  const summary: Record<string, string> = {};
   let allOk = true;
   for (const [name, p] of Object.entries(probes)) {
     const result = await p;
     summary[name] = result;
-    if (!result.startsWith("ok")) allOk = false;
+    if (result === "failed") allOk = false;
   }
 
   if (allOk) {
@@ -62,26 +77,36 @@ export async function checkConnectivity(config: ProxyConfig): Promise<void> {
   } else {
     log.warn("connectivity.check", { result: "some_failed", ...summary });
   }
+  return summary;
 }
 
-/** Probe an HTTP endpoint. Returns "ok (Xms)" or "FAIL: reason". */
-async function probe(url: string, headers?: Record<string, string>): Promise<string> {
-  const start = Date.now();
+/** Probe an HTTP endpoint without exposing its URL or failure detail. */
+async function probe(
+  url: string,
+  headers?: Record<string, string>,
+): Promise<ConnectivityStatus> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TIMEOUT);
   try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), TIMEOUT);
-    const resp = await fetch(url, { method: "GET", signal: ctrl.signal, headers, redirect: "follow" });
-    clearTimeout(t);
+    const resp = await fetch(url, {
+      method: "GET",
+      signal: ctrl.signal,
+      headers,
+      redirect: "follow",
+    });
     await resp.text().catch(() => {});
-    return `ok (${Date.now() - start}ms)`;
-  } catch (err: unknown) {
-    return `FAIL: ${err instanceof Error ? err.message : String(err)}`;
+    return resp.ok ? "ok" : "failed";
+  } catch {
+    return "failed";
+  } finally {
+    clearTimeout(timer);
   }
 }
 
 /** Probe Redis with PING. */
-async function probeRedis(cfg: ProxyConfig["redis"]): Promise<string> {
-  const start = Date.now();
+async function probeRedis(
+  cfg: ProxyConfig["redis"],
+): Promise<ConnectivityStatus> {
   try {
     const { default: Redis } = await import("ioredis");
     const client = cfg.url
@@ -90,8 +115,8 @@ async function probeRedis(cfg: ProxyConfig["redis"]): Promise<string> {
     await client.connect();
     await client.ping();
     await client.quit();
-    return `ok (${Date.now() - start}ms)`;
-  } catch (err: unknown) {
-    return `FAIL: ${err instanceof Error ? err.message : String(err)}`;
+    return "ok";
+  } catch {
+    return "failed";
   }
 }

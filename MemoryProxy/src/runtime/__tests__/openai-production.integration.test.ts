@@ -19,9 +19,9 @@ import {
 } from "../../__tests__/memory-parity/fixtures.js";
 import { parseRequestBody } from "../../__tests__/memory-parity/test-support.js";
 import {
-  createProxyMemoryRuntime,
+  createMemoryRuntime,
   isProxyMemoryRuntimeRequired,
-} from "../proxy-production.js";
+} from "../production.js";
 
 const roots: string[] = [];
 const previousOutboxPath = process.env.PROXY_OUTBOX_PATH;
@@ -140,7 +140,7 @@ describe("proxy production MemoryRuntime", () => {
       throw new Error(`unexpected fixture URL: ${url}`);
     }));
 
-    const managed = await createProxyMemoryRuntime(config);
+    const managed = await createMemoryRuntime(config);
     try {
       const runtime = managed.provider.forRequest({ userKey: "client-user-key" });
       await expect(runtime.prepareContext({
