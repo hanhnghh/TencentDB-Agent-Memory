@@ -87,12 +87,15 @@ export class V3HttpTransport {
         );
       }
 
-      if (!isRecord(parsed) || typeof parsed.code !== "number") {
+      if (!isRecord(parsed)) {
+        throw new TDAMResponseError("API response must be an envelope with a numeric code", headerRequestId);
+      }
+      const businessCode = parsed.code;
+      if (typeof businessCode !== "number") {
         throw new TDAMResponseError("API response must be an envelope with a numeric code", headerRequestId);
       }
       const envelope = parsed;
 
-      const businessCode = envelope.code;
       if (!response.ok || businessCode !== 0) {
         const code = businessCode && businessCode !== 0 ? businessCode : response.status;
         const details =
