@@ -6,11 +6,11 @@
 //                               listing unblocked issues with branch names.
 //   Phase 2 (Execute + Review): For each issue, a sandbox is created via
 //                               createSandbox(). The implementer runs first
-//                               (up to 12 iterations). If it produces commits,
-//                               a reviewer runs in the same sandbox on the same
-//                               branch (up to 2 iterations). This repository
-//                               deliberately runs one issue at a time while its
-//                               shared memory contracts are being established.
+//                               (up to 12 iterations). Any branch ahead of base
+//                               then receives independent specification and
+//                               standards reviews. This repository deliberately
+//                               runs one issue at a time while its shared memory
+//                               contracts are being established.
 //   Phase 3 (Merge):            A single agent merges all completed branches
 //                               into the current branch.
 //
@@ -32,6 +32,11 @@ import {
   writeFileSync,
 } from "node:fs";
 import { z } from "zod";
+import {
+  classifyIssueRun,
+  shouldReviewBranch,
+  type IssueRunDisposition,
+} from "./workflow-policy.mts";
 
 // The planner emits its plan as JSON inside <plan> tags; Output.object extracts
 // and validates it against this schema. We use Zod here, but any Standard
@@ -85,6 +90,15 @@ const BASE_BRANCH = execFileSync("git", ["branch", "--show-current"], {
 
 if (!BASE_BRANCH) {
   throw new Error("Sandcastle requires a named Git branch, not detached HEAD.");
+}
+
+function branchIsAheadBase(branch: string): boolean {
+  const count = execFileSync(
+    "git",
+    ["rev-list", "--count", `${BASE_BRANCH}..${branch}`],
+    { encoding: "utf8" },
+  ).trim();
+  return Number.parseInt(count, 10) > 0;
 }
 
 // Fail fast when either subscription authentication or GitHub authentication
@@ -231,8 +245,9 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   // Phase 2: Execute + Review
   //
   // For each issue, create a sandbox via createSandbox() so the implementer
-  // and reviewer share the same sandbox instance per branch. The implementer
-  // runs first; if it produces commits, the reviewer runs in the same sandbox.
+  // and independent reviewers share the same sandbox instance per branch.
+  // Existing ahead-of-base branches are reviewed even when the resumed
+  // implementer creates no new commit.
   //
   // Promise.allSettled means one failing pipeline doesn't cancel the others.
   // -------------------------------------------------------------------------
@@ -259,13 +274,16 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
           },
         });
 
-        // Only review if the implementer produced commits
-        if (implement.commits.length > 0) {
-          const review = await sandbox.run({
-            name: "reviewer",
-            maxIterations: 2,
+        const branchAheadAfterImplement = branchIsAheadBase(issue.branch);
+        if (shouldReviewBranch({
+          branchAheadBase: branchAheadAfterImplement,
+          implementCommitCount: implement.commits.length,
+        })) {
+          const specReview = await sandbox.run({
+            name: "spec-reviewer",
+            maxIterations: 3,
             agent: codexAgent("high"),
-            promptFile: "./.sandcastle/review-prompt.md",
+            promptFile: "./.sandcastle/spec-review-prompt.md",
             promptArgs: {
               BRANCH: issue.branch,
               TASK_ID: issue.id,
@@ -273,16 +291,49 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
               BASE_BRANCH,
             },
           });
-
-          // A branch is mergeable only after its reviewer emits the completion
-          // signal, which means the required feedback gate is green.
+          const standardsReview = await sandbox.run({
+            name: "standards-reviewer",
+            maxIterations: 2,
+            agent: codexAgent("high"),
+            promptFile: "./.sandcastle/standards-review-prompt.md",
+            promptArgs: {
+              BRANCH: issue.branch,
+              TASK_ID: issue.id,
+              ISSUE_TITLE: issue.title,
+              BASE_BRANCH,
+            },
+          });
+          const commits = [
+            ...implement.commits,
+            ...specReview.commits,
+            ...standardsReview.commits,
+          ];
+          const branchAheadBase = branchIsAheadBase(issue.branch);
+          const disposition = classifyIssueRun({
+            branchAheadBase,
+            specReviewComplete: specReview.completionSignal !== undefined,
+            standardsReviewComplete:
+              standardsReview.completionSignal !== undefined,
+            newCommitCount: commits.length,
+          });
           return {
-            commits: [...implement.commits, ...review.commits],
-            verified: review.completionSignal !== undefined,
+            commits,
+            branchAheadBase,
+            disposition,
           };
         }
 
-        return { commits: implement.commits, verified: false };
+        const disposition: IssueRunDisposition = classifyIssueRun({
+          branchAheadBase: branchAheadAfterImplement,
+          specReviewComplete: false,
+          standardsReviewComplete: false,
+          newCommitCount: implement.commits.length,
+        });
+        return {
+          commits: implement.commits,
+          branchAheadBase: branchAheadAfterImplement,
+          disposition,
+        };
       } finally {
         await sandbox.close();
       }
@@ -298,15 +349,16 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     }
   }
 
-  // Only pass branches with commits and a green reviewer completion signal to
-  // the merge phase.
+  // Merge requires an existing branch diff plus independent green spec and
+  // standards gates. Current-run commit count is intentionally not required:
+  // resumed branches may already contain all implementation commits.
   const completedIssues = settled
     .map((outcome, i) => ({ outcome, issue: issues[i]! }))
     .filter(
       (entry) =>
         entry.outcome.status === "fulfilled" &&
-        entry.outcome.value.verified &&
-        entry.outcome.value.commits.length > 0,
+        entry.outcome.value.disposition === "merge" &&
+        entry.outcome.value.branchAheadBase,
     )
     .map((entry) => entry.issue);
 
@@ -320,6 +372,15 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   }
 
   if (completedBranches.length === 0) {
+    const madeRetryableProgress = settled.some(
+      (outcome) =>
+        outcome.status === "fulfilled"
+        && outcome.value.disposition === "retry",
+    );
+    if (madeRetryableProgress) {
+      console.log("Review corrections were committed; planning another iteration.");
+      continue;
+    }
     console.log("No reviewed branch passed its feedback gate.");
     break;
   }

@@ -91,6 +91,8 @@ These standards guide review across a multi-package repository. Apply the rules 
 
 Run validation from every changed package; the repository root is not a substitute for module-local checks.
 
+- `.sandcastle` orchestration: run `node --test .sandcastle/workflow-policy.test.mts`, then `npx tsc -p .sandcastle/tsconfig.json`. Resume/review policy changes must include a regression for branches that are already ahead of base but create no new commit in the current agent invocation.
+
 - `MemoryCore`: run the relevant Vitest suite and `npm run build:plugin` when runtime exports change. Run `npm run lint:skill-isolation` for skill/core changes. The aggregate `npm run build` is not an authoritative gate while the unchanged repository is missing `scripts/seed-v2/tsconfig.json`; do not rerun it to re-establish that baseline.
 - `MemoryProxy`: run the focused Vitest suite, then `npm test`. From the repository root run `/home/agent/check-memory-proxy-types.sh`; it accepts only the six documented baseline diagnostics and fails on every new TypeScript diagnostic. Do not replace it with raw `npx tsc --noEmit` during implementation or review.
 - `MemoryKnowledge`: run `npm run typecheck`, `npm test`, and build checks for exported/server changes.

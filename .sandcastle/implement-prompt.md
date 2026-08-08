@@ -10,6 +10,13 @@ gh issue view {{TASK_ID}} --json number,title,body,labels,comments
 
 If the body references a parent PRD, load that issue too. The ticket defines scope; the PRD defines the wider contract. Work on this ticket only.
 
+Before editing, expand the issue and relevant PRD validation decisions into an
+atomic requirement matrix. Include every acceptance criterion and every named
+scenario or edge case; do not replace an explicit list with one representative
+example. Give each row a stable ID and identify the public seam where it can be
+observed. A green suite proves only the tests that exist, so an unmapped row
+keeps the completion gate red.
+
 # Required context
 
 Read `/home/agent/CODING_STANDARDS.md` completely before editing. It is a read-only mount from the integration branch, so existing issue branches receive the current standards without rebasing. Inspect the relevant package manifests, existing tests, and the last ten commits. Preserve unrelated working-tree changes.
@@ -39,6 +46,8 @@ Run commands from each changed package. The authoritative command matrix and sec
 
 Before committing:
 
+- every requirement-matrix row names an executable test, or is marked
+  `not-applicable` with a contract-based reason;
 - every changed behavior has focused regression evidence;
 - every required module-local test, type-check, build, isolation guard, or shell check is green;
 - parity-sensitive changes compare old proxy behavior with the extracted/shared path;
@@ -59,3 +68,11 @@ Use the commit body for the issue/PRD reference and important design decisions w
 If genuinely blocked, leave a concise GitHub comment containing completed work, the exact blocker, and failing command/output summary. Leave the issue open.
 
 Emit `<promise>COMPLETE</promise>` only after the ticket acceptance criteria and completion gate are satisfied. Do not close the issue; the verified merge phase owns closure.
+
+Immediately before the promise, print the final evidence matrix with these
+columns: `ID | source | requirement | public seam | test name | command |
+status`. For characterization work, distinguish observed legacy behavior from
+approved target behavior. Exercise approved-but-not-yet-implemented behavior
+as an explicit expected-failure test at the real boundary; do not use a
+tautological local array/constant comparison and do not silently bless a known
+legacy bug as the future contract.
