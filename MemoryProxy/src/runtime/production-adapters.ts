@@ -252,13 +252,15 @@ export class HookCacheContextAdapter implements RuntimeContextAdapter {
       prewarmed = [...prewarmResult.cachedHookIds];
       degraded.push(...prewarmResult.skipped.map((entry) => `prewarm:${entry.hookId}:skipped`));
       entries = prewarmResult.entries;
-      this.options.cacheRepo.putMany(
-        binding.identity.serviceId,
-        binding.identity.userId,
-        binding.identity.agentSource,
-        scopedCacheKey,
-        entries,
-      );
+      if (!request.readOnly) {
+        this.options.cacheRepo.putMany(
+          binding.identity.serviceId,
+          binding.identity.userId,
+          binding.identity.agentSource,
+          scopedCacheKey,
+          entries,
+        );
+      }
     }
     const prewarmOrder = new Map(
       prewarmed.map((hookId, index) => [hookId, index]),

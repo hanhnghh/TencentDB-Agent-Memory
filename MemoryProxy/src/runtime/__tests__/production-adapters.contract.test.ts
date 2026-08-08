@@ -25,6 +25,55 @@ import {
 } from "../../__tests__/memory-parity/fixtures.js";
 
 describe("MemoryRuntime production adapters", () => {
+  it("returns fresh fork context without self-healing the shared cache", async () => {
+    const putMany = vi.fn();
+    const prewarm = vi.fn(async () => ({
+      cachedHookIds: ["tdai-profile-memory-injector"],
+      entries: [{
+        hookId: "tdai-profile-memory-injector",
+        blocks: [{ type: "text" as const, content: "fresh read-only context" }],
+      }],
+      skipped: [],
+      durationMs: 1,
+    }));
+    const adapter = new HookCacheContextAdapter({
+      cacheRepo: {
+        put: vi.fn(),
+        putMany,
+        get: vi.fn(async () => null),
+        getAllForSession: vi.fn(async () => []),
+        clearBySession: vi.fn(),
+      },
+      prewarm,
+    });
+
+    const result = await adapter.prepareContext({
+      binding: {
+        identity: {
+          serviceId: PARITY_IDENTITY.spaceId,
+          teamId: PARITY_IDENTITY.teamId,
+          userId: PARITY_IDENTITY.userId,
+          agentId: PARITY_IDENTITY.agentId,
+          taskId: PARITY_IDENTITY.taskId,
+          agentSource: PARITY_IDENTITY.agentSource,
+          sessionId: PARITY_IDENTITY.sessionId,
+        },
+        agent: PARITY_AGENT,
+        task: PARITY_TASK,
+        sessionInfo: PARITY_SESSION_INFO,
+        resolution: "cached",
+      },
+      capabilities: { skill: true, llmWiki: true, codeGraph: true, chatMemory: true },
+      readOnly: true,
+    });
+
+    expect(result.blocks).toEqual([
+      expect.objectContaining({ kind: "memory", content: "fresh read-only context" }),
+    ]);
+    expect(prewarm).toHaveBeenCalledOnce();
+    expect(putMany).not.toHaveBeenCalled();
+  });
+
   it("prepareContext uses the same public contract with session, HTTP, and hook-cache adapters", async () => {
     const runtimeIdentity = {
       serviceId: PARITY_IDENTITY.spaceId,

@@ -59,6 +59,8 @@ export interface RuntimeContextDiagnostics {
 
 export interface PrepareContextInput {
   identity: RuntimeIdentity;
+  /** Resolve fresh context without persisting cache repairs (fork/read-only requests). */
+  readOnly?: boolean;
 }
 
 export interface PrepareContextResult {
@@ -84,6 +86,7 @@ export type RuntimeAuthorizationDecision =
 export interface RuntimeContextRequest {
   binding: ResolvedRuntimeBinding;
   capabilities: RuntimeCapabilityFlags;
+  readOnly?: boolean;
 }
 
 export interface RuntimeContextPreparation {
@@ -155,6 +158,13 @@ export class MemoryRuntimeBindingError extends Error {
   }
 }
 
+export class MemoryRuntimeContextError extends Error {
+  constructor(readonly cause: unknown) {
+    super(`Memory runtime context preparation failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = "MemoryRuntimeContextError";
+  }
+}
+
 export class MemoryRuntime implements MemoryRuntimeContract {
   constructor(private readonly adapters: MemoryRuntimeAdapters) {}
 
@@ -164,7 +174,17 @@ export class MemoryRuntime implements MemoryRuntimeContract {
     validateResolvedBinding(identity, binding);
     await this.authorize(binding.identity, "read");
     const capabilities = await this.adapters.resolveCapabilities(binding.identity);
-    const context = await this.adapters.prepareContext({ binding, capabilities });
+    let context: RuntimeContextPreparation;
+    try {
+      context = await this.adapters.prepareContext({
+        binding,
+        capabilities,
+        readOnly: input.readOnly,
+      });
+    } catch (error: unknown) {
+      if (error instanceof MemoryRuntimeContextError) throw error;
+      throw new MemoryRuntimeContextError(error);
+    }
 
     return {
       session: {

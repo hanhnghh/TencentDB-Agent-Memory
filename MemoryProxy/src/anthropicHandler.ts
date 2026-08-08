@@ -58,6 +58,18 @@ import {
   canonicalizeAgentSource,
   createSessionNamespace,
 } from "./agent-sources.js";
+import {
+  MemoryRuntimeAuthorizationError,
+  MemoryRuntimeBindingError,
+  MemoryRuntimeContextError,
+  type MemoryRuntimeContract,
+  type PrepareContextResult,
+} from "./runtime/index.js";
+import {
+  AnthropicStreamAccumulator,
+  buildAnthropicCompletedRound,
+} from "./runtime/anthropic-adapter.js";
+import type { ProxyMemoryRuntimeProvider } from "./runtime/proxy-production.js";
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -526,6 +538,7 @@ async function forwardWithRetry(
 export async function handleAnthropicMessages(
   c: Context,
   config: ProxyConfig,
+  memoryRuntimeProvider?: ProxyMemoryRuntimeProvider,
 ): Promise<Response> {
   const startTime = new Date().toISOString();
   const traceId = uuidv7();
@@ -535,7 +548,8 @@ export async function handleAnthropicMessages(
   // parsing or the alias-gate. `earlyVerify.userId` is reused later for
   // both the systemUser short-circuit and the normal pipeline.
   const earlyApiKey = extractApiKey(c);
-  const earlySpaceId = extractSpaceIdFromPath(c.req.path) ?? "";
+  const extractedSpaceId = extractSpaceIdFromPath(c.req.path) ?? "";
+  const earlySpaceId = extractedSpaceId === "v1" ? "" : extractedSpaceId;
   const earlyVerify = await verifyUserKey(earlyApiKey, earlySpaceId);
   if (earlyVerify.rejected) {
     return c.json({ type: "error", error: { type: "authentication_error", message: `Authentication failed: ${earlyVerify.rejectReason ?? "unknown"}` } }, 401);
@@ -664,6 +678,11 @@ export async function handleAnthropicMessages(
 
   // sk-mem key（用于 TDAI ACL / MetadataClient 的 x-tdai-user-key）就是入口的 apiKey。
   const callerUserKey = apiKey || null;
+  const runtimeServiceId = spaceId || config.tdai.serviceId;
+  const memoryRuntime = requestKind === "sidequery"
+    ? undefined
+    : memoryRuntimeProvider?.forRequest({ userKey: apiKey });
+  let runtimePrepared: PrepareContextResult | null = null;
 
   // Activate Redis storage early — must run BEFORE session init.
   if (config.redis?.enabled) {
@@ -675,6 +694,7 @@ export async function handleAnthropicMessages(
   let sessionInfo: Record<string, unknown> | null | undefined;
   let assetCapabilities: import("./injection/types.js").AssetCapabilityFlags | undefined;
   let injectedSkipped = !conversationId;
+  let sessionExplicitlyBypassed = false;
   let sessionJustRegistered = false;
   console.log(`[injection-debug] conversationId=${conversationId} sessionKey=${sessionKey} userId=${userId} agentSource=${agentSource} sessionInitEnabled=${config.sessionInit?.enabled} injectionEnabled=${config.injection?.enabled} injectors=${JSON.stringify(config.injection?.injectors)} injectedSkipped=${injectedSkipped}`);
   // CC 分流：SIDEQUERY 完全跳过 session-init（独立小请求无对话概念）。
@@ -785,11 +805,12 @@ export async function handleAnthropicMessages(
       // 第一条 user，把用户最开始的 mem:help 当"未消化的命令"每 turn 重复执行。
       if (wentThroughSessionInitStateMachine && initResult.justRegistered) sessionJustRegistered = true;
       if (initResult.bypassed) {
+        sessionExplicitlyBypassed = true;
         injectedSkipped = true;
         console.log(`[session-init] session=${sessionKey} bypassed → skipping all injection`);
       }
 
-      if (!initResult.bypassed && initResult.sessionInfo) {
+      if (!memoryRuntime && !initResult.bypassed && initResult.sessionInfo) {
         try {
           const { fetchAssetCapabilities } = await import("./tdai/capabilities.js");
           assetCapabilities = await fetchAssetCapabilities({
@@ -812,6 +833,7 @@ export async function handleAnthropicMessages(
       // ran before the cache was populated, silently injecting zero
       // blocks for the entire first turn.
       if (
+        !memoryRuntime &&
         !initResult.bypassed &&
         initResult.justRegistered &&
         initResult.sessionInfo &&
@@ -870,8 +892,70 @@ export async function handleAnthropicMessages(
     }
   }
 
+  // Freeze the real transport conversation before runtime injection so
+  // generated memory context can never be recaptured during write-back.
+  const memoryCaptureMessages = messages;
+
+  if (memoryRuntime && conversationId && !sessionExplicitlyBypassed && runtimeServiceId && userId) {
+    try {
+      runtimePrepared = await memoryRuntime.prepareContext({
+        identity: { serviceId: runtimeServiceId, userId, agentSource, sessionId: sessionKey },
+        readOnly: requestKind === "fork",
+      });
+      assetCapabilities = {
+        skill: runtimePrepared.capabilities.skill.enabled,
+        llm_wiki: runtimePrepared.capabilities.knowledge.wiki.enabled,
+        code_graph: runtimePrepared.capabilities.knowledge.codeGraph.enabled,
+        chat_memory: runtimePrepared.capabilities.memory.enabled,
+      };
+      sessionInfo ??= sessionInfoFromRuntime(runtimePrepared);
+      injectedSkipped = false;
+      if (config.injection?.enabled && config.injection.injectors.length > 0) {
+        const { getInjectionPipeline } = await import("./injection/index.js");
+        body = await getInjectionPipeline(config).applyPrepared(body, {
+          protocol: "anthropic",
+          traceId,
+          keyId,
+          modelId: modelId as string,
+          stream: isStream,
+          agentSource,
+          userId: userId || "anonymous",
+          spaceId,
+          sessionKey,
+          turnSeq: countHumanTurns(messages, "anthropic"),
+          requestPath: c.req.path,
+          readOnly: requestKind === "fork",
+          custom: { session: sessionInfo, userKey: callerUserKey ?? undefined, assetCapabilities },
+        }, runtimePrepared.blocks);
+        messages = Array.isArray(body.messages) ? body.messages : messages;
+        hasTools = Array.isArray(body.tools) && body.tools.length > 0;
+      }
+    } catch (err: unknown) {
+      if (!(err instanceof MemoryRuntimeContextError)) {
+        const errorType = err instanceof MemoryRuntimeAuthorizationError ||
+            err instanceof MemoryRuntimeBindingError
+          ? err.name
+          : "MemoryRuntimeSecurityError";
+        console.warn(`[memory-runtime] Anthropic access denied: ${errorType}`);
+        return c.json({
+          type: "error",
+          error: { type: "permission_error", message: "Memory access denied" },
+        }, 403);
+      }
+      console.warn(
+        "[memory-runtime] Anthropic prepare skipped:",
+        err instanceof Error ? err.message : String(err),
+      );
+      runtimePrepared = null;
+    }
+  }
+  const memoryRuntimeWriteEnabled = Boolean(
+    memoryRuntime && requestKind === "main" && conversationId &&
+    !sessionExplicitlyBypassed && runtimeServiceId && userId,
+  );
+
   // ── mem: command intercept ────────────────────────────────────────────────
-  // 在 session init 完成后、injection pipeline 之前检测。
+  // 在 session/runtime context 准备完成后检测。
   // 命中时：执行命令 → 写 L0 → 触发 skill extract → 伪造响应返回。
   // 跳过注入（不破坏 KV cache）和上游转发（零 token 消耗）。
   // 配置开关 memCommand.enabled 关闭时此段完全不执行，走原有链路。
@@ -934,7 +1018,7 @@ export async function handleAnthropicMessages(
         sessionKey,
         userKey: callerUserKey,
       });
-      if (tdaiClientForMem && tdaiIdentityForMem && isExtractionAllowed(config, "tdai-memory")) {
+      if (!memoryRuntime && tdaiClientForMem && tdaiIdentityForMem && isExtractionAllowed(config, "tdai-memory")) {
         const userMsg = { role: "user" as const, content: memCmd.rawMessage };
         try {
           await recordTdaiTurn(tdaiClientForMem, tdaiIdentityForMem, userMsg, memResult.messageText);
@@ -950,7 +1034,7 @@ export async function handleAnthropicMessages(
       //        与主对话链路对齐。
       //   Bug: fire-and-forget 没 await 导致响应先返回、写入被中断。改成同步 await
       //        保证 buffer 落盘再返回响应。
-      if (isExtractionAllowed(config, "skill")) {
+      if (!memoryRuntime && isExtractionAllowed(config, "skill")) {
         try {
           const assistantMsg = { role: "assistant", content: [{ type: "text", text: memResult.messageText }] };
           await triggerSkillExtractIfReady({
@@ -966,6 +1050,22 @@ export async function handleAnthropicMessages(
         } catch (err: unknown) {
           console.warn("[mem-command] skill extract trigger error:", err instanceof Error ? err.message : String(err));
         }
+      }
+
+      if (memoryRuntime && memoryRuntimeWriteEnabled) {
+        await commitAnthropicCompletedRound({
+          runtime: memoryRuntime,
+          identity: { serviceId: runtimeServiceId, userId, agentSource, sessionId: sessionKey },
+          turnSequence: countHumanTurns(messages, "anthropic") || 1,
+          inputMessages: [{
+            role: "user",
+            content: [{ type: "text", text: memCmd.rawMessage }],
+          }],
+          assistantMessage: {
+            role: "assistant",
+            content: [{ type: "text", text: memResult.messageText }],
+          },
+        });
       }
 
       // Step 18: observability
@@ -992,7 +1092,7 @@ export async function handleAnthropicMessages(
   //   - FORK: 走 pipeline 但 readOnly=true（miss 时不 self-heal 写 cache，避免破坏主对话 cache）
   //   - MAIN: 走完整 pipeline（含 self-heal）
   const skipInjection = requestKind === "sidequery";
-  if (!injectedSkipped && !skipInjection && config.injection?.enabled && config.injection.injectors.length > 0) {
+  if (!memoryRuntime && !injectedSkipped && !skipInjection && config.injection?.enabled && config.injection.injectors.length > 0) {
     try {
       console.log(`[injection-debug] entering injection pipeline session=${sessionKey} turnSeq=${countHumanTurns(messages, "anthropic")} injectors=${config.injection.injectors} kind=${requestKind}`);
       const injectionTurnSeq = countHumanTurns(messages, "anthropic");
@@ -1266,8 +1366,10 @@ export async function handleAnthropicMessages(
     const [rawClientStream, tapStream] = upstreamResp.body.tee();
     pipe.streamStart();
 
-    // Background: consume tap stream for Anthropic SSE → extract usage
-    consumeAnthropicStream(tapStream, {
+    // The tap owns finalization so a client disconnect cannot drop a completed
+    // round. The client branch waits only at its terminal flush so durable
+    // enqueue errors are still observable by a fully consuming client.
+    const streamCompletion = consumeAnthropicStream(tapStream, {
       config,
       modelId: effectiveModel,
       keyId,
@@ -1295,9 +1397,26 @@ export async function handleAnthropicMessages(
       requestKind,
       langfuseDebug,
       debugMetadata,
+      memoryRuntime,
+      runtimeCommit: memoryRuntime && memoryRuntimeWriteEnabled
+        ? {
+            runtime: memoryRuntime,
+            identity: {
+              serviceId: runtimeServiceId,
+              userId,
+              agentSource,
+              sessionId: sessionKey,
+            },
+            turnSequence: lf.turnSeq,
+            inputMessages: memoryCaptureMessages,
+          }
+        : undefined,
     });
 
-    const clientStream = rawClientStream.pipeThrough(createSseThinkingFixStream(pipe));
+    const fixedClientStream = rawClientStream.pipeThrough(createSseThinkingFixStream(pipe));
+    const clientStream = memoryRuntime && memoryRuntimeWriteEnabled
+      ? fixedClientStream.pipeThrough(createCompletionBarrierStream(streamCompletion, pipe))
+      : fixedClientStream;
 
     return new Response(clientStream, { status: upstreamResp.status, headers: respHeaders });
   }
@@ -1442,7 +1561,7 @@ export async function handleAnthropicMessages(
 
   // Skill extract trigger — count tool_use blocks + buffer conversation.
   // 同步 await：直到 store 落盘再继续，保证下一轮跨节点读到最新数据。
-  if (isMainDialog && isExtractionAllowed(config, "skill")) {
+  if (!memoryRuntime && isMainDialog && isExtractionAllowed(config, "skill")) {
     await triggerSkillExtractIfReady({
       config,
       sessionKey,
@@ -1454,9 +1573,9 @@ export async function handleAnthropicMessages(
       assetCapabilities,
       turnSequence: lf.turnSeq,
     });
-  } else if (isMainDialog) {
+  } else if (!memoryRuntime && isMainDialog) {
     logExtractionSkipped(config, "skill", sessionKey);
-  } else {
+  } else if (!isMainDialog) {
     console.log(`[cc-routing] skip skill buffer for kind=${requestKind} session=${sessionKey}`);
   }
 
@@ -1466,7 +1585,7 @@ export async function handleAnthropicMessages(
   // 短期记忆。**此前仅 stream=true 会写**，non-stream 请求（如工具/测试脚本
   // 常用的 stream:false）沉默丢失。缺失该调用意味着 CC non-stream 场景
   // 完全没有 L0 记忆写入。
-  if (isMainDialog && tdaiClient && isExtractionAllowed(config, "tdai-memory")) {
+  if (!memoryRuntime && isMainDialog && tdaiClient && isExtractionAllowed(config, "tdai-memory")) {
     await withL0SessionOrdering({
       serviceId: config.tdai.serviceId || "default",
       teamId: tdaiIdentity?.teamId ?? "",
@@ -1482,7 +1601,7 @@ export async function handleAnthropicMessages(
       outputContent,
       { sourceEventId: `proxy:${agentSource}:${sessionKey}:turn:${lf.turnSeq}` },
     ))).catch((err: unknown) => pipe.error("TDAI_L0", err));
-  } else if (isMainDialog && tdaiClient) {
+  } else if (!memoryRuntime && isMainDialog && tdaiClient) {
     logExtractionSkipped(config, "tdai-memory", sessionKey);
   } else if (!isMainDialog) {
     console.log(`[cc-routing] skip L0 write for kind=${requestKind} session=${sessionKey}`);
@@ -1523,7 +1642,67 @@ export async function handleAnthropicMessages(
     );
   }
 
+  if (memoryRuntime && memoryRuntimeWriteEnabled) {
+    await commitAnthropicCompletedRound({
+      runtime: memoryRuntime,
+      identity: { serviceId: runtimeServiceId, userId, agentSource, sessionId: sessionKey },
+      turnSequence: lf.turnSeq,
+      inputMessages: memoryCaptureMessages,
+      assistantMessage,
+    });
+  }
+
   return new Response(respText, { status: upstreamResp.status, headers: respHeaders });
+}
+
+async function commitAnthropicCompletedRound(input: {
+  runtime: MemoryRuntimeContract;
+  identity: {
+    serviceId: string;
+    userId: string;
+    agentSource: string;
+    sessionId: string;
+  };
+  turnSequence: number;
+  inputMessages: unknown[];
+  assistantMessage: Record<string, unknown> | null;
+  toolCallCountOverride?: number;
+}): Promise<void> {
+  const completedRound = buildAnthropicCompletedRound(input);
+  if (!completedRound) return;
+  await input.runtime.commitCompletedRound(completedRound);
+}
+
+function sessionInfoFromRuntime(prepared: PrepareContextResult): Record<string, unknown> {
+  const identity = prepared.session.identity;
+  return {
+    session_id: identity.sessionId,
+    space_id: identity.serviceId,
+    user_id: identity.userId,
+    team_id: identity.teamId,
+    agent_id: identity.agentId,
+    task_id: identity.taskId,
+    identity_verified: true,
+  };
+}
+
+function createCompletionBarrierStream(
+  completion: Promise<void>,
+  pipe: ReturnType<typeof createPipeline>,
+): TransformStream<Uint8Array, Uint8Array> {
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      controller.enqueue(chunk);
+    },
+    async flush() {
+      try {
+        await completion;
+      } catch (error: unknown) {
+        pipe.error("MEMORY_RUNTIME", error);
+        throw error;
+      }
+    },
+  });
 }
 
 
@@ -1666,27 +1845,38 @@ interface AnthropicTapContext {
   langfuseDebug: boolean;
   /** buildRequestDebugMetadata 求值结果；debug=false 时为 {}。 */
   debugMetadata: Record<string, unknown>;
+  memoryRuntime?: MemoryRuntimeContract;
+  runtimeCommit?: {
+    runtime: MemoryRuntimeContract;
+    identity: {
+      serviceId: string;
+      userId: string;
+      agentSource: string;
+      sessionId: string;
+    };
+    turnSequence: number;
+    inputMessages: unknown[];
+  };
 }
 
 /**
  * Consume Anthropic SSE stream in background, extract usage, log + Opik.
  */
-function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: AnthropicTapContext): void {
+function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: AnthropicTapContext): Promise<void> {
   const { config, modelId, keyId, sessionKey, upstreamUrl, traceId, forkTraceId, startTime, inputMessages, system, retried, logMeta, pipe, lf, spaceId, upstreamRequestId } = ctx;
 
-  (async () => {
+  const task = (async () => {
     const decoder = new TextDecoder();
-    let sseBuf = "";
-    let usage: Record<string, unknown> = {};
-    let outputText = "";
-    let toolUseCount = 0;
+    const accumulator = new AnthropicStreamAccumulator();
     let streamCompleted = false;
+    let streamFailure: Error | null = null;
+    const reader = stream.getReader();
 
     const timeoutHandle = setTimeout(() => {
       if (!streamCompleted) {
-        pipe.error("STREAM_TIMEOUT", "Anthropic stream reading exceeded 5 minutes");
-        // completeStream 是 async；这里 fire-and-forget（timeout 里已经无法 await）
-        void completeStream().catch((err) => pipe.error("STREAM_TIMEOUT_COMPLETE", err));
+        streamFailure = new Error("Anthropic stream reading exceeded 5 minutes");
+        pipe.error("STREAM_TIMEOUT", streamFailure);
+        void reader.cancel(streamFailure).catch((err) => pipe.error("STREAM_CANCEL", err));
       }
     }, 5 * 60 * 1000);
 
@@ -1696,6 +1886,8 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
       clearTimeout(timeoutHandle);
 
       const endTime = new Date().toISOString();
+      const snapshot = accumulator.snapshot();
+      const { usage, outputText, toolUseCount } = snapshot;
 
       if (Object.keys(usage).length > 0) {
         await recordInputTokenUsage({
@@ -1794,7 +1986,7 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
 
       // Tdai L0 write
       const tdaiClient = ctx.tdaiClient;
-      if (isMainDialog && tdaiClient && isExtractionAllowed(ctx.config, "tdai-memory")) {
+      if (!ctx.memoryRuntime && isMainDialog && tdaiClient && isExtractionAllowed(ctx.config, "tdai-memory")) {
         // Streaming 不 await（会拖慢 SSE 关流），trackWrite + withL0Retry 应对两条丢包线：
         //   - trackWrite 注册 in-flight promise 到全局 set；SIGTERM 时 index.ts 会
         //     flushPendingWrites 兜底，避免 pod rolling 时 event loop 未 flush 就退出丢 L0。
@@ -1816,7 +2008,7 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
             { sourceEventId: `proxy:${ctx.agentSource}:${ctx.sessionKeyForSkill}:turn:${lf.turnSeq}` },
           ))).catch((err: unknown) => pipe.error("TDAI_L0", err))
         );
-      } else if (isMainDialog && tdaiClient) {
+      } else if (!ctx.memoryRuntime && isMainDialog && tdaiClient) {
         logExtractionSkipped(ctx.config, "tdai-memory", ctx.sessionKeyForSkill);
       } else if (!isMainDialog) {
         console.log(`[cc-routing] skip L0 write (stream) for kind=${ctx.requestKind} session=${ctx.sessionKeyForSkill}`);
@@ -1826,7 +2018,7 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
 
       // Skill extract trigger — after stream finalization.
       // 同步 await：直到 store 落盘再继续，保证下一轮跨节点读到最新数据。
-      if (isMainDialog && isExtractionAllowed(ctx.config, "skill")) {
+      if (!ctx.memoryRuntime && isMainDialog && isExtractionAllowed(ctx.config, "skill")) {
         await triggerSkillExtractIfReady({
           config: ctx.config,
           sessionKey: ctx.sessionKeyForSkill,
@@ -1841,126 +2033,86 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
           toolCallCountOverride: toolUseCount,
           turnSequence: ctx.lf.turnSeq,
         });
-      } else if (isMainDialog) {
+      } else if (!ctx.memoryRuntime && isMainDialog) {
         logExtractionSkipped(ctx.config, "skill", ctx.sessionKeyForSkill);
-      } else {
+      } else if (!isMainDialog) {
         console.log(`[cc-routing] skip skill buffer (stream) for kind=${ctx.requestKind} session=${ctx.sessionKeyForSkill}`);
       }
 
-      // Credit usage reporting for streaming responses. The stream has already
-      // been forwarded to the client; failures here are best-effort and can
-      // only be observed via server logs (no way to retro-add response headers).
-      tryReportCreditFromPath(
-        ctx.config.creditReport,
-        ctx.requestPath,
-        usage,
-        ctx.config.creditPricing,
-        ctx.modelId,
-        ctx.upstreamUrl,
-        "usage",
-      )
-        .then((outcome) => {
-          if (outcome.attempted && !outcome.ok) {
-            pipe.error("CREDIT_REPORT", `[stream] ${outcome.errorMessage ?? "unknown"}`);
-            // Persist failed report as a raw record (reuses existing usage_raw table).
-            writeFailedReportRaw(
-              {
-                timestamp: new Date().toISOString(),
-                event: "usage",
-                modelId: ctx.modelId,
-                keyId: ctx.keyId,
-                sessionKey: ctx.sessionKey,
-                upstreamUrl: ctx.upstreamUrl,
-                stream: true,
-                usage,
-                upstreamRequestId: ctx.upstreamRequestId,
-                pricingConfig: ctx.config.creditPricing,
-              },
-              outcome.errorMessage ?? "unknown",
-            );
-          }
-        })
-        .catch((err: unknown) => pipe.error("CREDIT_REPORT", err));
+      // Credit accounting remains a transport responsibility and must run even
+      // when the subsequent durable memory enqueue fails.
+      try {
+        const outcome = await tryReportCreditFromPath(
+          ctx.config.creditReport,
+          ctx.requestPath,
+          usage,
+          ctx.config.creditPricing,
+          ctx.modelId,
+          ctx.upstreamUrl,
+          "usage",
+        );
+        if (outcome.attempted && !outcome.ok) {
+          pipe.error("CREDIT_REPORT", `[stream] ${outcome.errorMessage ?? "unknown"}`);
+          writeFailedReportRaw(
+            {
+              timestamp: new Date().toISOString(),
+              event: "usage",
+              modelId: ctx.modelId,
+              keyId: ctx.keyId,
+              sessionKey: ctx.sessionKey,
+              upstreamUrl: ctx.upstreamUrl,
+              stream: true,
+              usage,
+              upstreamRequestId: ctx.upstreamRequestId,
+              pricingConfig: ctx.config.creditPricing,
+            },
+            outcome.errorMessage ?? "unknown",
+          );
+        }
+      } catch (err: unknown) {
+        pipe.error("CREDIT_REPORT", err);
+      }
+
+      if (ctx.runtimeCommit) {
+        if (streamFailure) throw streamFailure;
+        if (snapshot.malformedEventCount > 0) {
+          throw new Error("Malformed Anthropic SSE event");
+        }
+        if (!snapshot.messageStopped) {
+          throw new Error("Anthropic stream ended before message_stop");
+        }
+        if (!snapshot.stopReason) {
+          throw new Error("Anthropic stream ended without stop_reason");
+        }
+        if (snapshot.stopReason === "end_turn") {
+          await commitAnthropicCompletedRound({
+            runtime: ctx.runtimeCommit.runtime,
+            identity: ctx.runtimeCommit.identity,
+            turnSequence: ctx.runtimeCommit.turnSequence,
+            inputMessages: ctx.runtimeCommit.inputMessages,
+            assistantMessage: outputText
+              ? { role: "assistant", content: [{ type: "text", text: outputText }] }
+              : null,
+            toolCallCountOverride: toolUseCount,
+          });
+        }
+      }
     }
 
     try {
-      const reader = stream.getReader();
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-
-        sseBuf += decoder.decode(value, { stream: true });
-
-        const parts = sseBuf.split("\n\n");
-        sseBuf = parts.pop() ?? "";
-
-        for (const part of parts) {
-          const lines = part.split("\n");
-          let dataStr = "";
-          for (const line of lines) {
-            if (line.startsWith("data: ")) {
-              dataStr = line.slice(6);
-            } else if (line.startsWith("data:")) {
-              dataStr = line.slice(5);
-            }
-          }
-
-          if (!dataStr || dataStr === "[DONE]") continue;
-
-          try {
-            const evt = JSON.parse(dataStr) as Record<string, unknown>;
-            const evtType = evt.type as string;
-
-            if (evtType === "message_start") {
-              const message = evt.message as Record<string, unknown> | undefined;
-              if (message?.usage) {
-                Object.assign(usage, message.usage as Record<string, unknown>);
-              }
-            } else if (evtType === "message_delta") {
-              if (evt.usage) {
-                Object.assign(usage, evt.usage as Record<string, unknown>);
-              }
-            } else if (evtType === "content_block_delta") {
-              const delta = evt.delta as Record<string, unknown> | undefined;
-              if (delta?.type === "text_delta" && typeof delta.text === "string") {
-                outputText += delta.text;
-              }
-            } else if (evtType === "content_block_start") {
-              const block = evt.content_block as Record<string, unknown> | undefined;
-              if (block?.type === "tool_use") toolUseCount++;
-            }
-          } catch {
-            // ignore malformed SSE data
-          }
-        }
+        accumulator.push(decoder.decode(value, { stream: true }));
       }
-
-      // Drain remaining buffer
-      if (sseBuf.trim()) {
-        const lines = sseBuf.split("\n");
-        let dataStr = "";
-        for (const line of lines) {
-          if (line.startsWith("data: ")) {
-            dataStr = line.slice(6);
-          }
-        }
-        if (dataStr && dataStr !== "[DONE]") {
-          try {
-            const evt = JSON.parse(dataStr) as Record<string, unknown>;
-            if (evt.type === "message_delta" && evt.usage) {
-              Object.assign(usage, evt.usage as Record<string, unknown>);
-            }
-          } catch {
-            // ignore
-          }
-        }
-      }
+      accumulator.finish(decoder.decode());
     } catch (err: unknown) {
       pipe.error("STREAM", err);
+      streamFailure = err instanceof Error ? err : new Error(String(err));
     }
 
     await completeStream();
-  })().catch((err: unknown) => {
-    pipe.error("STREAM_CONSUME", err);
-  });
+  })();
+  void task.catch((err: unknown) => pipe.error("STREAM_CONSUME", err));
+  return task;
 }

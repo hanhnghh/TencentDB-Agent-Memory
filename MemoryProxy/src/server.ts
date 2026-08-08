@@ -13,16 +13,23 @@ import { hasCostGuardMarker } from "./routes/whitelist.js";
 import { tryActivateStorage, tryActivateRedis } from "./injection/index.js";
 import { getEffectiveBackend } from "./storage/factory.js";
 import type { ProxyConfig } from "./types.js";
-import type { OpenAIMemoryRuntimeProvider } from "./runtime/openai-production.js";
+import type {
+  ProxyMemoryRuntimeProvider,
+} from "./runtime/proxy-production.js";
 
 export interface CreateAppOptions {
-  openAIMemoryRuntimeProvider?: OpenAIMemoryRuntimeProvider;
+  memoryRuntimeProvider?: ProxyMemoryRuntimeProvider;
+  /** @deprecated Use memoryRuntimeProvider. */
+  openAIMemoryRuntimeProvider?: ProxyMemoryRuntimeProvider;
 }
 
 export function createApp(config: ProxyConfig, options: CreateAppOptions = {}): Hono {
   const app = new Hono();
+  const memoryRuntimeProvider = options.memoryRuntimeProvider ?? options.openAIMemoryRuntimeProvider;
   const handleOpenAI = (c: Parameters<typeof handleChatCompletions>[0]) =>
-    handleChatCompletions(c, config, options.openAIMemoryRuntimeProvider);
+    handleChatCompletions(c, config, memoryRuntimeProvider);
+  const handleAnthropic = (c: Parameters<typeof handleAnthropicMessages>[0]) =>
+    handleAnthropicMessages(c, config, memoryRuntimeProvider);
 
   // Eagerly activate storage/bindingRepo so bridge-only requests (no main
   // /v1/messages hits yet) can still recover session state via L2 fallthrough
@@ -78,8 +85,8 @@ export function createApp(config: ProxyConfig, options: CreateAppOptions = {}): 
         degraded,
         ...(eff.error ? { lastError: eff.error } : {}),
       },
-      ...(options.openAIMemoryRuntimeProvider?.health
-        ? { memoryRuntime: await options.openAIMemoryRuntimeProvider.health() }
+      ...(memoryRuntimeProvider?.health
+        ? { memoryRuntime: await memoryRuntimeProvider.health() }
         : {}),
     };
     return c.json(body, degraded ? 503 : 200);
@@ -139,7 +146,7 @@ export function createApp(config: ProxyConfig, options: CreateAppOptions = {}): 
 
   // ── Whitelisted primary endpoints ────────────────────────────────────────
   // Anthropic Messages API
-  app.post("/v1/messages", (c) => handleAnthropicMessages(c, config));
+  app.post("/v1/messages", handleAnthropic);
 
   // ── Whitelisted auxiliary endpoints (must precede catch-all) ─────────────
   // 这些端点走轻量透传 handler（不进入路由模块，不构成对话回合）。
@@ -168,7 +175,7 @@ export function createApp(config: ProxyConfig, options: CreateAppOptions = {}): 
   // 详见 `hasCostGuardMarker`。
   // Hono 优先匹配更精确的路径，需注册在通用 `/:agent/:spaceId/v1/...` 之前。
   if (config.costGuard.markerOptIn) {
-    app.post("/:agent/:spaceId/cost-guard/v1/messages", (c) => handleAnthropicMessages(c, config));
+    app.post("/:agent/:spaceId/cost-guard/v1/messages", handleAnthropic);
     app.post("/:agent/:spaceId/cost-guard/v1/chat/completions", handleOpenAI);
   }
 
@@ -182,11 +189,11 @@ export function createApp(config: ProxyConfig, options: CreateAppOptions = {}): 
   // (OpenAI handler)，把 Anthropic body 打到 OpenAI 端点 → 上游 400。所以只要
   // markerOptIn=true 就必须显式注册这两条 anthropic/openai 5 段路由。
   if (config.injection?.assetReflection?.markerOptIn) {
-    app.post("/:agent/:spaceId/analyse/v1/messages", (c) => handleAnthropicMessages(c, config));
+    app.post("/:agent/:spaceId/analyse/v1/messages", handleAnthropic);
     app.post("/:agent/:spaceId/analyse/v1/chat/completions", handleOpenAI);
   }
 
-  app.post("/:agent/:spaceId/v1/messages", (c) => handleAnthropicMessages(c, config));
+  app.post("/:agent/:spaceId/v1/messages", handleAnthropic);
   app.post("/:agent/:spaceId/v1/messages/count_tokens", (c) => handleAuxiliaryEndpoint(c, config));
   app.post("/:agent/:spaceId/v1/embeddings", (c) => handleAuxiliaryEndpoint(c, config));
   app.post("/:agent/:spaceId/v1/completions", (c) => handleAuxiliaryEndpoint(c, config));
@@ -194,12 +201,12 @@ export function createApp(config: ProxyConfig, options: CreateAppOptions = {}): 
   app.post("/:agent/:spaceId/v1/chat/completions", handleOpenAI);
 
   // Agent-prefixed routes without spaceId (deprecated: no credit reporting)
-  app.post("/:agent/v1/messages", (c) => handleAnthropicMessages(c, config));
+  app.post("/:agent/v1/messages", handleAnthropic);
   app.post("/:agent/v1/chat/completions", handleOpenAI);
 
   // Legacy /proxy/<spaceId>/ prefix — no agent info, defaults to codebuddy.
   // 保留以兼容不带 agent 前缀的客户端。
-  app.post("/proxy/:spaceId/v1/messages", (c) => handleAnthropicMessages(c, config));
+  app.post("/proxy/:spaceId/v1/messages", handleAnthropic);
   app.post("/proxy/:spaceId/v1/messages/count_tokens", (c) => handleAuxiliaryEndpoint(c, config));
   app.post("/proxy/:spaceId/v1/embeddings", (c) => handleAuxiliaryEndpoint(c, config));
   app.post("/proxy/:spaceId/v1/completions", (c) => handleAuxiliaryEndpoint(c, config));

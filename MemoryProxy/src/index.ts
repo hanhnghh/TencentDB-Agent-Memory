@@ -21,7 +21,7 @@ import { initSystemUsers } from "./systemUser.js";
 import { checkConnectivity } from "./connectivity.js";
 import { initProxyStorage, getEffectiveBackend } from "./storage/factory.js";
 import { flushPendingWrites, pendingWriteCount } from "./tdai/pending-writes.js";
-import { createOpenAIMemoryRuntime } from "./runtime/openai-production.js";
+import { createProxyMemoryRuntime } from "./runtime/proxy-production.js";
 
 const overrides = parseArgv(process.argv);
 const config = buildConfig(overrides);
@@ -65,11 +65,11 @@ if (config.storage.enabled && config.storage.backend === "cos" && effectiveStora
   });
 }
 
-const openAIMemoryRuntime = config.sessionInit.enabled
-  ? await createOpenAIMemoryRuntime(config)
+const proxyMemoryRuntime = config.sessionInit.enabled
+  ? await createProxyMemoryRuntime(config)
   : undefined;
 const app = createApp(config, {
-  openAIMemoryRuntimeProvider: openAIMemoryRuntime?.provider,
+  memoryRuntimeProvider: proxyMemoryRuntime?.provider,
 });
 
 log.info("server.starting", {
@@ -126,7 +126,7 @@ async function gracefulShutdown(signal: "SIGTERM" | "SIGINT"): Promise<void> {
     log.info("server.shutdown.flush_l0.done", { drained, remaining });
   }
   await shutdownGuard();
-  await openAIMemoryRuntime?.shutdown();
+  await proxyMemoryRuntime?.shutdown();
   await shutdownLangfuse();
   await shutdownClickHouse();
   await shutdownLogger();

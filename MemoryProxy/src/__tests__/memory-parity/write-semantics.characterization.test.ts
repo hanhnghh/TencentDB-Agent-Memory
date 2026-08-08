@@ -16,6 +16,8 @@ import type { TdaiIdentity } from "../../tdai/types.js";
 import {
   InMemoryMemoryRuntimeAdapters,
   MemoryRuntime,
+  MemoryRuntimeAuthorizationError,
+  MemoryRuntimeContextError,
   type CommitCompletedRoundInput,
   type MemoryRuntimeContract,
 } from "../../runtime/index.js";
@@ -401,9 +403,40 @@ describe("memory parity: observed legacy intermediate L0 behavior", () => {
 });
 
 describe("memory parity: approved completed-round target", () => {
-  it.fails("commits one Anthropic L0 write for the completed human round", async () => {
+  it("commits one Anthropic completed human round through MemoryRuntime", async () => {
     const config = memoryParityConfig();
+    config.injection.enabled = true;
+    config.injection.assetReflection = { markerOptIn: true };
     await seedParitySession();
+    const runtimeAdapters = new InMemoryMemoryRuntimeAdapters({
+      binding: {
+        identity: {
+          serviceId: PARITY_IDENTITY.spaceId,
+          teamId: PARITY_IDENTITY.teamId,
+          userId: PARITY_IDENTITY.userId,
+          agentId: PARITY_IDENTITY.agentId,
+          taskId: PARITY_IDENTITY.taskId,
+          agentSource: PARITY_IDENTITY.agentSource,
+          sessionId: PARITY_IDENTITY.sessionId,
+        },
+        agent: PARITY_AGENT,
+        task: PARITY_TASK,
+        sessionInfo: PARITY_SESSION_INFO,
+        resolution: "cached",
+      },
+      context: {
+        blocks: [{
+          id: "skill-tools-injector:0",
+          sourceHookId: "skill-tools-injector",
+          kind: "skill",
+          order: 1,
+          type: "text",
+          content: "runtime-prepared-context",
+        }],
+        diagnostics: { prewarmed: ["skill-tools-injector"], cacheHits: [], degraded: [] },
+      },
+    });
+    const runtime = new MemoryRuntime(runtimeAdapters);
     const upstreamResponses = [
       {
         id: "message-intermediate",
@@ -431,16 +464,43 @@ describe("memory parity: approved completed-round target", () => {
         stop_reason: "end_turn",
         usage: { input_tokens: 1, output_tokens: 1 },
       },
+      [
+        `event: message_start\ndata: ${JSON.stringify({
+          type: "message_start",
+          message: { usage: { input_tokens: 1, output_tokens: 0 } },
+        })}`,
+        `event: content_block_start\ndata: ${JSON.stringify({
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "text", text: "" },
+        })}`,
+        `event: content_block_delta\ndata: ${JSON.stringify({
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: FINAL_ASSISTANT },
+        })}`,
+        `event: message_delta\ndata: ${JSON.stringify({
+          type: "message_delta",
+          delta: { stop_reason: "end_turn" },
+          usage: { output_tokens: 1 },
+        })}`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}`,
+        "",
+      ].join("\n\n"),
     ];
     const l0Requests: Array<Record<string, unknown>> = [];
+    const upstreamRequests: Array<Record<string, unknown>> = [];
     const fetcher: typeof fetch = async (input, init) => {
       const url = String(input);
       if (url === config.upstream.url) {
+        upstreamRequests.push(parseRequestBody(init));
         const next = upstreamResponses.shift();
         if (!next) throw new Error("unexpected third upstream request");
-        return new Response(JSON.stringify(next), {
+        return new Response(typeof next === "string" ? next : JSON.stringify(next), {
           status: 200,
-          headers: { "content-type": "application/json" },
+          headers: {
+            "content-type": typeof next === "string" ? "text/event-stream" : "application/json",
+          },
         });
       }
       if (url.endsWith("/v3/conversation/add")) {
@@ -452,8 +512,267 @@ describe("memory parity: approved completed-round target", () => {
       });
     };
     vi.stubGlobal("fetch", vi.fn(fetcher));
-    const app = createApp(config);
+    const app = createApp(config, {
+      memoryRuntimeProvider: { forRequest: () => runtime },
+    });
     const callProxy = (messages: Array<Record<string, unknown>>) => app.request(
+      `/claude-code/${PARITY_IDENTITY.spaceId}/analyse/v1/messages`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "client-key",
+          "x-conversation-id": PARITY_IDENTITY.sessionId,
+          "x-user-id": PARITY_IDENTITY.userId,
+        },
+        body: JSON.stringify({
+          model: "fixture-model",
+          max_tokens: 128,
+          stream: false,
+          system: [{
+            type: "text",
+            text: "base-system",
+            cache_control: { type: "ephemeral" },
+          }],
+          messages,
+        }),
+      },
+    );
+
+    const intermediate = await callProxy([PROXY_ROUND_INPUTS[0].messages[1]]);
+    const final = await callProxy(PROXY_ROUND_INPUTS[0].messages.slice(1));
+    expect(intermediate.status).toBe(200);
+    expect(final.status).toBe(200);
+    const stream = await app.request(
+      `/claude-code/${PARITY_IDENTITY.spaceId}/analyse/v1/messages`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "client-key",
+          "x-conversation-id": PARITY_IDENTITY.sessionId,
+          "x-user-id": PARITY_IDENTITY.userId,
+        },
+        body: JSON.stringify({
+          model: "fixture-model",
+          max_tokens: 128,
+          stream: true,
+          messages: PROXY_ROUND_INPUTS[0].messages.slice(1),
+        }),
+      },
+    );
+    const streamText = await stream.text();
+    expect(streamText).toContain(`"text":"${FINAL_ASSISTANT}"`);
+    expect(streamText).toContain("event: message_stop");
+    await expect(flushPendingWrites(1_000)).resolves.toEqual({
+      drained: true,
+      remaining: 0,
+    });
+
+    expect(l0Requests).toHaveLength(0);
+    expect(JSON.stringify(upstreamRequests[0].system)).toContain("runtime-prepared-context");
+    expect(JSON.stringify(upstreamRequests[0].system)).toContain("<asset_reflection>");
+    expect(upstreamRequests[0].system).toEqual(expect.arrayContaining([
+      expect.objectContaining({ cache_control: { type: "ephemeral" } }),
+    ]));
+    expect(runtimeAdapters.enqueuedRounds).toHaveLength(2);
+    expect(runtimeAdapters.enqueuedRounds[0]).toMatchObject({
+      identity: { agentSource: "claude-code", turnId: "turn-1" },
+      l0: { messages: [
+        { role: "user", content: USER_PROMPT },
+        { role: "assistant", content: FINAL_ASSISTANT },
+      ] },
+      skill: { messages: COMPLETED_ROUND_GOLDEN },
+    });
+    expect(runtimeAdapters.enqueuedRounds[1]).toEqual(runtimeAdapters.enqueuedRounds[0]);
+  });
+
+  it("keeps Anthropic fork reads read-only and bypasses sidequeries", async () => {
+    const config = memoryParityConfig();
+    config.ccRequestRouting = { enabled: true };
+    config.injection.enabled = false;
+    await seedParitySession();
+
+    const prepareInputs: Array<{ readOnly?: boolean }> = [];
+    const commits: CommitCompletedRoundInput[] = [];
+    const runtime: MemoryRuntimeContract = {
+      async prepareContext(input) {
+        prepareInputs.push({ readOnly: input.readOnly });
+        return {
+          session: {
+            identity: {
+              serviceId: PARITY_IDENTITY.spaceId,
+              teamId: PARITY_IDENTITY.teamId,
+              userId: PARITY_IDENTITY.userId,
+              agentId: PARITY_IDENTITY.agentId,
+              taskId: PARITY_IDENTITY.taskId,
+              agentSource: PARITY_IDENTITY.agentSource,
+              sessionId: PARITY_IDENTITY.sessionId,
+            },
+            agent: PARITY_AGENT,
+            task: PARITY_TASK,
+          },
+          blocks: [],
+          capabilities: {
+            memory: { enabled: true },
+            skill: { enabled: true },
+            knowledge: { wiki: { enabled: true }, codeGraph: { enabled: true } },
+          },
+          diagnostics: { binding: "cached", prewarmed: [], cacheHits: [], degraded: [] },
+        };
+      },
+      async commitCompletedRound(input) {
+        commits.push(input);
+        return {
+          status: "enqueued",
+          record: {
+            sourceEventId: input.sourceEventId,
+            contentHash: "fixture-hash",
+            state: "pending",
+            attemptCount: 0,
+            nextAttemptAt: 0,
+            createdAt: 0,
+            updatedAt: 0,
+          },
+        };
+      },
+    };
+    const forRequest = vi.fn(() => runtime);
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      if (String(input) === config.upstream.url) {
+        return new Response(JSON.stringify({
+          id: "message-final",
+          type: "message",
+          role: "assistant",
+          content: [{ type: "text", text: FINAL_ASSISTANT }],
+          stop_reason: "end_turn",
+          usage: { input_tokens: 1, output_tokens: 1 },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ code: 0, data: { items: [] } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }));
+    const app = createApp(config, { memoryRuntimeProvider: { forRequest } });
+    const request = (body: Record<string, unknown>) => app.request(
+      `/claude-code/${PARITY_IDENTITY.spaceId}/v1/messages`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "client-key",
+          "x-conversation-id": PARITY_IDENTITY.sessionId,
+          "x-user-id": PARITY_IDENTITY.userId,
+        },
+        body: JSON.stringify({ model: "fixture-model", max_tokens: 128, stream: false, ...body }),
+      },
+    );
+
+    await request({
+      tools: [{ name: "shell", input_schema: { type: "object" } }],
+      messages: [{
+        role: "user",
+        content: [{ type: "text", text: USER_PROMPT, cache_control: { type: "ephemeral" } }],
+      }],
+    });
+    await request({
+      tools: [{ name: "shell", input_schema: { type: "object" } }],
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "cached", cache_control: { type: "ephemeral" } }],
+        },
+        { role: "user", content: [{ type: "text", text: "fork query" }] },
+      ],
+    });
+    await request({
+      tools: [],
+      thinking: { type: "disabled" },
+      messages: [{ role: "user", content: [{ type: "text", text: "title query" }] }],
+    });
+
+    expect(forRequest).toHaveBeenCalledTimes(2);
+    expect(prepareInputs).toEqual([{ readOnly: false }, { readOnly: true }]);
+    expect(commits).toHaveLength(1);
+    expect(commits[0]).toMatchObject({
+      identity: { turnId: "turn-1" },
+      realPrompt: USER_PROMPT,
+      finalResponse: FINAL_ASSISTANT,
+    });
+  });
+
+  it("commits Anthropic no-space routes even when context preparation degrades", async () => {
+    const config = memoryParityConfig();
+    config.tdai.serviceId = PARITY_IDENTITY.spaceId;
+    await seedParitySession();
+    const committed: CommitCompletedRoundInput[] = [];
+    const runtime: MemoryRuntimeContract = {
+      prepareContext: async () => {
+        throw new MemoryRuntimeContextError(new Error("context backend unavailable"));
+      },
+      commitCompletedRound: async (input) => {
+        committed.push(input);
+        return { status: "skipped", sourceEventId: input.sourceEventId, reason: "fixture" };
+      },
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      if (String(input) === config.upstream.url) {
+        return new Response(JSON.stringify({
+          id: "message-no-space",
+          type: "message",
+          role: "assistant",
+          content: [{ type: "text", text: FINAL_ASSISTANT }],
+          stop_reason: "end_turn",
+          usage: { input_tokens: 1, output_tokens: 1 },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ code: 0 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }));
+    const app = createApp(config, { memoryRuntimeProvider: { forRequest: () => runtime } });
+
+    const response = await app.request("/claude-code/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": "client-key",
+        "x-conversation-id": PARITY_IDENTITY.sessionId,
+        "x-user-id": PARITY_IDENTITY.userId,
+      },
+      body: JSON.stringify({
+        model: "fixture-model",
+        max_tokens: 128,
+        stream: false,
+        messages: [{ role: "user", content: [{ type: "text", text: USER_PROMPT }] }],
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(committed).toHaveLength(1);
+    expect(committed[0]).toMatchObject({
+      identity: { serviceId: PARITY_IDENTITY.spaceId },
+      realPrompt: USER_PROMPT,
+      finalResponse: FINAL_ASSISTANT,
+    });
+  });
+
+  it("fails closed when Anthropic runtime read authorization is denied", async () => {
+    const config = memoryParityConfig();
+    await seedParitySession();
+    const upstream = vi.fn();
+    vi.stubGlobal("fetch", upstream);
+    const runtime: MemoryRuntimeContract = {
+      prepareContext: async () => {
+        throw new MemoryRuntimeAuthorizationError("read", "fixture-denied");
+      },
+      commitCompletedRound: vi.fn(),
+    };
+    const app = createApp(config, { memoryRuntimeProvider: { forRequest: () => runtime } });
+
+    const response = await app.request(
       `/claude-code/${PARITY_IDENTITY.spaceId}/v1/messages`,
       {
         method: "POST",
@@ -467,25 +786,406 @@ describe("memory parity: approved completed-round target", () => {
           model: "fixture-model",
           max_tokens: 128,
           stream: false,
-          messages,
+          messages: [{ role: "user", content: [{ type: "text", text: USER_PROMPT }] }],
         }),
       },
     );
 
-    await callProxy([PROXY_ROUND_INPUTS[0].messages[1]]);
-    await callProxy(PROXY_ROUND_INPUTS[0].messages.slice(1));
-    await expect(flushPendingWrites(1_000)).resolves.toEqual({
-      drained: true,
-      remaining: 0,
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({
+      type: "error",
+      error: { type: "permission_error", message: "Memory access denied" },
     });
+    expect(upstream).not.toHaveBeenCalled();
+    expect(runtime.commitCompletedRound).not.toHaveBeenCalled();
+  });
 
-    expect(l0Requests).toHaveLength(1);
-    expect(l0Requests[0]).toMatchObject({
-      messages: [
-        { role: "user", content: USER_PROMPT },
-        { role: "assistant", content: FINAL_ASSISTANT },
-      ],
+  it("binds and commits through runtime when legacy session recovery fails", async () => {
+    const config = memoryParityConfig();
+    await seedParitySession();
+    vi.spyOn(getSessionStore(), "getOrRecover").mockRejectedValueOnce(
+      new Error("legacy recovery unavailable"),
+    );
+    const prepareContext = vi.fn(async () => ({
+      session: {
+        identity: {
+          serviceId: PARITY_IDENTITY.spaceId,
+          teamId: PARITY_IDENTITY.teamId,
+          userId: PARITY_IDENTITY.userId,
+          agentId: PARITY_IDENTITY.agentId,
+          taskId: PARITY_IDENTITY.taskId,
+          agentSource: PARITY_IDENTITY.agentSource,
+          sessionId: PARITY_IDENTITY.sessionId,
+        },
+        agent: PARITY_AGENT,
+        task: PARITY_TASK,
+      },
+      blocks: [],
+      capabilities: {
+        memory: { enabled: true },
+        skill: { enabled: true },
+        knowledge: { wiki: { enabled: true }, codeGraph: { enabled: true } },
+      },
+      diagnostics: { binding: "recovered" as const, prewarmed: [], cacheHits: [], degraded: [] },
+    }));
+    const committed: CommitCompletedRoundInput[] = [];
+    const runtime: MemoryRuntimeContract = {
+      prepareContext,
+      async commitCompletedRound(input) {
+        committed.push(input);
+        return { status: "skipped", sourceEventId: input.sourceEventId, reason: "fixture" };
+      },
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      if (String(input) === config.upstream.url) {
+        return new Response(JSON.stringify({
+          type: "message",
+          role: "assistant",
+          content: [{ type: "text", text: FINAL_ASSISTANT }],
+          stop_reason: "end_turn",
+          usage: { input_tokens: 1, output_tokens: 1 },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ code: 0, data: { items: [] } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }));
+    const app = createApp(config, { memoryRuntimeProvider: { forRequest: () => runtime } });
+
+    const response = await app.request(
+      `/claude-code/${PARITY_IDENTITY.spaceId}/v1/messages`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "client-key",
+          "x-conversation-id": PARITY_IDENTITY.sessionId,
+          "x-user-id": PARITY_IDENTITY.userId,
+        },
+        body: JSON.stringify({
+          model: "fixture-model",
+          max_tokens: 128,
+          stream: false,
+          messages: [{ role: "user", content: [{ type: "text", text: USER_PROMPT }] }],
+        }),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(prepareContext).toHaveBeenCalledOnce();
+    expect(committed).toHaveLength(1);
+  });
+
+  it("keeps Anthropic mem-command interception on the runtime commit path", async () => {
+    const config = memoryParityConfig();
+    config.memCommand = { enabled: true, allowedCommands: ["help"] };
+    await seedParitySession();
+    const runtimeAdapters = new InMemoryMemoryRuntimeAdapters({
+      binding: {
+        identity: {
+          serviceId: PARITY_IDENTITY.spaceId,
+          teamId: PARITY_IDENTITY.teamId,
+          userId: PARITY_IDENTITY.userId,
+          agentId: PARITY_IDENTITY.agentId,
+          taskId: PARITY_IDENTITY.taskId,
+          agentSource: PARITY_IDENTITY.agentSource,
+          sessionId: PARITY_IDENTITY.sessionId,
+        },
+        agent: PARITY_AGENT,
+        task: PARITY_TASK,
+        sessionInfo: PARITY_SESSION_INFO,
+        resolution: "cached",
+      },
     });
+    const runtime = new MemoryRuntime(runtimeAdapters);
+    const fetcher = vi.fn(async () => {
+      throw new Error("mem:help must not call an upstream or legacy writer");
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const app = createApp(config, { memoryRuntimeProvider: { forRequest: () => runtime } });
+
+    const response = await app.request(
+      `/claude-code/${PARITY_IDENTITY.spaceId}/v1/messages`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "client-key",
+          "x-conversation-id": PARITY_IDENTITY.sessionId,
+          "x-user-id": PARITY_IDENTITY.userId,
+        },
+        body: JSON.stringify({
+          model: "fixture-model",
+          max_tokens: 128,
+          stream: false,
+          messages: [{ role: "user", content: [{ type: "text", text: "mem:help" }] }],
+        }),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(runtimeAdapters.enqueuedRounds).toHaveLength(1);
+    expect(runtimeAdapters.enqueuedRounds[0].l0.messages).toEqual([
+      { role: "user", content: "mem:help" },
+      expect.objectContaining({ role: "assistant" }),
+    ]);
+  });
+
+  it("does not complete an Anthropic stream when durable enqueue fails", async () => {
+    const config = memoryParityConfig();
+    await seedParitySession();
+    const workingRuntime = new MemoryRuntime(new InMemoryMemoryRuntimeAdapters({
+      binding: {
+        identity: {
+          serviceId: PARITY_IDENTITY.spaceId,
+          teamId: PARITY_IDENTITY.teamId,
+          userId: PARITY_IDENTITY.userId,
+          agentId: PARITY_IDENTITY.agentId,
+          taskId: PARITY_IDENTITY.taskId,
+          agentSource: PARITY_IDENTITY.agentSource,
+          sessionId: PARITY_IDENTITY.sessionId,
+        },
+        agent: PARITY_AGENT,
+        task: PARITY_TASK,
+        sessionInfo: PARITY_SESSION_INFO,
+        resolution: "cached",
+      },
+    }));
+    const runtime: MemoryRuntimeContract = {
+      prepareContext: (input) => workingRuntime.prepareContext(input),
+      commitCompletedRound: async () => { throw new Error("outbox disk unavailable"); },
+    };
+    const sse = [
+      `event: message_start\ndata: ${JSON.stringify({
+        type: "message_start",
+        message: { usage: { input_tokens: 1, output_tokens: 0 } },
+      })}`,
+      `event: content_block_start\ndata: ${JSON.stringify({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "text", text: "" },
+      })}`,
+      `event: content_block_delta\ndata: ${JSON.stringify({
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: FINAL_ASSISTANT },
+      })}`,
+      `event: message_delta\ndata: ${JSON.stringify({
+        type: "message_delta",
+        delta: { stop_reason: "end_turn" },
+        usage: { output_tokens: 1 },
+      })}`,
+      `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}`,
+      "",
+    ].join("\n\n");
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      if (String(input) === config.upstream.url) {
+        return new Response(sse, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      }
+      return new Response(JSON.stringify({ code: 0, data: { items: [] } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }));
+    const app = createApp(config, { memoryRuntimeProvider: { forRequest: () => runtime } });
+
+    const response = await app.request(
+      `/claude-code/${PARITY_IDENTITY.spaceId}/v1/messages`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "client-key",
+          "x-conversation-id": PARITY_IDENTITY.sessionId,
+          "x-user-id": PARITY_IDENTITY.userId,
+        },
+        body: JSON.stringify({
+          model: "fixture-model",
+          max_tokens: 128,
+          stream: true,
+          messages: PROXY_ROUND_INPUTS[0].messages.slice(1),
+        }),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.text()).rejects.toThrow("outbox disk unavailable");
+  });
+
+  it.each([
+    {
+      name: "interrupted",
+      tail: `event: message_delta\ndata: ${JSON.stringify({
+        type: "message_delta",
+        delta: { stop_reason: "end_turn" },
+      })}`,
+      error: "before message_stop",
+    },
+    {
+      name: "malformed",
+      tail: [
+        "event: content_block_delta\ndata: {not-json}",
+        `event: message_delta\ndata: ${JSON.stringify({
+          type: "message_delta",
+          delta: { stop_reason: "end_turn" },
+        })}`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}`,
+      ].join("\n\n"),
+      error: "Malformed Anthropic SSE event",
+    },
+  ])("does not commit a $name Anthropic stream", async ({ tail, error }) => {
+    const config = memoryParityConfig();
+    await seedParitySession();
+    const workingRuntime = new MemoryRuntime(new InMemoryMemoryRuntimeAdapters({
+      binding: {
+        identity: {
+          serviceId: PARITY_IDENTITY.spaceId,
+          teamId: PARITY_IDENTITY.teamId,
+          userId: PARITY_IDENTITY.userId,
+          agentId: PARITY_IDENTITY.agentId,
+          taskId: PARITY_IDENTITY.taskId,
+          agentSource: PARITY_IDENTITY.agentSource,
+          sessionId: PARITY_IDENTITY.sessionId,
+        },
+        agent: PARITY_AGENT,
+        task: PARITY_TASK,
+        sessionInfo: PARITY_SESSION_INFO,
+        resolution: "cached",
+      },
+    }));
+    const commitCompletedRound = vi.fn<MemoryRuntimeContract["commitCompletedRound"]>();
+    const runtime: MemoryRuntimeContract = {
+      prepareContext: (input) => workingRuntime.prepareContext(input),
+      commitCompletedRound,
+    };
+    const sse = [
+      `event: content_block_start\ndata: ${JSON.stringify({
+        type: "content_block_start",
+        content_block: { type: "text", text: "" },
+      })}`,
+      `event: content_block_delta\ndata: ${JSON.stringify({
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: FINAL_ASSISTANT },
+      })}`,
+      tail,
+      "",
+    ].join("\n\n");
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      if (String(input) === config.upstream.url) {
+        return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      return new Response(JSON.stringify({ code: 0, data: { items: [] } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }));
+    const app = createApp(config, { memoryRuntimeProvider: { forRequest: () => runtime } });
+
+    const response = await app.request(
+      `/claude-code/${PARITY_IDENTITY.spaceId}/v1/messages`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "client-key",
+          "x-conversation-id": PARITY_IDENTITY.sessionId,
+          "x-user-id": PARITY_IDENTITY.userId,
+        },
+        body: JSON.stringify({
+          model: "fixture-model",
+          max_tokens: 128,
+          stream: true,
+          messages: PROXY_ROUND_INPUTS[0].messages.slice(1),
+        }),
+      },
+    );
+
+    await expect(response.text()).rejects.toThrow(error);
+    expect(commitCompletedRound).not.toHaveBeenCalled();
+  });
+
+  it("commits a completed Anthropic stream after the client disconnects", async () => {
+    const config = memoryParityConfig();
+    await seedParitySession();
+    const workingRuntime = new MemoryRuntime(new InMemoryMemoryRuntimeAdapters({
+      binding: {
+        identity: {
+          serviceId: PARITY_IDENTITY.spaceId,
+          teamId: PARITY_IDENTITY.teamId,
+          userId: PARITY_IDENTITY.userId,
+          agentId: PARITY_IDENTITY.agentId,
+          taskId: PARITY_IDENTITY.taskId,
+          agentSource: PARITY_IDENTITY.agentSource,
+          sessionId: PARITY_IDENTITY.sessionId,
+        },
+        agent: PARITY_AGENT,
+        task: PARITY_TASK,
+        sessionInfo: PARITY_SESSION_INFO,
+        resolution: "cached",
+      },
+    }));
+    const committed: CommitCompletedRoundInput[] = [];
+    const runtime: MemoryRuntimeContract = {
+      prepareContext: (input) => workingRuntime.prepareContext(input),
+      async commitCompletedRound(input) {
+        committed.push(input);
+        return { status: "skipped", sourceEventId: input.sourceEventId, reason: "fixture" };
+      },
+    };
+    const sse = [
+      `event: content_block_start\ndata: ${JSON.stringify({
+        type: "content_block_start",
+        content_block: { type: "text", text: "foo" },
+      })}`,
+      `event: content_block_start\ndata: ${JSON.stringify({
+        type: "content_block_start",
+        content_block: { type: "text", text: "bar" },
+      })}`,
+      `event: message_delta\ndata: ${JSON.stringify({
+        type: "message_delta",
+        delta: { stop_reason: "end_turn" },
+      })}`,
+      `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}`,
+      "",
+    ].join("\n\n");
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      if (String(input) === config.upstream.url) {
+        return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      return new Response(JSON.stringify({ code: 0, data: { items: [] } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }));
+    const app = createApp(config, { memoryRuntimeProvider: { forRequest: () => runtime } });
+
+    const response = await app.request(
+      `/claude-code/${PARITY_IDENTITY.spaceId}/v1/messages`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "client-key",
+          "x-conversation-id": PARITY_IDENTITY.sessionId,
+          "x-user-id": PARITY_IDENTITY.userId,
+        },
+        body: JSON.stringify({
+          model: "fixture-model",
+          max_tokens: 128,
+          stream: true,
+          messages: PROXY_ROUND_INPUTS[0].messages.slice(1),
+        }),
+      },
+    );
+
+    await response.body?.cancel();
+    await vi.waitFor(() => expect(committed).toHaveLength(1));
+    expect(committed[0].finalResponse).toBe("foo\nbar");
   });
 
   it("commits one OpenAI completed human round through MemoryRuntime", async () => {
