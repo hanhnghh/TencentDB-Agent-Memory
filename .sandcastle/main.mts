@@ -93,7 +93,7 @@ if (!BASE_BRANCH) {
 const hooks = {
   sandbox: {
     onSandboxReady: [
-      { command: "test -f .sandcastle/CODING_STANDARDS.md" },
+      { command: "test -f /home/agent/CODING_STANDARDS.md" },
       { command: "codex login status" },
       { command: "gh auth status" },
     ],
@@ -106,6 +106,12 @@ const hooks = {
 const CODEX_HOME_HOST = ".sandcastle/codex-home";
 const CODEX_HOME_SANDBOX = "/home/agent/.codex";
 const CODEX_CONFIG_HOST = `${CODEX_HOME_HOST}/config.toml`;
+const STANDARDS_HOST = ".sandcastle/CODING_STANDARDS.md";
+const STANDARDS_SANDBOX = "/home/agent/CODING_STANDARDS.md";
+const PROXY_TYPE_GATE_HOST =
+  ".sandcastle/scripts/check-memory-proxy-types.sh";
+const PROXY_TYPE_GATE_SANDBOX =
+  "/home/agent/check-memory-proxy-types.sh";
 const CACHE_MOUNTS = [
   {
     hostPath: ".sandcastle/cache/npm",
@@ -145,6 +151,16 @@ const codexSandbox = () =>
       {
         hostPath: CODEX_HOME_HOST,
         sandboxPath: CODEX_HOME_SANDBOX,
+      },
+      {
+        hostPath: STANDARDS_HOST,
+        sandboxPath: STANDARDS_SANDBOX,
+        readonly: true,
+      },
+      {
+        hostPath: PROXY_TYPE_GATE_HOST,
+        sandboxPath: PROXY_TYPE_GATE_SANDBOX,
+        readonly: true,
       },
       ...CACHE_MOUNTS,
     ],

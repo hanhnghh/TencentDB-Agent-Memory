@@ -87,6 +87,11 @@ host:      .sandcastle/codex-home
 container: /home/agent/.codex
 ```
 
+It also mounts `CODING_STANDARDS.md` and the MemoryProxy baseline type gate
+read-only under `/home/agent`. This makes the current integration-branch
+feedback contract available to issue branches created before the setup commit,
+without modifying their staged code.
+
 The directory is ignored by Git. On first runner startup, `main.mts` creates a private `config.toml` containing:
 
 ```toml

@@ -16,7 +16,7 @@ Process one branch at a time:
 2. Merge with `git merge --no-ff --no-edit <branch>`.
 3. Resolve conflicts by re-reading both issue contracts and preserving the combined intended behavior.
 4. Identify every package changed by the cumulative merge.
-5. Run its focused regression tests, then every authoritative module-local gate required by `.sandcastle/CODING_STANDARDS.md`.
+5. Run its focused regression tests, then every authoritative module-local gate required by `/home/agent/CODING_STANDARDS.md`.
 6. If a gate turns red, fix the integration defect and rerun the failing check and affected package gate until green.
 7. Close the mapped issue only after the branch is present in `HEAD` and its cumulative gate is green:
 

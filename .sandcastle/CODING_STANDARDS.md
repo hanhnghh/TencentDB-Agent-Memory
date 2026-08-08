@@ -92,7 +92,7 @@ These standards guide review across a multi-package repository. Apply the rules 
 Run validation from every changed package; the repository root is not a substitute for module-local checks.
 
 - `MemoryCore`: run the relevant Vitest suite and `npm run build:plugin` when runtime exports change. Run `npm run lint:skill-isolation` for skill/core changes. The aggregate `npm run build` is not an authoritative gate while the unchanged repository is missing `scripts/seed-v2/tsconfig.json`; do not rerun it to re-establish that baseline.
-- `MemoryProxy`: run the focused Vitest suite, then `npm test`. From the repository root run `.sandcastle/scripts/check-memory-proxy-types.sh`; it accepts only the six documented baseline diagnostics and fails on every new TypeScript diagnostic. Do not replace it with raw `npx tsc --noEmit` during implementation or review.
+- `MemoryProxy`: run the focused Vitest suite, then `npm test`. From the repository root run `/home/agent/check-memory-proxy-types.sh`; it accepts only the six documented baseline diagnostics and fails on every new TypeScript diagnostic. Do not replace it with raw `npx tsc --noEmit` during implementation or review.
 - `MemoryKnowledge`: run `npm run typecheck`, `npm test`, and build checks for exported/server changes.
 - `MemoryPanel`: run backend typecheck/tests when backend code changes. In `MemoryPanel/web`, run `npm run lint:check`, `npm run format:check`, and `npm run build`.
 - TypeScript SDK: run `npm test` and `npm run build`. Python SDK: run `python -m pytest -q` and `python -m build --no-isolation`; the sandbox image already supplies its declared runtime, build backend, and dev tools.

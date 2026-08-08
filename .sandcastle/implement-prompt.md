@@ -12,7 +12,7 @@ If the body references a parent PRD, load that issue too. The ticket defines sco
 
 # Required context
 
-Read `.sandcastle/CODING_STANDARDS.md` completely before editing. Inspect the relevant package manifests, existing tests, and the last ten commits. Preserve unrelated working-tree changes.
+Read `/home/agent/CODING_STANDARDS.md` completely before editing. It is a read-only mount from the integration branch, so existing issue branches receive the current standards without rebasing. Inspect the relevant package manifests, existing tests, and the last ten commits. Preserve unrelated working-tree changes.
 
 # Execution: tracer-bullet feedback loop
 
@@ -33,7 +33,7 @@ Choose the domain loop that matches the ticket:
 - **Codex hook durability:** hook event → session/round classification → ledger/outbox → Core receipt, including retry, duplicate, and restart behavior.
 - **Deployment:** selected runtime mode → startup validation → listener/health smoke check.
 
-Run commands from each changed package. The authoritative command matrix and security/reliability invariants live in `.sandcastle/CODING_STANDARDS.md`; the repository root is not a substitute for module-local validation. Use its baseline-aware commands exactly and do not re-prove a documented repository baseline failure with ad hoc variants. Install dependencies only when the package executable is absent, only in the package that needs them, and respect its existing package manager and lockfile. Reuse the mounted npm, pnpm, and pip caches.
+Run commands from each changed package. The authoritative command matrix and security/reliability invariants live in `/home/agent/CODING_STANDARDS.md`; the repository root is not a substitute for module-local validation. Use its baseline-aware commands exactly and do not re-prove a documented repository baseline failure with ad hoc variants. Install dependencies only when the package executable is absent, only in the package that needs them, and respect its existing package manager and lockfile. Reuse the mounted npm, pnpm, and pip caches.
 
 # Completion gate
 

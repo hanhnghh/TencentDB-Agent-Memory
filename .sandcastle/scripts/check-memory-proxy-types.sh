@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(git rev-parse --show-toplevel)"
+repo_root="$PWD"
 proxy_dir="$repo_root/MemoryProxy"
 tsc="$proxy_dir/node_modules/.bin/tsc"
+
+if [[ ! -d "$proxy_dir" ]]; then
+  echo "Run this gate from the repository root containing MemoryProxy/." >&2
+  exit 2
+fi
 
 if [[ ! -x "$tsc" ]]; then
   echo "MemoryProxy dependencies are missing; install them once before running the type gate." >&2
