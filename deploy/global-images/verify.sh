@@ -187,6 +187,39 @@ check_llm_from_container() {
   fi
 }
 
+proxy_upstream_matches_memory_llm() {
+  [[ "$PROXY_UPSTREAM_URL" == "$MEMORY_LLM_BASE_URL" && \
+     "$PROXY_UPSTREAM_API_KEY" == "$MEMORY_LLM_API_KEY" && \
+     "$PROXY_UPSTREAM_MODEL" == "$MEMORY_LLM_MODEL" ]]
+}
+
+check_proxy_llm() {
+  if ! proxy_transport_enabled; then
+    ok "hooks-only mode: proxy upstream probe disabled"
+    return 0
+  fi
+
+  if [[ "$PROXY_UPSTREAM_AUTH_MODE" == "client-key" ]]; then
+    info "proxy 组使用 client-key passthrough；仅检查上游可达性，不探测用户凭据"
+    check_proxy_upstream_reachable "$PROXY_UPSTREAM_URL"
+    return $?
+  fi
+
+  if proxy_upstream_matches_memory_llm; then
+    ok "proxy 组 与 memory 组完全相同，跳过重复检查"
+    return 0
+  fi
+
+  local check_failed=0
+  if ! check_llm_group "proxy 组" "$PROXY_UPSTREAM_URL" "$PROXY_UPSTREAM_API_KEY" \
+       "$PROXY_UPSTREAM_MODEL" openai; then
+    check_failed=1
+  fi
+  check_llm_from_container tdai-proxy "proxy 组 (from container)" \
+    "$PROXY_UPSTREAM_URL" "$PROXY_UPSTREAM_API_KEY" "$PROXY_UPSTREAM_MODEL" openai
+  return "$check_failed"
+}
+
 # 1. docker
 if command -v "$DOCKER" >/dev/null 2>&1 || [[ -x "$DOCKER" ]]; then
   ok "docker 可用: $DOCKER"
@@ -231,7 +264,7 @@ else
   fi
   for var in "${REQUIRED_VARS[@]}"; do
     val="${!var:-}"
-    if [[ -z "$val" || "$val" == "REPLACE_ME" ]]; then
+    if env_value_is_missing "$val"; then
       MISSING+=("$var")
     fi
   done
@@ -295,29 +328,8 @@ else
       "$MEMORY_LLM_BASE_URL" "$MEMORY_LLM_API_KEY" "$MEMORY_LLM_MODEL" \
       "${MEMORY_LLM_PROTOCOL:-openai}"
 
-    if proxy_transport_enabled; then
-      # proxy 组（如果与 memory 组值完全一样，说明用户填的是同一份，只验 1 次即可）
-      if [[ "$PROXY_UPSTREAM_AUTH_MODE" == "server-key" && \
-            "$PROXY_UPSTREAM_URL" == "$MEMORY_LLM_BASE_URL" && \
-            "$PROXY_UPSTREAM_API_KEY" == "$MEMORY_LLM_API_KEY" && \
-            "$PROXY_UPSTREAM_MODEL" == "$MEMORY_LLM_MODEL" ]]; then
-        ok "proxy 组 与 memory 组完全相同，跳过重复检查"
-      elif [[ "$PROXY_UPSTREAM_AUTH_MODE" == "client-key" ]]; then
-        info "proxy 组使用 client-key passthrough；仅检查上游可达性，不探测用户凭据"
-        if ! check_proxy_upstream_reachable "$PROXY_UPSTREAM_URL"; then
-          ERRORS=$((ERRORS+1))
-        fi
-      else
-        # proxy 组默认按 openai 协议（与 config.yaml 一致）
-        if ! check_llm_group "proxy 组" "$PROXY_UPSTREAM_URL" "$PROXY_UPSTREAM_API_KEY" \
-             "$PROXY_UPSTREAM_MODEL" openai; then
-          ERRORS=$((ERRORS+1))
-        fi
-        check_llm_from_container tdai-proxy "proxy 组 (from container)" \
-          "$PROXY_UPSTREAM_URL" "$PROXY_UPSTREAM_API_KEY" "$PROXY_UPSTREAM_MODEL" openai
-      fi
-    else
-      ok "hooks-only mode: proxy upstream probe disabled"
+    if ! check_proxy_llm; then
+      ERRORS=$((ERRORS+1))
     fi
   fi
 fi

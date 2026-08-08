@@ -2,17 +2,17 @@
 
 set -eu
 
-app_pid=""
-relay_pid=""
+runtime_pid=""
+hook_relay_pid=""
 
 # shellcheck disable=SC2317 # invoked indirectly by the signal traps below
 forward_signal() {
-  signal="$1"
-  if [ -n "$app_pid" ]; then
-    kill "-$signal" "$app_pid" 2>/dev/null || true
+  signal_name="$1"
+  if [ -n "$runtime_pid" ]; then
+    kill "-$signal_name" "$runtime_pid" 2>/dev/null || true
   fi
-  if [ -n "$relay_pid" ]; then
-    kill "-$signal" "$relay_pid" 2>/dev/null || true
+  if [ -n "$hook_relay_pid" ]; then
+    kill "-$signal_name" "$hook_relay_pid" 2>/dev/null || true
   fi
 }
 
@@ -25,24 +25,25 @@ if [ "${PROXY_HOOK_BRIDGE_ENABLED:-0}" = "1" ]; then
   socat \
     "TCP-LISTEN:${bridge_port},bind=0.0.0.0,reuseaddr,fork" \
     "TCP:127.0.0.1:${hook_port}" &
-  relay_pid="$!"
+  hook_relay_pid="$!"
 fi
 
 node --import tsx/esm src/index.ts "$@" &
-app_pid="$!"
+runtime_pid="$!"
 
 set +e
-wait "$app_pid"
-app_status="$?"
-if kill -0 "$app_pid" 2>/dev/null; then
-  wait "$app_pid"
-  app_status="$?"
+wait "$runtime_pid"
+runtime_status="$?"
+# 信号 trap 可能在 runtime 退出前中断 wait，此时需要继续等待。
+if kill -0 "$runtime_pid" 2>/dev/null; then
+  wait "$runtime_pid"
+  runtime_status="$?"
 fi
 set -e
 
-if [ -n "$relay_pid" ]; then
-  kill -TERM "$relay_pid" 2>/dev/null || true
-  wait "$relay_pid" 2>/dev/null || true
+if [ -n "$hook_relay_pid" ]; then
+  kill -TERM "$hook_relay_pid" 2>/dev/null || true
+  wait "$hook_relay_pid" 2>/dev/null || true
 fi
 
-exit "$app_status"
+exit "$runtime_status"

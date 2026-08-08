@@ -7,6 +7,12 @@ import test from "node:test";
 
 const deployDir = resolve(import.meta.dirname);
 const temporaryRoots = [];
+const hooksOnlyOverrides = {
+  PROXY_RUNTIME_MODE: "hooks",
+  PROXY_UPSTREAM_URL: "",
+  PROXY_UPSTREAM_API_KEY: "",
+  PROXY_UPSTREAM_MODEL: "",
+};
 
 test.afterEach(async () => {
   await Promise.all(temporaryRoots.splice(0).map((root) => (
@@ -15,12 +21,7 @@ test.afterEach(async () => {
 });
 
 test("hooks deployment starts without proxy upstream configuration and uses hook health", async () => {
-  const fixture = await deploymentFixture({
-    PROXY_RUNTIME_MODE: "hooks",
-    PROXY_UPSTREAM_URL: "",
-    PROXY_UPSTREAM_API_KEY: "",
-    PROXY_UPSTREAM_MODEL: "",
-  });
+  const fixture = await deploymentFixture(hooksOnlyOverrides);
 
   const result = await runScript("start-proxy.sh", fixture.env);
 
@@ -37,12 +38,7 @@ test("hooks deployment starts without proxy upstream configuration and uses hook
 });
 
 test("full stack validation and launch remain hooks-aware", async () => {
-  const fixture = await deploymentFixture({
-    PROXY_RUNTIME_MODE: "hooks",
-    PROXY_UPSTREAM_URL: "",
-    PROXY_UPSTREAM_API_KEY: "",
-    PROXY_UPSTREAM_MODEL: "",
-  });
+  const fixture = await deploymentFixture(hooksOnlyOverrides);
 
   const result = await runScript("start-all.sh", fixture.env);
 
@@ -89,8 +85,8 @@ test("deployment matrix validates mode-scoped upstream credentials", async (cont
     {
       name: "proxy server-key",
       overrides: { PROXY_RUNTIME_MODE: "proxy" },
-      code: 0,
-      config: /upstream:\n  url: "https:\/\/upstream\.example\/v1"\n  apiKey: "server-secret"/,
+      expectedExitCode: 0,
+      configPattern: /upstream:\n  url: "https:\/\/upstream\.example\/v1"\n  apiKey: "server-secret"/,
     },
     {
       name: "proxy client-key passthrough",
@@ -99,84 +95,67 @@ test("deployment matrix validates mode-scoped upstream credentials", async (cont
         PROXY_UPSTREAM_AUTH_MODE: "client-key",
         PROXY_UPSTREAM_API_KEY: "",
       },
-      code: 0,
-      config: /upstream:\n  url: "https:\/\/upstream\.example\/v1"\n  apiKey: ""/,
+      expectedExitCode: 0,
+      configPattern: /upstream:\n  url: "https:\/\/upstream\.example\/v1"\n  apiKey: ""/,
     },
     {
       name: "both server-key",
       overrides: { PROXY_RUNTIME_MODE: "both" },
-      code: 0,
-      config: /runtime:\n  mode: both/,
-      docker: [/-p 8096:8096/, /-p 127\.0\.0\.1:8097:/],
+      expectedExitCode: 0,
+      configPattern: /runtime:\n  mode: both/,
+      dockerPatterns: [/-p 8096:8096/, /-p 127\.0\.0\.1:8097:/],
     },
     {
       name: "unknown mode",
       overrides: { PROXY_RUNTIME_MODE: "public-hooks" },
-      code: 1,
-      error: /PROXY_RUNTIME_MODE/,
+      expectedExitCode: 1,
+      errorPattern: /PROXY_RUNTIME_MODE/,
     },
     {
       name: "proxy missing URL",
       overrides: { PROXY_RUNTIME_MODE: "proxy", PROXY_UPSTREAM_URL: "" },
-      code: 1,
-      error: /PROXY_UPSTREAM_URL/,
+      expectedExitCode: 1,
+      errorPattern: /PROXY_UPSTREAM_URL/,
     },
     {
       name: "both missing model",
       overrides: { PROXY_RUNTIME_MODE: "both", PROXY_UPSTREAM_MODEL: "" },
-      code: 1,
-      error: /PROXY_UPSTREAM_MODEL/,
+      expectedExitCode: 1,
+      errorPattern: /PROXY_UPSTREAM_MODEL/,
     },
     {
       name: "server-key missing key",
       overrides: { PROXY_UPSTREAM_API_KEY: "" },
-      code: 1,
-      error: /PROXY_UPSTREAM_API_KEY/,
+      expectedExitCode: 1,
+      errorPattern: /PROXY_UPSTREAM_API_KEY/,
     },
     {
       name: "client-key rejects a global override",
       overrides: { PROXY_UPSTREAM_AUTH_MODE: "client-key" },
-      code: 1,
-      error: /client-key.*PROXY_UPSTREAM_API_KEY/,
+      expectedExitCode: 1,
+      errorPattern: /client-key.*PROXY_UPSTREAM_API_KEY/,
     },
     {
       name: "both rejects colliding host ports",
       overrides: { PROXY_RUNTIME_MODE: "both", PROXY_HOOK_PORT: "8096" },
-      code: 1,
-      error: /different host ports/,
+      expectedExitCode: 1,
+      errorPattern: /different host ports/,
     },
     {
       name: "hooks rejects a non-numeric publish target",
       overrides: { PROXY_RUNTIME_MODE: "hooks", PROXY_HOOK_PORT: "0.0.0.0:8097" },
-      code: 1,
-      error: /PROXY_HOOK_PORT.*1.*65535/,
+      expectedExitCode: 1,
+      errorPattern: /PROXY_HOOK_PORT.*1.*65535/,
     },
   ];
 
   for (const matrixCase of cases) {
-    await context.test(matrixCase.name, async () => {
-      const fixture = await deploymentFixture(matrixCase.overrides);
-      const result = await runScript("start-proxy.sh", fixture.env);
-      assert.equal(result.code, matrixCase.code, result.stderr);
-      if (matrixCase.error) assert.match(result.stderr, matrixCase.error);
-      if (matrixCase.config) {
-        assert.match(await readFile(fixture.configFile, "utf8"), matrixCase.config);
-      }
-      if (matrixCase.docker) {
-        const dockerLog = await readFile(fixture.dockerLog, "utf8");
-        for (const expected of matrixCase.docker) assert.match(dockerLog, expected);
-      }
-    });
+    await context.test(matrixCase.name, () => assertDeploymentCase(matrixCase));
   }
 });
 
 test("hooks verification probes the internal memory model but not proxy upstream", async () => {
-  const fixture = await deploymentFixture({
-    PROXY_RUNTIME_MODE: "hooks",
-    PROXY_UPSTREAM_URL: "",
-    PROXY_UPSTREAM_API_KEY: "",
-    PROXY_UPSTREAM_MODEL: "",
-  });
+  const fixture = await deploymentFixture(hooksOnlyOverrides);
 
   const result = await runScript("verify.sh", fixture.env);
 
@@ -204,7 +183,7 @@ test("client-key verification checks upstream reachability without a deployment 
   assert.doesNotMatch(upstreamProbe, /Authorization|server-secret/);
 });
 
-test("container contract relays host-loopback hooks and forwards shutdown to the runtime", async () => {
+test("container contract publishes the host-loopback hook relay", async () => {
   const fixture = await deploymentFixture({
     PROXY_RUNTIME_MODE: "both",
   });
@@ -217,13 +196,6 @@ test("container contract relays host-loopback hooks and forwards shutdown to the
   const dockerfile = await readFile(resolve(deployDir, "../../MemoryProxy/Dockerfile"), "utf8");
   assert.match(dockerfile, /CMD curl .*PROXY_HEALTH_PORT/);
   assert.match(dockerfile, /container-entrypoint\.sh/);
-  const entrypoint = await readFile(
-    resolve(deployDir, "../../MemoryProxy/scripts/container-entrypoint.sh"),
-    "utf8",
-  );
-  assert.match(entrypoint, /trap .*TERM/);
-  assert.match(entrypoint, /kill .*app_pid/);
-  assert.match(entrypoint, /wait .*app_pid/);
 });
 
 test("container entrypoint stops the hook relay and waits for runtime shutdown", async () => {
@@ -289,6 +261,26 @@ test("examples and bilingual install docs describe the deployed runtime contract
     assert.match(document, /127\.0\.0\.1.*8097/);
   }
 });
+
+async function assertDeploymentCase(matrixCase) {
+  const fixture = await deploymentFixture(matrixCase.overrides);
+  const result = await runScript("start-proxy.sh", fixture.env);
+
+  assert.equal(result.code, matrixCase.expectedExitCode, result.stderr);
+  if (matrixCase.errorPattern) {
+    assert.match(result.stderr, matrixCase.errorPattern);
+  }
+  if (matrixCase.configPattern) {
+    const config = await readFile(fixture.configFile, "utf8");
+    assert.match(config, matrixCase.configPattern);
+  }
+  if (matrixCase.dockerPatterns) {
+    const dockerLog = await readFile(fixture.dockerLog, "utf8");
+    for (const expected of matrixCase.dockerPatterns) {
+      assert.match(dockerLog, expected);
+    }
+  }
+}
 
 async function deploymentFixture(overrides = {}) {
   const root = await mkdtemp(join(tmpdir(), "tdai-deployment-mode-"));

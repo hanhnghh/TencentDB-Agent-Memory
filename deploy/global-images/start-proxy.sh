@@ -25,6 +25,11 @@ MEMORY_CORE_GATEWAY_API_KEY="${MEMORY_CORE_GATEWAY_API_KEY-}"
 
 CONTAINER=tdai-proxy
 NETWORK=tdai-memory-stack
+CONTAINER_PROXY_PORT=8096
+CONTAINER_HOOK_PORT=8097
+CONTAINER_HOOK_BRIDGE_PORT=18097
+CONTAINER_DATA_DIR=/data/tdai-memory-proxy
+CONTAINER_DB_PATH="$CONTAINER_DATA_DIR/proxy.db"
 
 if ! $DOCKER network inspect "$NETWORK" >/dev/null 2>&1; then
   info "创建 docker 网络 $NETWORK"
@@ -88,11 +93,11 @@ runtime:
   mode: ${PROXY_RUNTIME_MODE}
   hooks:
     host: 127.0.0.1
-    port: 8097
+    port: ${CONTAINER_HOOK_PORT}
 
 server:
   host: 0.0.0.0
-  port: 8096
+  port: ${CONTAINER_PROXY_PORT}
   forwardTimeoutMs: 600000
 
 upstream:
@@ -157,20 +162,20 @@ storage:
   enabled: true
   backend: sqlite
   sqlite:
-    dbPath: /data/tdai-memory-proxy/proxy.db
+    dbPath: ${CONTAINER_DB_PATH}
 YAML
 
-HEALTH_PORT=8096
+HEALTH_PORT=$CONTAINER_PROXY_PORT
 HOOK_BRIDGE_ENABLED=0
 PORT_ARGS=()
 if proxy_transport_enabled; then
-  PORT_ARGS+=( -p "${PROXY_PORT}:8096" )
+  PORT_ARGS+=( -p "${PROXY_PORT}:${CONTAINER_PROXY_PORT}" )
 fi
 if hook_transport_enabled; then
-  PORT_ARGS+=( -p "127.0.0.1:${PROXY_HOOK_PORT}:18097" )
+  PORT_ARGS+=( -p "127.0.0.1:${PROXY_HOOK_PORT}:${CONTAINER_HOOK_BRIDGE_PORT}" )
   HOOK_BRIDGE_ENABLED=1
   if [[ "$PROXY_RUNTIME_MODE" == "hooks" ]]; then
-    HEALTH_PORT=8097
+    HEALTH_PORT=$CONTAINER_HOOK_PORT
   fi
 fi
 
@@ -182,11 +187,11 @@ $DOCKER run -d --name "$CONTAINER" \
   "${PORT_ARGS[@]}" \
   -e "PROXY_HEALTH_PORT=${HEALTH_PORT}" \
   -e "PROXY_HOOK_BRIDGE_ENABLED=${HOOK_BRIDGE_ENABLED}" \
-  -e PROXY_HOOK_PORT=8097 \
-  -e PROXY_HOOK_BRIDGE_PORT=18097 \
-  -e PROXY_DB_PATH=/data/tdai-memory-proxy/proxy.db \
-  -e PROXY_OUTBOX_PATH=/data/tdai-memory-proxy/proxy.db \
-  -v "${PROXY_VOLUME}:/data/tdai-memory-proxy" \
+  -e "PROXY_HOOK_PORT=${CONTAINER_HOOK_PORT}" \
+  -e "PROXY_HOOK_BRIDGE_PORT=${CONTAINER_HOOK_BRIDGE_PORT}" \
+  -e "PROXY_DB_PATH=${CONTAINER_DB_PATH}" \
+  -e "PROXY_OUTBOX_PATH=${CONTAINER_DB_PATH}" \
+  -v "${PROXY_VOLUME}:${CONTAINER_DATA_DIR}" \
   -v "$CONFIG_FILE:/data/config.yaml:ro" \
   "$PROXY_IMAGE" >/dev/null
 

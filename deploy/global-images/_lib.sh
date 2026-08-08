@@ -30,12 +30,17 @@ load_env() {
   set +a
 }
 
+env_value_is_missing() {
+  [[ -z "$1" || "$1" == "REPLACE_ME" ]]
+}
+
 # 校验一组必填变量；缺一个都不启动，一次性列出所有缺失项
 require_vars() {
   local missing=()
+  local var value
   for var in "$@"; do
-    local val="${!var:-}"
-    if [[ -z "$val" || "$val" == "REPLACE_ME" ]]; then
+    value="${!var:-}"
+    if env_value_is_missing "$value"; then
       missing+=("$var")
     fi
   done
