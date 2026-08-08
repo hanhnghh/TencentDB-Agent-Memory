@@ -11,6 +11,7 @@ import { CoreSkillClient, setCoreSkillClient } from "../../skill/core-client.js"
 import { triggerSkillExtractIfReady } from "../../skill/handler-glue.js";
 import { extractLatestUserMessage, recordTdaiTurn } from "../../tdai/recorder.js";
 import { TdaiClient } from "../../tdai/client.js";
+import { flushPendingWrites } from "../../tdai/pending-writes.js";
 import type { TdaiIdentity } from "../../tdai/types.js";
 import {
   COMPLETED_ROUND_GOLDEN,
@@ -69,12 +70,14 @@ function memoryParityConfig(): ProxyConfig {
   return config;
 }
 
-async function seedParitySession(): Promise<void> {
+async function seedParitySession(
+  agentSource: string = PARITY_IDENTITY.agentSource,
+): Promise<void> {
   await getSessionStore().set(
-    `${PARITY_IDENTITY.agentSource}:${PARITY_IDENTITY.sessionId}`,
+    `${agentSource}:${PARITY_IDENTITY.sessionId}`,
     {
       status: "initialized",
-      keyId: `${PARITY_IDENTITY.agentSource}:${PARITY_IDENTITY.sessionId}`,
+      keyId: `${agentSource}:${PARITY_IDENTITY.sessionId}`,
       startedAt: 1,
       attemptCount: 0,
       userId: PARITY_IDENTITY.userId,
@@ -93,7 +96,7 @@ afterEach(() => {
 });
 
 describe("memory parity: observed legacy intermediate L0 behavior", () => {
-  it("keeps the proxy route's intermediate L0 write separate from completed-round skill ingestion", async () => {
+  it("keeps the Anthropic proxy route's intermediate L0 write separate from completed-round skill ingestion", async () => {
     const config = memoryParityConfig();
     await seedParitySession();
 
@@ -176,7 +179,115 @@ describe("memory parity: observed legacy intermediate L0 behavior", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual(intermediateBody);
-    await vi.waitFor(() => expect(l0Requests).toHaveLength(1));
+    await expect(flushPendingWrites(1_000)).resolves.toEqual({
+      drained: true,
+      remaining: 0,
+    });
+    expect(l0Requests).toHaveLength(1);
+    expect(l0Requests[0]).toMatchObject({
+      team_id: PARITY_IDENTITY.teamId,
+      user_id: PARITY_IDENTITY.userId,
+      agent_id: PARITY_IDENTITY.agentId,
+      session_id: PARITY_IDENTITY.sessionId,
+      task_id: PARITY_IDENTITY.taskId,
+      messages: [
+        { role: "user", content: USER_PROMPT },
+        { role: "assistant", content: INTERMEDIATE_ASSISTANT },
+      ],
+    });
+    expect(skillRequests).toHaveLength(0);
+  });
+
+  it("keeps the OpenAI proxy route's intermediate L0 write separate from completed-round skill ingestion", async () => {
+    const config = memoryParityConfig();
+    await seedParitySession("codebuddy");
+
+    const l0Requests: Array<Record<string, unknown>> = [];
+    const skillRequests: Array<Record<string, unknown>> = [];
+    const intermediateBody = {
+      id: "chatcmpl-intermediate",
+      object: "chat.completion",
+      choices: [{
+        index: 0,
+        message: {
+          role: "assistant",
+          content: INTERMEDIATE_ASSISTANT,
+          tool_calls: [{
+            id: "tool-1",
+            type: "function",
+            function: {
+              name: "shell",
+              arguments: JSON.stringify({ cmd: "printf 'xin chào'" }),
+            },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url === config.upstream.url) {
+        return new Response(JSON.stringify(intermediateBody), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url === config.creditReport.url) {
+        return new Response(JSON.stringify({ code: 0 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.endsWith("/v3/meta/config/user/get")) {
+        return new Response(JSON.stringify({ code: 0, data: { items: [] } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.endsWith("/v3/skill/conversation/add")) {
+        skillRequests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return new Response(JSON.stringify({ code: 0, data: { status: "ok" } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.endsWith("/v3/conversation/add")) {
+        l0Requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return new Response(JSON.stringify({ code: 0, data: {} }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error(`unexpected fixture URL: ${url}`);
+    }));
+
+    const app = createApp(config);
+    const response = await app.request(
+      `/codebuddy/${PARITY_IDENTITY.spaceId}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer client-key",
+          "content-type": "application/json",
+          "x-conversation-id": PARITY_IDENTITY.sessionId,
+          "x-user-id": PARITY_IDENTITY.userId,
+        },
+        body: JSON.stringify({
+          model: "fixture-model",
+          stream: false,
+          messages: [PROXY_ROUND_INPUTS[1].messages[1]],
+        }),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual(intermediateBody);
+    await expect(flushPendingWrites(1_000)).resolves.toEqual({
+      drained: true,
+      remaining: 0,
+    });
+    expect(l0Requests).toHaveLength(1);
     expect(l0Requests[0]).toMatchObject({
       team_id: PARITY_IDENTITY.teamId,
       user_id: PARITY_IDENTITY.userId,
@@ -264,7 +375,7 @@ describe("memory parity: observed legacy intermediate L0 behavior", () => {
 });
 
 describe("memory parity: approved completed-round target", () => {
-  it.fails("commits one L0 write for the completed human round", async () => {
+  it.fails("commits one Anthropic L0 write for the completed human round", async () => {
     const config = memoryParityConfig();
     await seedParitySession();
     const upstreamResponses = [
@@ -337,7 +448,10 @@ describe("memory parity: approved completed-round target", () => {
 
     await callProxy([PROXY_ROUND_INPUTS[0].messages[1]]);
     await callProxy(PROXY_ROUND_INPUTS[0].messages.slice(1));
-    await vi.waitFor(() => expect(l0Requests.length).toBeGreaterThan(0));
+    await expect(flushPendingWrites(1_000)).resolves.toEqual({
+      drained: true,
+      remaining: 0,
+    });
 
     expect(l0Requests).toHaveLength(1);
     expect(l0Requests[0]).toMatchObject({
@@ -348,7 +462,100 @@ describe("memory parity: approved completed-round target", () => {
     });
   });
 
-  it("commits the full normalized tool-aware round to skill ingestion only after the final response", async () => {
+  it.fails("commits one OpenAI L0 write for the completed human round", async () => {
+    const config = memoryParityConfig();
+    await seedParitySession("codebuddy");
+    const upstreamResponses = [
+      {
+        id: "chatcmpl-intermediate",
+        object: "chat.completion",
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content: INTERMEDIATE_ASSISTANT,
+            tool_calls: [{
+              id: "tool-1",
+              type: "function",
+              function: {
+                name: "shell",
+                arguments: JSON.stringify({ cmd: "printf 'xin chào'" }),
+              },
+            }],
+          },
+          finish_reason: "tool_calls",
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      },
+      {
+        id: "chatcmpl-final",
+        object: "chat.completion",
+        choices: [{
+          index: 0,
+          message: { role: "assistant", content: FINAL_ASSISTANT },
+          finish_reason: "stop",
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      },
+    ];
+    const l0Requests: Array<Record<string, unknown>> = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url === config.upstream.url) {
+        const next = upstreamResponses.shift();
+        if (!next) throw new Error("unexpected third upstream request");
+        return new Response(JSON.stringify(next), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.endsWith("/v3/conversation/add")) {
+        l0Requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      }
+      return new Response(JSON.stringify({ code: 0, data: { items: [] } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    vi.stubGlobal("fetch", vi.fn(fetcher));
+    const app = createApp(config);
+    const callProxy = (messages: Array<Record<string, unknown>>) => app.request(
+      `/codebuddy/${PARITY_IDENTITY.spaceId}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer client-key",
+          "content-type": "application/json",
+          "x-conversation-id": PARITY_IDENTITY.sessionId,
+          "x-user-id": PARITY_IDENTITY.userId,
+        },
+        body: JSON.stringify({
+          model: "fixture-model",
+          stream: false,
+          messages,
+        }),
+      },
+    );
+
+    await callProxy([PROXY_ROUND_INPUTS[1].messages[1]]);
+    await callProxy(PROXY_ROUND_INPUTS[1].messages.slice(1));
+    await expect(flushPendingWrites(1_000)).resolves.toEqual({
+      drained: true,
+      remaining: 0,
+    });
+
+    expect(l0Requests).toHaveLength(1);
+    expect(l0Requests[0]).toMatchObject({
+      messages: [
+        { role: "user", content: USER_PROMPT },
+        { role: "assistant", content: FINAL_ASSISTANT },
+      ],
+    });
+  });
+
+  it.each(PROXY_ROUND_INPUTS)(
+    "$protocol proxy commits the full normalized tool-aware round to skill ingestion only after the final response",
+    async (fixture) => {
     const requests: Array<{ url: string; init?: RequestInit }> = [];
     const fetcher: typeof fetch = async (url, init) => {
         requests.push({ url: String(url), init });
@@ -359,7 +566,6 @@ describe("memory parity: approved completed-round target", () => {
       };
     const client = new CoreSkillClient(coreSkillConfig, fetcher);
     setCoreSkillClient(client);
-    const fixture = PROXY_ROUND_INPUTS[0];
     const config = memoryParityConfig();
     const sessionInfo = {
       session_id: PARITY_IDENTITY.sessionId,
@@ -376,10 +582,20 @@ describe("memory parity: approved completed-round target", () => {
       agentSource: fixture.agentSource,
       sessionInfo,
       inputMessages: fixture.messages,
-      assistantMessage: {
-        role: "assistant",
-        content: [{ type: "tool_use", id: "still-running", name: "read", input: {} }],
-      },
+      assistantMessage: fixture.protocol === "anthropic"
+        ? {
+            role: "assistant",
+            content: [{ type: "tool_use", id: "still-running", name: "read", input: {} }],
+          }
+        : {
+            role: "assistant",
+            content: null,
+            tool_calls: [{
+              id: "still-running",
+              type: "function",
+              function: { name: "read", arguments: "{}" },
+            }],
+          },
       protocol: fixture.protocol,
     });
     expect(requests).toHaveLength(0);
@@ -422,5 +638,6 @@ describe("memory parity: approved completed-round target", () => {
       task_id: PARITY_IDENTITY.taskId,
       messages: COMPLETED_ROUND_GOLDEN,
     });
-  });
+    },
+  );
 });

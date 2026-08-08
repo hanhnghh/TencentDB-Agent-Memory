@@ -2,6 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { checkAclOrDeny, TdaiClient } from "../../tdai/client.js";
 import { fetchAssetCapabilities } from "../../tdai/capabilities.js";
+import { CoreKnowledgeClient } from "../../knowledge/core-client.js";
+import { KnowledgeToolsInjector } from "../../injection/injectors/knowledge-tools-injector.js";
+import { SkillToolsInjector } from "../../injection/injectors/skill-tools-injector.js";
+import { TdaiMemoryToolsInjector } from "../../injection/injectors/tdai-tools-injector.js";
 import { createApp } from "../../server.js";
 import { DEFAULT_CONFIG } from "../../config.js";
 import {
@@ -9,6 +13,7 @@ import {
   getSessionStore,
 } from "../../session/store.js";
 import type { ProxyConfig } from "../../types.js";
+import type { AssetCapabilityFlags, PrewarmInput } from "../../injection/types.js";
 import {
   PARITY_AGENT,
   PARITY_IDENTITY,
@@ -21,6 +26,21 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
+
+function capabilityPrewarmInput(
+  assetCapabilities: AssetCapabilityFlags,
+): PrewarmInput {
+  return {
+    keyId: `${PARITY_IDENTITY.agentSource}:${PARITY_IDENTITY.sessionId}`,
+    spaceId: PARITY_IDENTITY.spaceId,
+    userId: PARITY_IDENTITY.userId,
+    agentSource: PARITY_IDENTITY.agentSource,
+    sessionInfo: PARITY_SESSION_INFO,
+    agentDetail: PARITY_AGENT,
+    taskDetail: PARITY_TASK,
+    assetCapabilities,
+  };
+}
 
 describe("memory parity: ACL and capability gates", () => {
   it("maps per-user asset capability flags without contacting a real service", async () => {
@@ -58,6 +78,125 @@ describe("memory parity: ACL and capability gates", () => {
     });
   });
 
+  it("suppresses skill context when the skill capability is disabled", async () => {
+    const injector = new SkillToolsInjector({
+      proxyBaseUrl: "http://proxy.fixture",
+      allowLlmWrite: false,
+    });
+
+    await expect(injector.prewarm(capabilityPrewarmInput({
+      skill: false,
+      llm_wiki: true,
+      code_graph: true,
+      chat_memory: true,
+    }))).resolves.toEqual([]);
+    await expect(injector.prewarm(capabilityPrewarmInput({
+      skill: true,
+      llm_wiki: true,
+      code_graph: true,
+      chat_memory: true,
+    }))).resolves.toEqual([
+      expect.objectContaining({
+        type: "text",
+        content: expect.stringContaining("<skill_tools>"),
+      }),
+    ]);
+  });
+
+  it("suppresses memory context when the chat-memory capability is disabled", async () => {
+    const injector = new TdaiMemoryToolsInjector({
+      proxyBaseUrl: "http://proxy.fixture",
+    });
+
+    expect(injector.prewarm(capabilityPrewarmInput({
+      skill: true,
+      llm_wiki: true,
+      code_graph: true,
+      chat_memory: false,
+    }))).toEqual([]);
+    expect(injector.prewarm(capabilityPrewarmInput({
+      skill: true,
+      llm_wiki: true,
+      code_graph: true,
+      chat_memory: true,
+    }))).toEqual([
+      expect.objectContaining({
+        type: "text",
+        content: expect.stringContaining("<tdai_memory_tools>"),
+      }),
+    ]);
+  });
+
+  it.each([
+    {
+      disabled: "llm_wiki",
+      capabilities: { skill: true, llm_wiki: false, code_graph: true, chat_memory: true },
+      omittedId: "wiki-a",
+      retainedId: "graph-a",
+    },
+    {
+      disabled: "code_graph",
+      capabilities: { skill: true, llm_wiki: true, code_graph: false, chat_memory: true },
+      omittedId: "graph-a",
+      retainedId: "wiki-a",
+    },
+  ] as const)(
+    "suppresses $disabled knowledge context while retaining the other knowledge type",
+    async ({ capabilities, omittedId, retainedId }) => {
+      const client = new CoreKnowledgeClient({
+        endpoint: "http://core.fixture",
+        serviceToken: "service-token",
+        serviceId: PARITY_IDENTITY.spaceId,
+        timeoutMs: 1_000,
+      }, async () => new Response(JSON.stringify({
+        code: 0,
+        data: {
+          items: [
+            {
+              knowledge_id: "wiki-a",
+              type: "wiki",
+              service_url: "http://knowledge.fixture/v3",
+              name: "Fixture Wiki",
+              summary: "Wiki fixture",
+              team_id: PARITY_IDENTITY.teamId,
+              user_id: PARITY_IDENTITY.userId,
+              created_at: "2026-01-01T00:00:00.000Z",
+              updated_at: "2026-01-01T00:00:00.000Z",
+            },
+            {
+              knowledge_id: "graph-a",
+              type: "code-graph",
+              service_url: "http://knowledge.fixture/v3",
+              name: "Fixture Graph",
+              summary: "Graph fixture",
+              team_id: PARITY_IDENTITY.teamId,
+              user_id: PARITY_IDENTITY.userId,
+              repo_url: "https://example.invalid/repo.git",
+              branch: "main",
+              created_at: "2026-01-01T00:00:00.000Z",
+              updated_at: "2026-01-01T00:00:00.000Z",
+            },
+          ],
+          total: 2,
+        },
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+      const injector = new KnowledgeToolsInjector({
+        coreSkill: {
+          endpoint: "http://core.fixture",
+          serviceToken: "service-token",
+          serviceId: PARITY_IDENTITY.spaceId,
+          timeoutMs: 1_000,
+        },
+      }, client);
+
+      const blocks = await injector.prewarm(capabilityPrewarmInput(capabilities));
+
+      expect(blocks).toHaveLength(1);
+      expect(blocks[0].content).toContain(retainedId);
+      expect(blocks[0].content).not.toContain(omittedId);
+    },
+  );
+
   it("fails ACL checks closed when the authorization service is unavailable", async () => {
     const client = new TdaiClient({
       enabled: true,
@@ -79,6 +218,43 @@ describe("memory parity: ACL and capability gates", () => {
       action: "read",
       agent_id: "agent-a",
     })).resolves.toEqual({ allowed: false, reason: "acl_check_error" });
+  });
+
+  it("preserves an explicit ACL rejection from the authorization service", async () => {
+    const fetcher = vi.fn(async (_input: string | URL | Request, init?: RequestInit) =>
+      new Response(JSON.stringify({
+        code: 0,
+        data: { allowed: false, reason: "team_scope_denied" },
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetcher);
+    const client = new TdaiClient({
+      enabled: true,
+      endpoint: "http://memory.fixture",
+      apiKey: "service-token",
+      serviceId: PARITY_IDENTITY.spaceId,
+      writeL0: true,
+      recallL1: true,
+      injectL2L3: true,
+      l1Limit: 5,
+      l2Limit: 3,
+      timeoutMs: 50,
+    });
+
+    await expect(client.checkAcl({
+      user_key: "user-key",
+      asset_id: `chat_memory-${PARITY_IDENTITY.teamId}-${PARITY_IDENTITY.agentId}`,
+      action: "read",
+      agent_id: PARITY_IDENTITY.agentId,
+    })).resolves.toEqual({ allowed: false, reason: "team_scope_denied" });
+    expect(fetcher).toHaveBeenCalledOnce();
+    const [input, init] = fetcher.mock.calls[0];
+    expect(String(input)).toBe("http://memory.fixture/v3/meta/acl/check");
+    expect(new Headers(init?.headers).get("x-tdai-user-key")).toBe("user-key");
+    expect(JSON.parse(String(init?.body))).toMatchObject({
+      user_key: "user-key",
+      action: "read",
+      agent_id: PARITY_IDENTITY.agentId,
+    });
   });
 
   it("fails ACL checks closed on a malformed success envelope", async () => {

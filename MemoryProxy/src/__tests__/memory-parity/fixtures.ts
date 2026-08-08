@@ -52,7 +52,9 @@ export interface NormalizationScenario {
     | "multiple-tools"
     | "failed-tool"
     | "empty-result"
-    | "large-result-boundary"
+    | "large-result-below-boundary"
+    | "large-result-at-boundary"
+    | "large-result-above-boundary"
     | "local-exec"
     | "apply-patch"
     | "mcp-tool";
@@ -124,7 +126,12 @@ export const INJECTED_MEMORY_CONTEXT =
 export const INTERMEDIATE_ASSISTANT = "I will inspect the workspace.";
 export const FINAL_ASSISTANT = "Done — the code block and Unicode are preserved.";
 
-export const LARGE_TOOL_RESULT = "界".repeat(40 * 1024 + 1);
+export const LARGE_PAYLOAD_BOUNDARY_BYTES = 40 * 1024;
+export const LARGE_TOOL_RESULTS = {
+  below: "a".repeat(LARGE_PAYLOAD_BOUNDARY_BYTES - 1),
+  at: "a".repeat(LARGE_PAYLOAD_BOUNDARY_BYTES),
+  above: "a".repeat(LARGE_PAYLOAD_BOUNDARY_BYTES + 1),
+} as const;
 
 function createNormalizationScenario(input: {
   id: NormalizationScenario["id"];
@@ -323,16 +330,40 @@ export const NORMALIZATION_SCENARIOS: NormalizationScenario[] = [
     assistant: "The file is empty.",
   }),
   createNormalizationScenario({
-    id: "large-result-boundary",
-    userPrompt: "Read the large generated payload",
+    id: "large-result-below-boundary",
+    userPrompt: "Read the payload immediately below the extraction boundary",
     tools: [{
-      toolCallId: "tool-large",
+      toolCallId: "tool-large-below",
       toolName: "read",
-      input: { path: "large.txt" },
-      result: LARGE_TOOL_RESULT,
+      input: { path: "large-below.txt" },
+      result: LARGE_TOOL_RESULTS.below,
       failed: false,
     }],
-    assistant: "The large payload was preserved.",
+    assistant: "The below-boundary payload was preserved.",
+  }),
+  createNormalizationScenario({
+    id: "large-result-at-boundary",
+    userPrompt: "Read the payload at the extraction boundary",
+    tools: [{
+      toolCallId: "tool-large-at",
+      toolName: "read",
+      input: { path: "large-at.txt" },
+      result: LARGE_TOOL_RESULTS.at,
+      failed: false,
+    }],
+    assistant: "The at-boundary payload was preserved.",
+  }),
+  createNormalizationScenario({
+    id: "large-result-above-boundary",
+    userPrompt: "Read the payload immediately above the extraction boundary",
+    tools: [{
+      toolCallId: "tool-large-above",
+      toolName: "read",
+      input: { path: "large-above.txt" },
+      result: LARGE_TOOL_RESULTS.above,
+      failed: false,
+    }],
+    assistant: "The above-boundary payload was preserved.",
   }),
   createNormalizationScenario({
     id: "local-exec",

@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { describe, expect, it } from "vitest";
 
 import { normalizeConversation } from "../../skill/normalize-conversation.js";
@@ -6,7 +7,8 @@ import {
   HOSTED_TOOL_VISIBILITY_FIXTURE,
   HOOK_ROUND_INPUT,
   INJECTED_MEMORY_CONTEXT,
-  LARGE_TOOL_RESULT,
+  LARGE_PAYLOAD_BOUNDARY_BYTES,
+  LARGE_TOOL_RESULTS,
   NORMALIZATION_SCENARIOS,
   PROXY_ROUND_INPUTS,
   normalizedHookRound,
@@ -46,7 +48,9 @@ describe("memory parity: completed-round normalization", () => {
       "multiple-tools",
       "failed-tool",
       "empty-result",
-      "large-result-boundary",
+      "large-result-below-boundary",
+      "large-result-at-boundary",
+      "large-result-above-boundary",
       "local-exec",
       "apply-patch",
       "mcp-tool",
@@ -64,16 +68,24 @@ describe("memory parity: completed-round normalization", () => {
     },
   );
 
-  it("preserves the large tool result beyond the 40 KiB extraction boundary", () => {
-    const scenario = NORMALIZATION_SCENARIOS.find(
-      ({ id }) => id === "large-result-boundary",
-    );
+  it.each([
+    ["below", LARGE_PAYLOAD_BOUNDARY_BYTES - 1],
+    ["at", LARGE_PAYLOAD_BOUNDARY_BYTES],
+    ["above", LARGE_PAYLOAD_BOUNDARY_BYTES + 1],
+  ] as const)(
+    "preserves the tool result $0 the 40 KiB byte boundary",
+    (position, expectedBytes) => {
+      const id = `large-result-${position}-boundary`;
+      const result = LARGE_TOOL_RESULTS[position];
+      const scenario = NORMALIZATION_SCENARIOS.find(
+        ({ id: scenarioId }) => scenarioId === id,
+      );
 
-    expect(scenario).toBeDefined();
-    expect(LARGE_TOOL_RESULT.length).toBeGreaterThan(40 * 1024);
-    expect(scenario?.golden.find(({ role }) => role === "tool_result")?.content)
-      .toBe(LARGE_TOOL_RESULT);
-  });
+      expect(Buffer.byteLength(result, "utf8")).toBe(expectedBytes);
+      expect(scenario?.golden.find(({ role }) => role === "tool_result")?.content)
+        .toBe(result);
+    },
+  );
 
   it("keeps hosted-tool omission explicit at the proxy/hook visibility boundary", () => {
     const { proxyInput, hookInput, proxyGolden, hookGolden } =

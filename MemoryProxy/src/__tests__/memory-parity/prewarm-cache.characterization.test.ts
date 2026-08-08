@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { HookCacheEntry, HookCacheRepo } from "../../db/hookCacheRepo.js";
+import { AnthropicAdapter } from "../../injection/adapters/anthropic.js";
+import type { ProtocolAdapter } from "../../injection/adapters/interface.js";
 import { OpenAIAdapter } from "../../injection/adapters/openai.js";
 import { InjectionPipeline } from "../../injection/pipeline.js";
 import { prewarmAll } from "../../injection/prewarm.js";
@@ -121,7 +123,10 @@ describe("memory parity: prewarm, cache, and context order", () => {
     expect(prewarm.cachedHookIds).toEqual(["wiki", "memory", "skills"]);
     const pipeline = new InjectionPipeline(
       registry,
-      new Map([["openai", new OpenAIAdapter()]]),
+      new Map<string, ProtocolAdapter>([
+        ["openai", new OpenAIAdapter()],
+        ["anthropic", new AnthropicAdapter()],
+      ]),
       { hookCacheRepo: cache },
     );
     const result = await pipeline.process(
@@ -152,6 +157,35 @@ describe("memory parity: prewarm, cache, and context order", () => {
       },
       { role: "user", content: "real-user-prompt" },
     ]);
+
+    const anthropicResult = await pipeline.process(
+      {
+        model: "fixture-model",
+        system: "base-system",
+        messages: [{ role: "user", content: "real-user-prompt" }],
+      },
+      {
+        protocol: "anthropic",
+        traceId: "trace-2",
+        keyId: "key-2",
+        modelId: "fixture-model",
+        stream: false,
+        spaceId: PARITY_IDENTITY.spaceId,
+        userId: PARITY_IDENTITY.userId,
+        agentSource: PARITY_IDENTITY.agentSource,
+        custom: { session: PARITY_SESSION_INFO },
+      },
+    );
+
+    expect(anthropicResult.system).toEqual([
+      { type: "text", text: "base-system" },
+      { type: "text", text: "memory-context" },
+      { type: "text", text: "skill-context" },
+      { type: "text", text: "wiki-context" },
+    ]);
+    expect(anthropicResult.messages).toEqual([
+      { role: "user", content: [{ type: "text", text: "real-user-prompt" }] },
+    ]);
     expect(memoryHook.execute).not.toHaveBeenCalled();
     expect(skillHook.execute).not.toHaveBeenCalled();
     expect(wikiHook.execute).not.toHaveBeenCalled();
@@ -174,6 +208,13 @@ describe("memory parity: prewarm, cache, and context order", () => {
       PARITY_IDENTITY.userId,
       "another-agent-source",
       PARITY_IDENTITY.sessionId,
+      "memory",
+    )).resolves.toBeNull();
+    await expect(cache.get(
+      PARITY_IDENTITY.spaceId,
+      PARITY_IDENTITY.userId,
+      PARITY_IDENTITY.agentSource,
+      "another-session",
       "memory",
     )).resolves.toBeNull();
   });
