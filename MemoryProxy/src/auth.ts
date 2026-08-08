@@ -23,6 +23,16 @@ export interface VerifyUserResult {
   rejectReason?: string;
 }
 
+export interface UserKeyVerifierConfig {
+  url: string;
+  timeoutMs: number;
+}
+
+interface UserKeyVerifierObserver {
+  httpError?(status: number, serviceId: string): void;
+  error?(reason: string, serviceId: string): void;
+}
+
 // ── Module state ──────────────────────────────────────────────────────────────
 
 let config: AuthConfig | null = null;
@@ -69,6 +79,29 @@ export function isAuthEnabled(): boolean {
  */
 export async function verifyUserKey(userKey: string, serviceId: string): Promise<VerifyUserResult> {
   if (!config) return { userId: "", rejected: false };
+  return verifyUserKeyWithConfig(config, userKey, serviceId, globalThis.fetch.bind(globalThis), {
+    httpError: (status, verifiedServiceId) => {
+      log.warn("auth.verify.httpError", { status, serviceId: verifiedServiceId });
+    },
+    error: (reason, verifiedServiceId) => {
+      log.warn("auth.verify.error", { error: reason, serviceId: verifiedServiceId });
+    },
+  });
+}
+
+/**
+ * Verify a key with explicit configuration.
+ *
+ * Binding commands use this form because they are short-lived and must not
+ * depend on the server process' module-global initialization.
+ */
+export async function verifyUserKeyWithConfig(
+  verifier: UserKeyVerifierConfig,
+  userKey: string,
+  serviceId: string,
+  fetcher: typeof fetch = globalThis.fetch.bind(globalThis),
+  observer?: UserKeyVerifierObserver,
+): Promise<VerifyUserResult> {
   if (!serviceId) return { userId: "", rejected: true, rejectReason: "missing service_id (spaceId not in request path)" };
   if (!userKey) return { userId: "", rejected: true, rejectReason: "missing user_key" };
 
@@ -81,16 +114,16 @@ export async function verifyUserKey(userKey: string, serviceId: string): Promise
       },
       body: JSON.stringify({ user_key: userKey }),
     };
-    if (config.timeoutMs > 0) {
-      fetchOpts.signal = AbortSignal.timeout(config.timeoutMs);
+    if (verifier.timeoutMs > 0) {
+      fetchOpts.signal = AbortSignal.timeout(verifier.timeoutMs);
     }
 
-    const url = config.url.replace(/\/+$/, "") + "/v3/meta/auth/verify";
-    const resp = await fetch(url, fetchOpts);
+    const url = verifier.url.replace(/\/+$/, "") + "/v3/meta/auth/verify";
+    const resp = await fetcher(url, fetchOpts);
 
     if (!resp.ok) {
       const reason = `auth service returned HTTP ${resp.status}`;
-      log.warn("auth.verify.httpError", { status: resp.status, serviceId });
+      observer?.httpError?.(resp.status, serviceId);
       return { userId: "", rejected: true, rejectReason: reason };
     }
 
@@ -112,9 +145,9 @@ export async function verifyUserKey(userKey: string, serviceId: string): Promise
   } catch (err: unknown) {
     const isTimeout = err instanceof DOMException && err.name === "TimeoutError";
     const reason = isTimeout
-      ? `auth service timeout (${config.timeoutMs}ms)`
+      ? `auth service timeout (${verifier.timeoutMs}ms)`
       : `auth service error: ${err instanceof Error ? err.message : String(err)}`;
-    log.warn("auth.verify.error", { error: reason, serviceId });
+    observer?.error?.(reason, serviceId);
     return { userId: "", rejected: true, rejectReason: reason };
   }
 }
