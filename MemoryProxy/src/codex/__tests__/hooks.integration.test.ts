@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DEFAULT_CONFIG } from "../../config.js";
 import { createHookApp } from "../../hook-server.js";
@@ -38,6 +38,10 @@ const access: CodexHookAccess = {
   userKey: "user-key-secret",
   preferences: { dynamicRecall: true, contextLimit: 3 },
 };
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 function config(): ProxyConfig {
   const value: ProxyConfig = structuredClone(DEFAULT_CONFIG);
@@ -1028,7 +1032,7 @@ describe("Codex lifecycle hook contract", () => {
   });
 
   it("commits one correlated, redacted round on Stop and suppresses repeated Stop", async () => {
-    const info = vi.spyOn(log, "info");
+    const logInfo = vi.spyOn(log, "info");
     const commitCompletedRound = vi.fn<MemoryRuntimeContract["commitCompletedRound"]>(async () => ({
       status: "skipped",
       sourceEventId: "codex:stop:test",
@@ -1098,13 +1102,13 @@ describe("Codex lifecycle hook contract", () => {
       finalResponse: "Đã hoàn thành.",
     });
     expect(store.markCommitted).toHaveBeenCalledWith({ ...identity, turnId: "turn-7" });
-    expect(info).toHaveBeenCalledWith("codex_hook.round_committed", {
+    expect(logInfo).toHaveBeenCalledWith("codex_hook.round_committed", {
       sessionId: "session-1",
       turnId: "turn-7",
       sourceEventId: expect.stringMatching(/^codex:stop:sha256:[a-f0-9]{64}$/),
       toolCount: 1,
     });
-    expect(JSON.stringify(info.mock.calls)).not.toMatch(
+    expect(JSON.stringify(logInfo.mock.calls)).not.toMatch(
       /(?:user-key-secret|hidden reasoning|Giữ Unicode|Đã hoàn thành)/,
     );
 
@@ -1124,7 +1128,6 @@ describe("Codex lifecycle hook contract", () => {
       body: JSON.stringify(body),
     })).status).toBe(200);
     expect(commitCompletedRound).toHaveBeenCalledTimes(1);
-    info.mockRestore();
   });
 
   it("does not acknowledge Stop when durable enqueue fails and retries on redelivery", async () => {

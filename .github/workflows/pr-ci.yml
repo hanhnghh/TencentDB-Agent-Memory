@@ -162,6 +162,9 @@ jobs:
     name: Proxy/Hooks Parity and Crash Safety
     needs: install
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: MemoryProxy
     steps:
       - uses: actions/checkout@v4
 
@@ -176,36 +179,54 @@ jobs:
           key: deps-${{ runner.os }}-${{ hashFiles('MemoryCore/package.json') }}
 
       - name: Install MemoryProxy dependencies
-        working-directory: MemoryProxy
         run: npm ci
 
       - name: Proxy characterization and parity E2E
-        working-directory: MemoryProxy
         run: npx vitest run src/__tests__/memory-parity/*.test.ts
 
       - name: MemoryRuntime contract
-        working-directory: MemoryProxy
-        run: npx vitest run src/runtime/__tests__/memory-runtime.contract.test.ts src/runtime/__tests__/production-adapters.contract.test.ts
+        run: >-
+          npx vitest run
+          src/runtime/__tests__/memory-runtime.contract.test.ts
+          src/runtime/__tests__/production-adapters.contract.test.ts
 
       - name: MemoryCore idempotency
         working-directory: MemoryCore
-        run: npx vitest run src/gateway/v2-router.idempotency.test.ts src/core/skill/conversation-add/duplicate-safety.test.ts
+        run: >-
+          npx vitest run
+          src/gateway/v2-router.idempotency.test.ts
+          src/core/skill/conversation-add/duplicate-safety.test.ts
 
       - name: Durable outbox crash matrix
-        working-directory: MemoryProxy
-        run: npx vitest run src/outbox/__tests__/durable-round-outbox.integration.test.ts src/outbox/__tests__/memory-core-delivery.test.ts
+        run: >-
+          npx vitest run
+          src/outbox/__tests__/durable-round-outbox.integration.test.ts
+          src/outbox/__tests__/memory-core-delivery.test.ts
 
       - name: Proxy regressions
-        working-directory: MemoryProxy
-        run: npx vitest run src/runtime/__tests__/openai-adapter.contract.test.ts src/runtime/__tests__/anthropic-adapter.contract.test.ts src/runtime/__tests__/openai-production.integration.test.ts src/runtime/__tests__/startup.integration.test.ts src/__tests__/runtime-mode.config.test.ts src/__tests__/runtime-mode.routes.test.ts
+        run: >-
+          npx vitest run
+          src/runtime/__tests__/openai-adapter.contract.test.ts
+          src/runtime/__tests__/anthropic-adapter.contract.test.ts
+          src/runtime/__tests__/openai-production.integration.test.ts
+          src/runtime/__tests__/startup.integration.test.ts
+          src/__tests__/runtime-mode.config.test.ts
+          src/__tests__/runtime-mode.routes.test.ts
 
       - name: Codex hook adapters and lifecycle journal
-        working-directory: MemoryProxy
-        run: npx vitest run src/codex/__tests__/hooks.integration.test.ts src/codex/__tests__/round-normalizer.contract.test.ts src/codex/__tests__/turn-store.integration.test.ts src/codex/__tests__/prompt-recall-acl.integration.test.ts src/codex/__tests__/cli.test.ts
+        run: >-
+          npx vitest run
+          src/codex/__tests__/hooks.integration.test.ts
+          src/codex/__tests__/round-normalizer.contract.test.ts
+          src/codex/__tests__/turn-store.integration.test.ts
+          src/codex/__tests__/prompt-recall-acl.integration.test.ts
+          src/codex/__tests__/cli.test.ts
 
       - name: Codex plugin packaging and installation
-        working-directory: MemoryProxy
-        run: npx vitest run src/codex/__tests__/plugin.contract.test.ts src/codex/__tests__/installation.integration.test.ts
+        run: >-
+          npx vitest run
+          src/codex/__tests__/plugin.contract.test.ts
+          src/codex/__tests__/installation.integration.test.ts
 
       - name: Deployment mode matrix
         working-directory: .

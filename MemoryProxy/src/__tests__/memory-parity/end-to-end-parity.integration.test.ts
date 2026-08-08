@@ -6,9 +6,12 @@ import {
   InMemoryMemoryRuntimeAdapters,
   MemoryRuntime,
   MemoryRuntimeAuthorizationError,
+  type BoundRuntimeIdentity,
   type CommitCompletedRoundInput,
   type PrepareContextResult,
+  type RuntimeAuthorizationDecision,
   type RuntimeCapabilityFlags,
+  type RuntimeContextBlock,
   type RuntimeIdentity,
   type RuntimeOutboxRound,
 } from "../../runtime/index.js";
@@ -22,45 +25,67 @@ import {
   PROXY_ROUND_INPUTS,
 } from "./fixtures.js";
 
-const CONTEXT_BLOCKS = [
+const PARITY_AGENT_SOURCES = ["codebuddy", "codex"] as const;
+const DISABLED_CAPABILITIES = {
+  skill: false,
+  llmWiki: false,
+  codeGraph: false,
+  chatMemory: false,
+} as const satisfies RuntimeCapabilityFlags;
+const ACL_DENIAL_REASON = "fixture_denied";
+
+type ParityAgentSource = (typeof PARITY_AGENT_SOURCES)[number];
+
+interface RuntimeHarnessOptions {
+  capabilities?: RuntimeCapabilityFlags;
+  authorizationAllowed?: boolean;
+}
+
+interface RuntimeHarness {
+  runtime: MemoryRuntime;
+  adapters: InMemoryMemoryRuntimeAdapters;
+}
+
+const CONTEXT_BLOCKS: readonly RuntimeContextBlock[] = [
   {
     id: "memory",
     sourceHookId: "tdai-profile-memory-injector",
-    kind: "memory" as const,
+    kind: "memory",
     order: 10,
-    type: "text" as const,
+    type: "text",
     content: "Remember the shared release decision.",
   },
   {
     id: "skill",
     sourceHookId: "skill-injector",
-    kind: "skill" as const,
+    kind: "skill",
     order: 20,
-    type: "text" as const,
+    type: "text",
     content: "Use the verified deployment checklist.",
   },
-] as const;
+];
 
 describe("proxy/hooks end-to-end memory parity", () => {
   it("produces equivalent prepared context, L0 pair, and normalized skill round", async () => {
     const proxyIdentity = runtimeIdentity("codebuddy");
     const hookIdentity = runtimeIdentity("codex");
-    const proxy = harness(proxyIdentity);
-    const hooks = harness(hookIdentity);
+    const proxyHarness = createRuntimeHarness(proxyIdentity);
+    const hookHarness = createRuntimeHarness(hookIdentity);
 
-    const proxyPrepared = await proxy.runtime.prepareContext({ identity: proxyIdentity });
-    const hookPrepared = await hooks.runtime.prepareContext({ identity: hookIdentity });
+    const proxyPrepared = await proxyHarness.runtime.prepareContext({ identity: proxyIdentity });
+    const hookPrepared = await hookHarness.runtime.prepareContext({ identity: hookIdentity });
     const proxyRound = representativeProxyRound(proxyIdentity);
     const hookRound = representativeHookRound(hookIdentity);
 
-    await proxy.runtime.commitCompletedRound(proxyRound);
-    await hooks.runtime.commitCompletedRound(hookRound);
+    await proxyHarness.runtime.commitCompletedRound(proxyRound);
+    await hookHarness.runtime.commitCompletedRound(hookRound);
+
+    const proxyMemoryOutcome = memoryOutcome(proxyHarness.adapters.enqueuedRounds[0]);
+    const hookMemoryOutcome = memoryOutcome(hookHarness.adapters.enqueuedRounds[0]);
 
     expect(transportNeutralContext(proxyPrepared)).toEqual(transportNeutralContext(hookPrepared));
-    expect(memoryOutcome(proxy.adapters.enqueuedRounds[0])).toEqual(
-      memoryOutcome(hooks.adapters.enqueuedRounds[0]),
-    );
-    expect(memoryOutcome(proxy.adapters.enqueuedRounds[0])).toEqual({
+    expect(proxyMemoryOutcome).toEqual(hookMemoryOutcome);
+    expect(proxyMemoryOutcome).toEqual({
       l0: {
         messages: [
           { role: "user", content: HOOK_ROUND_INPUT.prompt.prompt },
@@ -71,39 +96,41 @@ describe("proxy/hooks end-to-end memory parity", () => {
       channels: { l0: true, skill: true },
     });
 
-    expect(proxy.adapters.authorizationChecks.map(({ action }) => action)).toEqual(["read", "write"]);
-    expect(hooks.adapters.authorizationChecks.map(({ action }) => action)).toEqual(["read", "write"]);
+    expect(proxyHarness.adapters.authorizationChecks.map(({ action }) => action)).toEqual([
+      "read",
+      "write",
+    ]);
+    expect(hookHarness.adapters.authorizationChecks.map(({ action }) => action)).toEqual([
+      "read",
+      "write",
+    ]);
     expect(createSessionNamespace(proxyIdentity.agentSource, proxyIdentity.sessionId)).not.toBe(
       createSessionNamespace(hookIdentity.agentSource, hookIdentity.sessionId),
     );
   });
 
-  it("applies the same Team/Agent/Task ACL denial and disabled capability outcome", async () => {
-    for (const agentSource of ["codebuddy", "codex"] as const) {
+  it.each(PARITY_AGENT_SOURCES)(
+    "applies the same Team/Agent/Task ACL denial and disabled capability outcome for %s",
+    async (agentSource) => {
       const identity = runtimeIdentity(agentSource);
-      const denied = harness(identity, undefined, false);
+      const deniedHarness = createRuntimeHarness(identity, { authorizationAllowed: false });
 
-      await expect(denied.runtime.prepareContext({ identity })).rejects.toMatchObject({
+      await expect(deniedHarness.runtime.prepareContext({ identity })).rejects.toMatchObject({
         name: MemoryRuntimeAuthorizationError.name,
         action: "read",
-        reason: "fixture_denied",
+        reason: ACL_DENIAL_REASON,
       });
-      expect(denied.adapters.authorizationChecks).toEqual([{
+      expect(deniedHarness.adapters.authorizationChecks).toEqual([{
         action: "read",
         identity: boundIdentity(identity),
       }]);
 
-      const disabled = harness(identity, {
-        skill: false,
-        llmWiki: false,
-        codeGraph: false,
-        chatMemory: false,
+      const disabledHarness = createRuntimeHarness(identity, {
+        capabilities: DISABLED_CAPABILITIES,
       });
-      const prepared = await disabled.runtime.prepareContext({ identity });
-      const result = await disabled.runtime.commitCompletedRound(
-        agentSource === "codex"
-          ? representativeHookRound(identity)
-          : representativeProxyRound(identity),
+      const prepared = await disabledHarness.runtime.prepareContext({ identity });
+      const result = await disabledHarness.runtime.commitCompletedRound(
+        representativeRound(identity),
       );
 
       expect(prepared.capabilities).toEqual({
@@ -112,16 +139,21 @@ describe("proxy/hooks end-to-end memory parity", () => {
         knowledge: { wiki: { enabled: false }, codeGraph: { enabled: false } },
       });
       expect(result).toMatchObject({ status: "skipped", reason: "extraction_disabled" });
-      expect(disabled.adapters.enqueuedRounds).toEqual([]);
-    }
-  });
+      expect(disabledHarness.adapters.enqueuedRounds).toEqual([]);
+    },
+  );
 });
 
-function harness(
+function createRuntimeHarness(
   identity: RuntimeIdentity,
-  capabilities?: RuntimeCapabilityFlags,
-  allowed = true,
-): { runtime: MemoryRuntime; adapters: InMemoryMemoryRuntimeAdapters } {
+  {
+    capabilities,
+    authorizationAllowed = true,
+  }: RuntimeHarnessOptions = {},
+): RuntimeHarness {
+  const authorizationDecision: RuntimeAuthorizationDecision = authorizationAllowed
+    ? { allowed: true }
+    : { allowed: false, reason: ACL_DENIAL_REASON };
   const adapters = new InMemoryMemoryRuntimeAdapters({
     binding: {
       identity: boundIdentity(identity),
@@ -129,10 +161,10 @@ function harness(
       agent: PARITY_AGENT,
       task: PARITY_TASK,
     },
-    ...(capabilities === undefined ? {} : { capabilities }),
+    capabilities,
     authorization: {
-      read: allowed ? { allowed: true } : { allowed: false, reason: "fixture_denied" },
-      write: allowed ? { allowed: true } : { allowed: false, reason: "fixture_denied" },
+      read: authorizationDecision,
+      write: authorizationDecision,
     },
     context: {
       blocks: CONTEXT_BLOCKS.map((block) => ({ ...block })),
@@ -146,7 +178,7 @@ function harness(
   return { runtime: new MemoryRuntime(adapters), adapters };
 }
 
-function runtimeIdentity(agentSource: "codebuddy" | "codex"): RuntimeIdentity {
+function runtimeIdentity(agentSource: ParityAgentSource): RuntimeIdentity {
   return {
     serviceId: PARITY_IDENTITY.spaceId,
     userId: PARITY_IDENTITY.userId,
@@ -155,13 +187,24 @@ function runtimeIdentity(agentSource: "codebuddy" | "codex"): RuntimeIdentity {
   };
 }
 
-function boundIdentity(identity: RuntimeIdentity) {
+function boundIdentity(identity: RuntimeIdentity): BoundRuntimeIdentity {
   return {
     ...identity,
     teamId: PARITY_IDENTITY.teamId,
     agentId: PARITY_IDENTITY.agentId,
     taskId: PARITY_IDENTITY.taskId,
   };
+}
+
+function representativeRound(identity: RuntimeIdentity): CommitCompletedRoundInput {
+  switch (identity.agentSource) {
+    case "codebuddy":
+      return representativeProxyRound(identity);
+    case "codex":
+      return representativeHookRound(identity);
+    default:
+      throw new TypeError(`unsupported parity agent source: ${identity.agentSource}`);
+  }
 }
 
 function representativeProxyRound(identity: RuntimeIdentity): CommitCompletedRoundInput {
