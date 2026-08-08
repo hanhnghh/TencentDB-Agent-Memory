@@ -13,8 +13,8 @@
  * would just be dead code. See `docs/design/2026-06-17-team-skill-proxy-runtime.md`.
  *
  * Auth: `Authorization: Bearer <serviceToken>` + `x-tdai-service-id`.
- * Error model: throws plain `Error` on !ok or non-zero envelope code; callers
- * (injectors / trigger) wrap in try/catch and degrade silently.
+ * Error model: throws `CoreSkillClientError` with retry classification on
+ * transport, HTTP, malformed-response, or non-zero envelope failures.
  *
  * Test injection: pass a custom `fetcher` to the constructor.
  *
@@ -126,13 +126,16 @@ export interface ExtractAsyncResult {
  *   - ID 字段不能包含 `|`（Core 拒绝，返回 400）
  *   - messages 是本轮增量（user + 中间 tool_call/tool_result + assistant 总结），
  *     不重传历史（Core 不去重，重传会造成 buffer 重复）
- *   - 同 session 必须严格串行（一轮 200 之后才发下一轮）
+ *   - source_event_id 可选；传入后 Core 对重放去重并返回同一 receipt
+ *   - Core 会在 server 侧串行同 session；caller 仍可串行以减少排队
  *
  * 详见 `2026-07-15-skill-trigger-in-core-design.md` §11.1 & §13。
  */
 export interface ConversationAddInput extends IdFields {
   session_id: string;
   space_id?: string;
+  source_event_id?: string;
+  content_hash?: string;
   messages: ConversationTurnMessage[];
 }
 
@@ -149,6 +152,12 @@ export interface ConversationAddArchived {
 export interface ConversationAddResult {
   status: "ok" | "archived";
   archived?: ConversationAddArchived;
+  receipt: {
+    receipt_id: string;
+    source_event_id?: string;
+    content_hash: string;
+    accepted_at_ms: number;
+  };
 }
 
 /** Input for /v3/skill/conversation/force-archive — 手动强制归档。 */
@@ -193,6 +202,32 @@ interface CoreEnvelope<T> {
   request_id?: string;
   data?: T;
   error?: { code: number; message: string };
+}
+
+export type CoreSkillFailureKind =
+  | "network"
+  | "timeout"
+  | "rate_limit"
+  | "conflict"
+  | "client"
+  | "server"
+  | "envelope"
+  | "invalid_response";
+
+export class CoreSkillClientError extends Error {
+  constructor(
+    message: string,
+    readonly kind: CoreSkillFailureKind,
+    readonly retryable: boolean,
+    readonly httpStatus?: number,
+    readonly code?: number,
+    readonly requestId = "",
+    readonly details?: Record<string, unknown>,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "CoreSkillClientError";
+  }
 }
 
 export interface CoreSkillRequestOptions {
@@ -334,24 +369,84 @@ export class CoreSkillClient {
         signal: AbortSignal.timeout(timeout),
       });
     } catch (err) {
-      throw new Error(`${TAG} ${path} fetch failed: ${(err as Error).message}`);
+      const isTimeout = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+      throw new CoreSkillClientError(
+        `${TAG} ${path} fetch failed: ${(err as Error).message}`,
+        isTimeout ? "timeout" : "network",
+        true,
+        undefined,
+        undefined,
+        "",
+        undefined,
+        { cause: err },
+      );
     }
 
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => "");
-      throw new Error(`${TAG} ${path} HTTP ${resp.status}: ${text.slice(0, 200)}`);
-    }
-
+    const text = await resp.text().catch(() => "");
     let env: CoreEnvelope<T>;
     try {
-      env = (await resp.json()) as CoreEnvelope<T>;
+      env = JSON.parse(text) as CoreEnvelope<T>;
     } catch (err) {
-      throw new Error(`${TAG} ${path} non-JSON response: ${(err as Error).message}`);
+      const retryable = resp.status === 408 || resp.status === 429 || resp.status >= 500;
+      const kind: CoreSkillFailureKind = resp.status === 408
+        ? "timeout"
+        : resp.status === 429
+          ? "rate_limit"
+          : resp.status === 409
+            ? "conflict"
+            : resp.status >= 500
+              ? "server"
+              : resp.status >= 400
+                ? "client"
+                : "invalid_response";
+      throw new CoreSkillClientError(
+        `${TAG} ${path} non-JSON response: ${(err as Error).message}`,
+        kind,
+        retryable,
+        resp.status,
+        undefined,
+        "",
+        undefined,
+        { cause: err },
+      );
+    }
+    if (!env || typeof env !== "object" || Array.isArray(env)) {
+      const retryable = resp.status === 408 || resp.status === 429 || resp.status >= 500;
+      throw new CoreSkillClientError(
+        `${TAG} ${path} response envelope must be a JSON object`,
+        resp.status >= 500 ? "server" : "invalid_response",
+        retryable,
+        resp.status,
+      );
     }
 
-    if (env.code !== 0) {
+    if (!resp.ok || env.code !== 0) {
       const msg = env.error?.message ?? env.message ?? `code=${env.code}`;
-      throw new Error(`${TAG} ${path} envelope error ${env.code}: ${msg}`);
+      const code = typeof env.code === "number" ? env.code : resp.status;
+      const kind: CoreSkillFailureKind = resp.status === 408
+        ? "timeout"
+        : resp.status === 429 || code === 4291
+          ? "rate_limit"
+          : resp.status === 409 || code === 40902
+            ? "conflict"
+            : resp.status >= 500 || code >= 50000
+              ? "server"
+              : resp.status >= 400 || (code >= 40000 && code < 50000)
+                ? "client"
+                : "envelope";
+      const retryable = resp.status === 408 || resp.status === 429 || code === 4291 || resp.status >= 500 || code >= 50000;
+      const details = env.data && typeof env.data === "object"
+        ? env.data as Record<string, unknown>
+        : undefined;
+      throw new CoreSkillClientError(
+        `${TAG} ${path} failed (${code}): ${msg}`,
+        kind,
+        retryable,
+        resp.status,
+        code,
+        env.request_id ?? "",
+        details,
+      );
     }
 
     return (env.data ?? ({} as T));

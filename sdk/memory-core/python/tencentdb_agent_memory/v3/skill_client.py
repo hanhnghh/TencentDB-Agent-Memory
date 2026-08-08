@@ -41,6 +41,7 @@ SKILL_ERROR_CODE: Dict[str, int] = {
     "TEAM_MISMATCH": 40302,
     "NOT_FOUND": 40401,
     "VERSION_STALE": 40901,
+    "SOURCE_EVENT_CONFLICT": 40902,
     "VERSION_EXPIRED": 41002,
     "RESOURCE_TOO_LARGE": 41301,
     "QUOTA_EXCEEDED": 4291,
@@ -494,6 +495,8 @@ class SkillClient:
         team_id: str,
         agent_id: str,
         messages: List[Dict[str, Any]],
+        source_event_id: Optional[str] = None,
+        content_hash: Optional[str] = None,
         space_id: Optional[str] = None,
         task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -511,14 +514,21 @@ class SkillClient:
         is forwarded to ``archive.task.task_ref_id`` when this call
         happens to trip an archive threshold.
 
+        ``source_event_id`` enables duplicate-safe retries. The optional
+        ``content_hash`` is echoed in the durable ``receipt``; replaying the
+        same event and content returns the original receipt, while changed
+        content raises :class:`TDAMError` with code ``40902``.
+
         Returns ``{status: "ok"|"archived", archived?: {task_id,
-        archived_at_ms, archive_key, reason}}``. ``reason`` ∈
+        archived_at_ms, archive_key, reason}, receipt: {...}}``. ``reason`` ∈
         ``{tool_calls, bytes, compressed, oversize}``. See
         ``docs/design/2026-07-15-skill-trigger-in-core-design.md`` §11.1
         for the trigger semantics.
         """
         body = _strip_none({
             "session_id": session_id,
+            "source_event_id": source_event_id,
+            "content_hash": content_hash,
             "space_id": space_id,
             "user_id": user_id,
             "team_id": team_id,
@@ -906,12 +916,16 @@ class AsyncSkillClient:
         team_id: str,
         agent_id: str,
         messages: List[Dict[str, Any]],
+        source_event_id: Optional[str] = None,
+        content_hash: Optional[str] = None,
         space_id: Optional[str] = None,
         task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """See :meth:`SkillClient.conversation_add` for the contract."""
         body = _strip_none({
             "session_id": session_id,
+            "source_event_id": source_event_id,
+            "content_hash": content_hash,
             "space_id": space_id,
             "user_id": user_id,
             "team_id": team_id,

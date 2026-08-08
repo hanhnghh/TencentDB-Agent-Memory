@@ -374,6 +374,8 @@ export class SkillClient {
   conversationAdd(params: SkillConversationAddRequest): Promise<SkillConversationAddData> {
     const body = stripUndefined({
       session_id: params.session_id,
+      source_event_id: params.source_event_id,
+      content_hash: params.content_hash,
       space_id: params.space_id,
       user_id: params.user_id,
       team_id: params.team_id,

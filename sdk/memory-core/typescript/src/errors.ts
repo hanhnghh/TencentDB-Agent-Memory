@@ -9,6 +9,16 @@ export class ParamError extends TypeError {
   }
 }
 
+export type TDAMFailureKind =
+  | "network"
+  | "timeout"
+  | "rate_limit"
+  | "conflict"
+  | "client"
+  | "server"
+  | "envelope"
+  | "invalid_response";
+
 export class TDAMError extends Error {
   readonly code: number;
   readonly requestId: string;
@@ -22,12 +32,28 @@ export class TDAMError extends Error {
    * conflict recovery.
    */
   readonly details?: Record<string, unknown>;
+  readonly kind: TDAMFailureKind;
+  readonly retryable: boolean;
+  readonly httpStatus?: number;
 
-  constructor(code: number, message: string, requestId = "", details?: Record<string, unknown>) {
+  constructor(
+    code: number,
+    message: string,
+    requestId = "",
+    details?: Record<string, unknown>,
+    classification: {
+      kind?: TDAMFailureKind;
+      retryable?: boolean;
+      httpStatus?: number;
+    } = {},
+  ) {
     super(`[${code}] ${message} (request_id=${requestId})`);
     this.name = "TDAMError";
     this.code = code;
     this.requestId = requestId;
     this.details = details;
+    this.kind = classification.kind ?? "envelope";
+    this.retryable = classification.retryable ?? false;
+    this.httpStatus = classification.httpStatus;
   }
 }

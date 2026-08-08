@@ -26,8 +26,18 @@ export interface AgentTuple {
   agent_id: string;
 }
 
+export interface SessionTuple extends AgentTuple {
+  session_id: string;
+}
+
 export function serializeAgentTuple(a: AgentTuple): string {
   return `${a.space_id}|${a.user_id}|${a.team_id}|${a.agent_id}`;
+}
+
+export function serializeSessionTuple(s: SessionTuple): string {
+  return [s.space_id, s.user_id, s.team_id, s.agent_id, s.session_id]
+    .map((part) => `${Buffer.byteLength(part, "utf8")}:${part}`)
+    .join("|");
 }
 
 export function parseAgentTuple(raw: string): AgentTuple | null {
@@ -79,6 +89,13 @@ export interface ISkillAgentTaskQueue {
     fn: () => Promise<T>,
   ): Promise<T>;
 
+  /** Serialize the complete read/modify/commit path for one session. */
+  withSessionMutex<T>(
+    tuple: SessionTuple,
+    opts: { lockTtlMs: number; waitDeadlineMs: number },
+    fn: () => Promise<T>,
+  ): Promise<T>;
+
   // ── extract-lock（Worker 独占 agent 抽取权） ──
   acquireExtractLock(tuple: AgentTuple, ttlMs: number): Promise<ExtractLockHandle | null>;
   renewExtractLock(handle: ExtractLockHandle, ttlMs: number): Promise<boolean>;
@@ -98,6 +115,7 @@ export class LocalSkillAgentTaskQueue implements ISkillAgentTaskQueue {
   private readonly list: string[] = [];      // 头 = LPUSH, 尾 = RPOP —— 匹配 Redis 语义
   private readonly set = new Set<string>();
   private readonly tasksMutex = new Map<string, { token: string; expireAt: number }>();
+  private readonly sessionMutex = new Map<string, { token: string; expireAt: number }>();
   private readonly extractLocks = new Map<string, { token: string; expireAt: number }>();
   private readonly waiters: WaitingConsumer[] = [];
 
@@ -178,6 +196,46 @@ export class LocalSkillAgentTaskQueue implements ISkillAgentTaskQueue {
       }
       if (Date.now() > deadline) {
         throw new Error(`[skill-agent-queue] tasks-mutex wait timeout for ${key}`);
+      }
+      await sleep(10);
+    }
+  }
+
+  async withSessionMutex<T>(
+    tuple: SessionTuple,
+    opts: { lockTtlMs: number; waitDeadlineMs: number },
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    return this.withLocalMutex(
+      this.sessionMutex,
+      `session:${serializeSessionTuple(tuple)}`,
+      opts,
+      fn,
+    );
+  }
+
+  private async withLocalMutex<T>(
+    mutexes: Map<string, { token: string; expireAt: number }>,
+    key: string,
+    opts: { lockTtlMs: number; waitDeadlineMs: number },
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const deadline = Date.now() + opts.waitDeadlineMs;
+    while (true) {
+      const now = Date.now();
+      const cur = mutexes.get(key);
+      if (!cur || cur.expireAt <= now) {
+        const token = randomUUID();
+        mutexes.set(key, { token, expireAt: now + opts.lockTtlMs });
+        try {
+          return await fn();
+        } finally {
+          const held = mutexes.get(key);
+          if (held && held.token === token) mutexes.delete(key);
+        }
+      }
+      if (Date.now() > deadline) {
+        throw new Error(`[skill-agent-queue] mutex wait timeout for ${key}`);
       }
       await sleep(10);
     }
@@ -292,6 +350,7 @@ export class RedisSkillAgentTaskQueue implements ISkillAgentTaskQueue {
   private readonly setKey: string;
   private readonly extractLockPrefix: string;
   private readonly tasksMutexPrefix: string;
+  private readonly sessionMutexPrefix: string;
   private readonly pollIntervalMs: number;
 
   constructor(opts: RedisSkillAgentTaskQueueOptions) {
@@ -307,6 +366,7 @@ export class RedisSkillAgentTaskQueue implements ISkillAgentTaskQueue {
     this.setKey = `${prefix}:pending-agents-set`;
     this.extractLockPrefix = `${prefix}:extract-lock:`;
     this.tasksMutexPrefix = `${prefix}:tasks-mutex:`;
+    this.sessionMutexPrefix = `${prefix}:session-mutex:`;
   }
 
   async enqueueAgent(tuple: AgentTuple): Promise<boolean> {
@@ -373,6 +433,45 @@ export class RedisSkillAgentTaskQueue implements ISkillAgentTaskQueue {
       }
       if (Date.now() > deadline) {
         throw new Error(`[skill-agent-queue] tasks-mutex wait timeout for ${key}`);
+      }
+      await sleep(20 + Math.floor(Math.random() * 30));
+    }
+  }
+
+  async withSessionMutex<T>(
+    tuple: SessionTuple,
+    opts: { lockTtlMs: number; waitDeadlineMs: number },
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    return this.withRedisMutex(
+      this.sessionMutexPrefix + serializeSessionTuple(tuple),
+      opts,
+      fn,
+    );
+  }
+
+  private async withRedisMutex<T>(
+    key: string,
+    opts: { lockTtlMs: number; waitDeadlineMs: number },
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const token = randomUUID();
+    const deadline = Date.now() + opts.waitDeadlineMs;
+    while (true) {
+      const ok = await this.client.set(key, token, "NX", "PX", opts.lockTtlMs);
+      if (ok === "OK") {
+        try {
+          return await fn();
+        } finally {
+          try {
+            await this.client.eval(LUA_RELEASE, 1, key, token);
+          } catch {
+            /* swallow */
+          }
+        }
+      }
+      if (Date.now() > deadline) {
+        throw new Error(`[skill-agent-queue] session-mutex wait timeout for ${key}`);
       }
       await sleep(20 + Math.floor(Math.random() * 30));
     }

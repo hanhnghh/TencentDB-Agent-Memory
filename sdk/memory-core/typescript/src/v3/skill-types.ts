@@ -308,6 +308,10 @@ export interface SkillConversationMessage {
  */
 export interface SkillConversationAddRequest {
   session_id: string;
+  /** Stable source identity used for exactly-once replay handling. */
+  source_event_id?: string;
+  /** Optional caller hash echoed in the server receipt. */
+  content_hash?: string;
   /**
    * Instance id. Optional at the schema layer — server falls back to
    * `auth.serviceId` (from the `x-tdai-service-id` header). Set only
@@ -347,6 +351,12 @@ export interface SkillConversationArchivedInfo {
 export interface SkillConversationAddData {
   status: "ok" | "archived";
   archived?: SkillConversationArchivedInfo;
+  receipt: {
+    receipt_id: string;
+    source_event_id?: string;
+    content_hash: string;
+    accepted_at_ms: number;
+  };
 }
 
 // ── /v3/skill/conversation/force-archive ──
@@ -410,6 +420,7 @@ export const SkillErrorCode = {
   TEAM_MISMATCH: 40302,
   NOT_FOUND: 40401,
   VERSION_STALE: 40901,
+  SOURCE_EVENT_CONFLICT: 40902,
   VERSION_EXPIRED: 41002,
   RESOURCE_TOO_LARGE: 41301,
   QUOTA_EXCEEDED: 4291,

@@ -13,6 +13,26 @@ from .errors import ParamError, TDAMError
 logger = logging.getLogger(__name__)
 
 
+def _classify_failure(status: int, code: int) -> dict:
+    if status == 408:
+        kind = "timeout"
+    elif status == 429 or code == 4291:
+        kind = "rate_limit"
+    elif status == 409 or code == 40902:
+        kind = "conflict"
+    elif status >= 500 or code >= 50000:
+        kind = "server"
+    elif status >= 400 or 40000 <= code < 50000:
+        kind = "client"
+    else:
+        kind = "envelope"
+    return {
+        "kind": kind,
+        "retryable": status in (408, 429) or code == 4291 or status >= 500 or code >= 50000,
+        "http_status": status,
+    }
+
+
 def _validate_transport_options(
     endpoint: str,
     api_key: str,
@@ -45,10 +65,23 @@ def _decode_response(resp: httpx.Response) -> dict:
         envelope = resp.json()
     except ValueError as exc:
         message = resp.text or f"HTTP {resp.status_code} returned a non-JSON response"
-        raise TDAMError(resp.status_code if resp.is_error else -1, message, header_request_id) from exc
+        code = resp.status_code if resp.is_error else -1
+        classification = _classify_failure(resp.status_code, code)
+        if not resp.is_error:
+            classification["kind"] = "invalid_response"
+        raise TDAMError(code, message, header_request_id, **classification) from exc
 
     if not isinstance(envelope, dict):
-        raise TDAMError(-1, "API response must be a JSON object", header_request_id)
+        code = resp.status_code if resp.is_error else -1
+        classification = _classify_failure(resp.status_code, code)
+        if not resp.is_error:
+            classification["kind"] = "invalid_response"
+        raise TDAMError(
+            code,
+            "API response must be a JSON object",
+            header_request_id,
+            **classification,
+        )
 
     code = envelope.get("code")
     if resp.is_error or code != 0:
@@ -60,6 +93,7 @@ def _decode_response(resp: httpx.Response) -> dict:
             message=str(envelope.get("message") or f"HTTP {resp.status_code}"),
             request_id=str(envelope.get("request_id") or header_request_id),
             details=details,
+            **_classify_failure(resp.status_code, effective_code),
         )
 
     result = envelope.get("data") or {}
@@ -96,12 +130,21 @@ class HttpStub(Stub):
             self.headers["x-tdai-user-key"] = user_key
 
     def post(self, path: str, body: dict, timeout: Optional[float] = None) -> dict:
-        resp = self.client.post(
-            url=f"{self.endpoint}{path}",
-            json=body,
-            headers=self.headers,
-            timeout=timeout or self.client.timeout,
-        )
+        try:
+            resp = self.client.post(
+                url=f"{self.endpoint}{path}",
+                json=body,
+                headers=self.headers,
+                timeout=timeout or self.client.timeout,
+            )
+        except httpx.RequestError as exc:
+            is_timeout = isinstance(exc, httpx.TimeoutException)
+            raise TDAMError(
+                -1,
+                str(exc),
+                kind="timeout" if is_timeout else "network",
+                retryable=True,
+            ) from exc
         logger.debug("Response %s %s", path, resp.text)
         return _decode_response(resp)
 
@@ -135,12 +178,21 @@ class AsyncHttpStub:
             self.headers["x-tdai-user-key"] = user_key
 
     async def post(self, path: str, body: dict, timeout: Optional[float] = None) -> dict:
-        resp = await self.client.post(
-            url=f"{self.endpoint}{path}",
-            json=body,
-            headers=self.headers,
-            timeout=timeout or self.client.timeout,
-        )
+        try:
+            resp = await self.client.post(
+                url=f"{self.endpoint}{path}",
+                json=body,
+                headers=self.headers,
+                timeout=timeout or self.client.timeout,
+            )
+        except httpx.RequestError as exc:
+            is_timeout = isinstance(exc, httpx.TimeoutException)
+            raise TDAMError(
+                -1,
+                str(exc),
+                kind="timeout" if is_timeout else "network",
+                retryable=True,
+            ) from exc
         logger.debug("Response %s %s", path, resp.text)
         return _decode_response(resp)
 

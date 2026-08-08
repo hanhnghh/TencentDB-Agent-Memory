@@ -3,6 +3,7 @@
  *
  * 路径规则（挂在 memory 全局 PathPrefix 下，subPath 默认 "skill_buffer"）：
  *   Session 级:
+ *     {subPath}/{space}/{user}/{team}/{agent}/{session}/state.json
  *     {subPath}/{space}/{user}/{team}/{agent}/{session}/data-current.jsonl
  *     {subPath}/{space}/{user}/{team}/{agent}/{session}/data-<ts>.jsonl
  *     {subPath}/{space}/{user}/{team}/{agent}/{session}/meta.json
@@ -12,8 +13,8 @@
  * 底层复用 memory 现有 StorageAdapter (Local 或 Cos)。
  *
  * 读写规则：
- *   - data-current: 明文 JSON（不做 append 语义；每次全量覆盖）
- *   - meta:         明文 JSON（session 串行，无 CAS）
+ *   - state.json:   versioned aggregate；buffer/meta/source receipts 单次覆盖提交
+ *   - data-current/meta: 旧版兼容读取，首次新写自动迁移进 state.json
  *   - archive:      明文 JSON（写入前 exists() 判定，已存在直接视为成功）
  *   - _tasks.json:  明文 JSON（读改写，由上层 SkillAgentTaskQueue 用 Redis 短锁保护）
  */
@@ -117,6 +118,50 @@ export interface BufferedMessages {
   messages: Array<Record<string, unknown>>;
 }
 
+export interface ConversationReceipt {
+  receipt_id: string;
+  source_event_id?: string;
+  content_hash: string;
+  accepted_at_ms: number;
+}
+
+export interface StoredConversationAddResult {
+  status: "ok" | "archived";
+  archived?: {
+    task_id: string;
+    archived_at_ms: number;
+    archive_key: string;
+    reason: "tool_calls" | "bytes" | "compressed" | "oversize";
+  };
+  receipt: ConversationReceipt;
+}
+
+export interface PendingConversationArchive {
+  task_id: string;
+  archived_at_ms: number;
+  archive_key: string;
+  messages: Array<Record<string, unknown>>;
+  task_ref_id?: string;
+}
+
+export interface StoredConversationEvent {
+  /** Server-computed canonical fingerprint; never trusts a caller hash for conflicts. */
+  fingerprint: string;
+  result: StoredConversationAddResult;
+  pending_archive?: PendingConversationArchive;
+}
+
+/**
+ * Versioned session aggregate. One object replacement commits the applied
+ * buffer/meta state and its source-event receipt together.
+ */
+export interface ConversationSessionState {
+  version: number;
+  current: BufferedMessages;
+  meta: SessionMeta;
+  receipts: Record<string, StoredConversationEvent>;
+}
+
 export interface SkillBufferStorageOptions {
   storage: StorageAdapter;
   /** COS 子路径前缀。默认 "skill_buffer"。 */
@@ -156,6 +201,10 @@ export class SkillBufferStorage {
     return `${this.sessionDir(sess)}/meta.json`;
   }
 
+  stateKey(sess: SessionKey): string {
+    return `${this.sessionDir(sess)}/state.json`;
+  }
+
   archiveKey(sess: SessionKey, archivedAtMs: number): string {
     return `${this.sessionDir(sess)}/data-${archivedAtMs}.jsonl`;
   }
@@ -171,6 +220,12 @@ export class SkillBufferStorage {
   // ── data-current ──────────────────────────────────────────────────────────
 
   async readCurrent(sess: SessionKey): Promise<BufferedMessages> {
+    const state = await this.readStoredSessionState(sess);
+    if (state) return state.current;
+    return this.readLegacyCurrent(sess);
+  }
+
+  private async readLegacyCurrent(sess: SessionKey): Promise<BufferedMessages> {
     const raw = await this.storage.readFile(this.currentKey(sess));
     if (!raw) return { messages: [] };
     try {
@@ -190,6 +245,12 @@ export class SkillBufferStorage {
   // ── session meta.json ────────────────────────────────────────────────────
 
   async readMeta(sess: SessionKey): Promise<SessionMeta> {
+    const state = await this.readStoredSessionState(sess);
+    if (state) return state.meta;
+    return this.readLegacyMeta(sess);
+  }
+
+  private async readLegacyMeta(sess: SessionKey): Promise<SessionMeta> {
     const raw = await this.storage.readFile(this.metaKey(sess));
     if (!raw) return this.defaultMeta(sess);
     try {
@@ -213,6 +274,51 @@ export class SkillBufferStorage {
     await this.storage.writeFile(this.metaKey(sess), JSON.stringify(meta));
   }
 
+  async readSessionState(sess: SessionKey): Promise<ConversationSessionState> {
+    const stored = await this.readStoredSessionState(sess);
+    if (stored) return stored;
+    const [current, meta] = await Promise.all([
+      this.readLegacyCurrent(sess),
+      this.readLegacyMeta(sess),
+    ]);
+    return { version: 0, current, meta, receipts: {} };
+  }
+
+  async writeSessionState(sess: SessionKey, state: ConversationSessionState): Promise<void> {
+    await this.storage.writeFile(this.stateKey(sess), JSON.stringify(state));
+  }
+
+  private async readStoredSessionState(sess: SessionKey): Promise<ConversationSessionState | null> {
+    const raw = await this.storage.readFile(this.stateKey(sess));
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as Partial<ConversationSessionState>;
+      if (!parsed.current || !parsed.meta || !parsed.receipts || typeof parsed.version !== "number") {
+        throw new Error("invalid session state");
+      }
+      return {
+        version: parsed.version,
+        current: {
+          messages: Array.isArray(parsed.current.messages) ? parsed.current.messages : [],
+        },
+        meta: {
+          ...this.defaultMeta(sess),
+          ...parsed.meta,
+          session_id: sess.session_id,
+          space_id: sess.space_id,
+          user_id: sess.user_id,
+          team_id: sess.team_id,
+          agent_id: sess.agent_id,
+        },
+        receipts: parsed.receipts,
+      };
+    } catch (error) {
+      throw new Error(`Corrupt skill conversation session state: ${this.stateKey(sess)}`, {
+        cause: error,
+      });
+    }
+  }
+
   private defaultMeta(sess: SessionKey): SessionMeta {
     return {
       session_id: sess.session_id,
@@ -231,7 +337,7 @@ export class SkillBufferStorage {
    * 写归档文件；若 key 已存在直接视为成功（对齐设计 §7.4 ④）。
    *
    * 注：我们不用 If-None-Match: * 头（storage 抽象层未暴露），
-   * 而是 exists() → putObject 两步。同 session 由 proxy 保证串行，
+   * 而是 exists() → putObject 两步。同 session 由 server-side lock 保证串行，
    * 且 archived_at_ms 递增（毫秒时间戳），实际不会撞。
    */
   async writeArchive(sess: SessionKey, archivedAtMs: number, buf: BufferedMessages): Promise<void> {

@@ -1,7 +1,7 @@
 /** Strict HTTP transport used exclusively by v3 SDK clients. */
 
 import { Agent } from "undici";
-import { ParamError, TDAMError } from "../errors.js";
+import { ParamError, TDAMError, type TDAMFailureKind } from "../errors.js";
 import type { HttpTransportOptions } from "../http.js";
 import type { ApiResponseEnvelope } from "../types.js";
 
@@ -55,7 +55,19 @@ export class V3HttpTransport {
         signal: controller.signal,
       };
       if (this.dispatcher) fetchOptions.dispatcher = this.dispatcher;
-      const response = await fetch(`${this.endpoint}${path}`, fetchOptions as RequestInit);
+      let response: Response;
+      try {
+        response = await fetch(`${this.endpoint}${path}`, fetchOptions as RequestInit);
+      } catch (error) {
+        const timeout = error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
+        throw new TDAMError(
+          -1,
+          error instanceof Error ? error.message : String(error),
+          "",
+          undefined,
+          { kind: timeout ? "timeout" : "network", retryable: true },
+        );
+      }
       const responseText = await response.text().catch(() => "");
       const headerRequestId =
         response.headers.get("x-qcloud-transaction-id") ??
@@ -66,10 +78,23 @@ export class V3HttpTransport {
       try {
         envelope = JSON.parse(responseText) as ApiResponseEnvelope<T>;
       } catch {
+        const classification = classifyFailure(response.status, response.status);
         throw new TDAMError(
           response.ok ? -1 : response.status,
           responseText || `HTTP ${response.status} returned a non-JSON response`,
           headerRequestId,
+          undefined,
+          response.ok ? { ...classification, kind: "invalid_response" } : classification,
+        );
+      }
+      if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
+        const classification = classifyFailure(response.status, response.status);
+        throw new TDAMError(
+          response.ok ? -1 : response.status,
+          "API response must be a JSON object",
+          headerRequestId,
+          undefined,
+          response.ok ? { ...classification, kind: "invalid_response" } : classification,
         );
       }
 
@@ -85,6 +110,7 @@ export class V3HttpTransport {
           envelope.message || `HTTP ${response.status}`,
           headerRequestId || envelope.request_id || "",
           details,
+          classifyFailure(response.status, code),
         );
       }
 
@@ -98,4 +124,27 @@ export class V3HttpTransport {
       clearTimeout(timer);
     }
   }
+}
+
+function classifyFailure(httpStatus: number, code: number): {
+  kind: TDAMFailureKind;
+  retryable: boolean;
+  httpStatus: number;
+} {
+  const kind: TDAMFailureKind = httpStatus === 408
+    ? "timeout"
+    : httpStatus === 429 || code === 4291
+      ? "rate_limit"
+      : httpStatus === 409 || code === 40902
+        ? "conflict"
+        : httpStatus >= 500 || code >= 50000
+          ? "server"
+          : httpStatus >= 400 || (code >= 40000 && code < 50000)
+            ? "client"
+            : "envelope";
+  return {
+    kind,
+    retryable: httpStatus === 408 || httpStatus === 429 || code === 4291 || httpStatus >= 500 || code >= 50000,
+    httpStatus,
+  };
 }

@@ -51,6 +51,7 @@ import { DEFAULT_COMPRESS_OPTIONS } from "../core/skill/conversation-add/message
 import { DEFAULT_OVERSIZE_OPTIONS } from "../core/skill/conversation-add/oversize-strategy.js";
 import { prepareArchivePayload } from "../core/skill/conversation-add/prepare-archive.js";
 import type { CompressibleMessage } from "../core/skill/conversation-add/message-compressor.js";
+import { SourceEventConflictError } from "../core/skill/conversation-add/add-handler.js";
 import { trace } from "../core/report/trace.js";
 import { metricProducer } from "../core/report/kafka-metric-producer.js";
 import { obsLogger } from "../core/report/obs-logger.js";
@@ -840,6 +841,8 @@ export async function handleConversationAdd(
       team_id: input.team_id,
       agent_id: input.agent_id,
       task_id: input.task_id,
+      source_event_id: input.source_event_id,
+      content_hash: input.content_hash,
       // schema 保证 role 合法, tool_name/tool_call_id 由 handler 内校验
       messages: input.messages.map((m) => ({
         role: m.role,
@@ -876,6 +879,20 @@ export async function handleConversationAdd(
       msg_count: input.messages.length, });
     return successEnvelope(out, requestId);
   } catch (err) {
+    if (err instanceof SourceEventConflictError) {
+      obsLogger.warn("skill.handleConversationAdd.done", {
+        req_id: requestId,
+        code: 40902,
+        dur_ms: Date.now() - t0,
+        source_event_id: err.sourceEventId,
+        reason: "source_event_conflict",
+      });
+      return errorEnvelope(40902, err.message, requestId, {
+        source_event_id: err.sourceEventId,
+        expected_content_hash: err.expectedContentHash,
+        actual_content_hash: err.actualContentHash,
+      });
+    }
     // HandlerValidationError → 400；其他 → 500
     const isValidation = err instanceof Error && err.name === "HandlerValidationError";
     if (isValidation) {
@@ -928,54 +945,55 @@ export async function handleForceArchive(
   };
 
   try {
-    // 读取当前 buffer
-    const [current, meta] = await Promise.all([
-      wired.buffer.readCurrent(sess),
-      wired.buffer.readMeta(sess),
-    ]);
+    return await wired.serializeSession(sess, async () => {
+      const state = await wired.buffer.readSessionState(sess);
+      const current = state.current;
 
-    // Buffer 为空：无需归档
-    if (!current.messages || current.messages.length === 0) {
-      obsLogger.info("skill.handleForceArchive.done", { req_id: requestId, code: 0, dur_ms: Date.now() - t0, status: "empty" });
-      return successEnvelope({ status: "empty", message: "No messages in buffer to archive" }, requestId);
-    }
+      // Buffer 为空：无需归档
+      if (!current.messages || current.messages.length === 0) {
+        obsLogger.info("skill.handleForceArchive.done", { req_id: requestId, code: 0, dur_ms: Date.now() - t0, status: "empty" });
+        return successEnvelope({ status: "empty", message: "No messages in buffer to archive" }, requestId);
+      }
 
-    // 无条件调 trigger.archive（跳过阈值判断）
-    const archiveRes = await wired.trigger.archive({
-      session: sess,
-      bufferAtTrigger: { messages: current.messages },
-      taskRefId: input.task_id,
-      reason: input.reason,
-      perfRequestId: requestId,
+      // 无条件调 trigger.archive（跳过阈值判断）
+      const archiveRes = await wired.trigger.archive({
+        session: sess,
+        bufferAtTrigger: { messages: current.messages },
+        taskRefId: input.task_id,
+        reason: input.reason,
+        perfRequestId: requestId,
+      });
+
+      // Preserve receipts while atomically replacing the buffered state.
+      const nowMs = Date.now();
+      await wired.buffer.writeSessionState(sess, {
+        version: state.version + 1,
+        current: { messages: [] },
+        meta: {
+          session_id: sess.session_id,
+          space_id: sess.space_id,
+          user_id: sess.user_id,
+          team_id: sess.team_id,
+          agent_id: sess.agent_id,
+          tool_call_count: 0,
+          byte_count: 0,
+          last_appended_at_ms: nowMs,
+          last_archived_at_ms: archiveRes.archivedAtMs,
+        },
+        receipts: state.receipts,
+      });
+
+      obsLogger.info("skill.handleForceArchive.done", {
+        req_id: requestId, code: 0, dur_ms: Date.now() - t0,
+        status: "archived", task_id: archiveRes.taskId,
+      });
+      return successEnvelope({
+        status: "archived",
+        task_id: archiveRes.taskId,
+        archived_at_ms: archiveRes.archivedAtMs,
+        archive_key: archiveRes.archiveKey,
+      }, requestId);
     });
-
-    // 归档后清空 buffer + 重置 meta（与 add-handler 归档后行为一致）
-    const nowMs = Date.now();
-    await Promise.all([
-      wired.buffer.writeCurrent(sess, { messages: [] }),
-      wired.buffer.writeMeta(sess, {
-        session_id: sess.session_id,
-        space_id: sess.space_id,
-        user_id: sess.user_id,
-        team_id: sess.team_id,
-        agent_id: sess.agent_id,
-        tool_call_count: 0,
-        byte_count: 0,
-        last_appended_at_ms: nowMs,
-        last_archived_at_ms: archiveRes.archivedAtMs,
-      }),
-    ]);
-
-    obsLogger.info("skill.handleForceArchive.done", {
-      req_id: requestId, code: 0, dur_ms: Date.now() - t0,
-      status: "archived", task_id: archiveRes.taskId,
-    });
-    return successEnvelope({
-      status: "archived",
-      task_id: archiveRes.taskId,
-      archived_at_ms: archiveRes.archivedAtMs,
-      archive_key: archiveRes.archiveKey,
-    }, requestId);
   } catch (err) {
     deps.logger.warn(`${TAG} /v3/skill/conversation/force-archive failed: ${(err as Error).message} req_id=${requestId}`);
     obsLogger.error("skill.handleForceArchive.done", { req_id: requestId, dur_ms: Date.now() - t0 }, err instanceof Error ? err : undefined);
