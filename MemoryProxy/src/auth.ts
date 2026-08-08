@@ -23,6 +23,29 @@ export interface VerifyUserResult {
   rejectReason?: string;
 }
 
+export interface UserKeyVerifierConfig {
+  url: string;
+  timeoutMs: number;
+  /** Optional MemoryCore gateway credential; omitted by the legacy proxy verifier. */
+  serviceToken?: string;
+}
+
+interface UserKeyVerifierObserver {
+  httpError?(status: number, serviceId: string): void;
+  error?(reason: string, serviceId: string): void;
+}
+
+function redactVerifierSecrets(message: string, secrets: Array<string | undefined>): string {
+  return secrets
+    .filter((secret): secret is string => Boolean(secret))
+    .sort((a, b) => b.length - a.length)
+    .reduce((text, secret) => text.split(secret).join("[REDACTED]"), message);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 // ── Module state ──────────────────────────────────────────────────────────────
 
 let config: AuthConfig | null = null;
@@ -69,52 +92,86 @@ export function isAuthEnabled(): boolean {
  */
 export async function verifyUserKey(userKey: string, serviceId: string): Promise<VerifyUserResult> {
   if (!config) return { userId: "", rejected: false };
+  return verifyUserKeyWithConfig(config, userKey, serviceId, globalThis.fetch.bind(globalThis), {
+    httpError: (status, verifiedServiceId) => {
+      log.warn("auth.verify.httpError", { status, serviceId: verifiedServiceId });
+    },
+    error: (reason, verifiedServiceId) => {
+      log.warn("auth.verify.error", { error: reason, serviceId: verifiedServiceId });
+    },
+  });
+}
+
+/**
+ * Verify a key with explicit configuration.
+ *
+ * Binding commands use this form because they are short-lived and must not
+ * depend on the server process' module-global initialization.
+ */
+export async function verifyUserKeyWithConfig(
+  verifier: UserKeyVerifierConfig,
+  userKey: string,
+  serviceId: string,
+  fetcher: typeof fetch = globalThis.fetch.bind(globalThis),
+  observer?: UserKeyVerifierObserver,
+): Promise<VerifyUserResult> {
   if (!serviceId) return { userId: "", rejected: true, rejectReason: "missing service_id (spaceId not in request path)" };
   if (!userKey) return { userId: "", rejected: true, rejectReason: "missing user_key" };
 
   try {
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      "x-tdai-service-id": serviceId,
+    };
+    if (verifier.serviceToken) {
+      headers.Authorization = `Bearer ${verifier.serviceToken}`;
+    }
     const fetchOpts: RequestInit = {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-tdai-service-id": serviceId,
-      },
+      headers,
       body: JSON.stringify({ user_key: userKey }),
     };
-    if (config.timeoutMs > 0) {
-      fetchOpts.signal = AbortSignal.timeout(config.timeoutMs);
+    if (verifier.timeoutMs > 0) {
+      fetchOpts.signal = AbortSignal.timeout(verifier.timeoutMs);
     }
 
-    const url = config.url.replace(/\/+$/, "") + "/v3/meta/auth/verify";
-    const resp = await fetch(url, fetchOpts);
+    const url = verifier.url.replace(/\/+$/, "") + "/v3/meta/auth/verify";
+    const resp = await fetcher(url, fetchOpts);
 
     if (!resp.ok) {
       const reason = `auth service returned HTTP ${resp.status}`;
-      log.warn("auth.verify.httpError", { status: resp.status, serviceId });
+      observer?.httpError?.(resp.status, serviceId);
       return { userId: "", rejected: true, rejectReason: reason };
     }
 
-    const body = await resp.json() as {
-      code?: number;
-      data?: { valid?: boolean; user?: { user_id?: string } };
-    };
+    const body: unknown = await resp.json();
+    const bodyRecord = isRecord(body) ? body : null;
+    const data = isRecord(bodyRecord?.data) ? bodyRecord.data : null;
+    const user = isRecord(data?.user) ? data.user : null;
 
     // Only accept: code=0 AND valid=true AND user_id present
-    if (body.code === 0 && body.data?.valid === true && body.data.user?.user_id) {
-      return { userId: body.data.user.user_id, rejected: false };
+    const userId = user?.user_id;
+    if (
+      bodyRecord?.code === 0 &&
+      data?.valid === true &&
+      typeof userId === "string" &&
+      userId.trim()
+    ) {
+      return { userId: userId.trim(), rejected: false };
     }
 
     // Everything else is a rejection
-    const reason = body.data?.valid === false
+    const reason = data?.valid === false
       ? "invalid user_key"
-      : `unexpected verify response (code=${body.code})`;
+      : `unexpected verify response (code=${String(bodyRecord?.code)})`;
     return { userId: "", rejected: true, rejectReason: reason };
   } catch (err: unknown) {
     const isTimeout = err instanceof DOMException && err.name === "TimeoutError";
-    const reason = isTimeout
-      ? `auth service timeout (${config.timeoutMs}ms)`
+    const unsafeReason = isTimeout
+      ? `auth service timeout (${verifier.timeoutMs}ms)`
       : `auth service error: ${err instanceof Error ? err.message : String(err)}`;
-    log.warn("auth.verify.error", { error: reason, serviceId });
+    const reason = redactVerifierSecrets(unsafeReason, [userKey, verifier.serviceToken]);
+    observer?.error?.(reason, serviceId);
     return { userId: "", rejected: true, rejectReason: reason };
   }
 }

@@ -54,6 +54,10 @@ import {
   isRateLimitExceededError,
   recordInputTokenUsage,
 } from "./rate-limit/guard.js";
+import {
+  canonicalizeAgentSource,
+  createSessionNamespace,
+} from "./agent-sources.js";
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -560,7 +564,9 @@ export async function handleAnthropicMessages(
   const _agentFromPathEarly = _pathPartsEarly[0]
     && !["v1", "proxy", "skill-bridge", "memory-bridge"].includes(_pathPartsEarly[0])
     ? _pathPartsEarly[0] : undefined;
-  const agentAdapter = resolveAgentAdapter(_agentFromPathEarly ?? "claude-code");
+  const agentAdapter = resolveAgentAdapter(
+    canonicalizeAgentSource(_agentFromPathEarly, "claude-code"),
+  );
   const ccRoutingEnabled = config.ccRequestRouting?.enabled === true;
   const requestKind: CcRequestKind = ccRoutingEnabled ? agentAdapter.classifyRequest(body) : "main";
 
@@ -620,7 +626,7 @@ export async function handleAnthropicMessages(
   const pathParts = c.req.path.split("/").filter(Boolean);
   const agentFromPath = pathParts[0] && !["v1", "proxy", "skill-bridge", "memory-bridge"].includes(pathParts[0])
     ? pathParts[0] : undefined;
-  const agentSource = agentFromPath ?? "claude-code";
+  const agentSource = canonicalizeAgentSource(agentFromPath, "claude-code");
 
   // ── Identity inspection ──────────────────────────────────────────────────
   const reqHeaders: Record<string, string> = {};
@@ -684,7 +690,7 @@ export async function handleAnthropicMessages(
       const presetIdentity = parsePresetIdentity(config.sessionInit, lcHeaders);
 
       // ── Session Recovery: try L2b binding before falling into session-init form ──
-      const compositeKey = `${agentSource}:${sessionKey}`;
+      const compositeKey = createSessionNamespace(agentSource, sessionKey);
       // Identity for repo/binding writes. userId 缺失时 fallback 到 `anonymous`
       // 复合键，保证 key path 分段合法（参见 §4.4 边界处理）。
       const identity = {

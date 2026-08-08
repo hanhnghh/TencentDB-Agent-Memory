@@ -9,6 +9,8 @@
  * 新增端点时，只需在 `WHITELIST_ENDPOINTS` 增加一条记录即可，无需散点修改。
  */
 
+import { AGENT_SOURCES } from "../agent-sources.js";
+
 /** 白名单端点元数据。 */
 export interface WhitelistEndpoint {
   /**
@@ -103,7 +105,11 @@ const PROXY_PREFIX_RE = /^\/proxy\/[^/]+/;
  * lookahead `(?=/v1/)` 确保白名单入口 `/v1/messages` 自身不会被误剥。
  * agent 段限定为已知名字，避免误伤路径中恰好有 "v1" 字面量的其它请求。
  */
-const AGENT_PREFIX_RE = /^\/(claude-code|codebuddy|cursor|anthropic|openai)(?:\/[^/]+)?(?=\/v1\/)/i;
+const agentPrefixNames = [...AGENT_SOURCES, "cursor", "anthropic", "openai"];
+const AGENT_PREFIX_RE = new RegExp(
+  `^/(${agentPrefixNames.join("|")})(?:/[^/]+)?(?=/v1/)`,
+  "i",
+);
 
 /**
  * `/cost-guard` marker 正则：位于 `/{agent}/{spaceId}` 之后的独立 segment。

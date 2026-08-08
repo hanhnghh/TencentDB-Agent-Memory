@@ -1,0 +1,703 @@
+import { mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import {
+  PROJECT_BINDING_RELATIVE_PATH,
+  bindCodexProject,
+  resolveCredentialPath,
+} from "../binding.js";
+
+const tempRoots: string[] = [];
+
+async function makeTempRoot(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "codex-binding-test-"));
+  tempRoots.push(root);
+  return root;
+}
+
+afterEach(async () => {
+  vi.unstubAllGlobals();
+  const { rm } = await import("node:fs/promises");
+  await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+function jsonResponse(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseJsonRecord(value: string): Record<string, unknown> {
+  const parsed: unknown = JSON.parse(value);
+  if (!isRecord(parsed)) {
+    throw new Error("expected a JSON object");
+  }
+  return parsed;
+}
+
+function successfulApi(): typeof fetch {
+  const fetcher: typeof fetch = vi.fn(async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    const body = parseJsonRecord(String(init?.body ?? "{}"));
+
+    if (path === "/v3/meta/auth/verify") {
+      expect(body).toEqual({ user_key: "user-key-secret" });
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer service-secret");
+      return jsonResponse({ code: 0, data: { valid: true, user: { user_id: "user-1" } } });
+    }
+
+    expect(new Headers(init?.headers).get("x-tdai-user-key")).toBe("user-key-secret");
+    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer service-secret");
+
+    if (path === "/v3/meta/team/list") {
+      expect(body).toMatchObject({ user_id: "user-1", limit: 100, offset: 0 });
+      return jsonResponse({ code: 0, data: { items: [{ team_id: "team-1", name: "Team" }], total: 1, limit: 100, offset: 0 } });
+    }
+    if (path === "/v3/meta/agent/list") {
+      expect(body).toMatchObject({
+        team_id: "team-1",
+        owner_user_id: "user-1",
+        status: "active",
+        limit: 100,
+        offset: 0,
+      });
+      return jsonResponse({ code: 0, data: { items: [{ agent_id: "agent-1", team_id: "team-1", name: "Agent" }], total: 1, limit: 100, offset: 0 } });
+    }
+    if (path === "/v3/meta/task/list") {
+      expect(body).toMatchObject({
+        team_id: "team-1",
+        status: "running",
+        limit: 100,
+        offset: 0,
+      });
+      return jsonResponse({ code: 0, data: { items: [{ task_id: "task-1", team_id: "team-1", title: "Task" }], total: 1, limit: 100, offset: 0 } });
+    }
+    throw new Error(`unexpected path ${path}`);
+  });
+  return fetcher;
+}
+
+describe("validated Codex project binding", () => {
+  it("validates the user and complete Team/Agent/Task scope before persisting", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    const userConfigDir = join(root, "user-config");
+    await mkdir(projectDir);
+
+    const result = await bindCodexProject({
+      projectDir,
+      userConfigDir,
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      fetcher: successfulApi(),
+    });
+
+    expect(result.userId).toBe("user-1");
+    const projectText = await readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH), "utf8");
+    expect(JSON.parse(projectText)).toEqual({
+      version: 1,
+      source: "codex",
+      service_id: "memory-1",
+      team_id: "team-1",
+      agent_id: "agent-1",
+      task_id: "task-1",
+    });
+    expect(projectText).not.toContain("user-key-secret");
+    expect(projectText).not.toContain("service-secret");
+
+    const credentialPath = resolveCredentialPath(userConfigDir);
+    const credentialText = await readFile(credentialPath, "utf8");
+    expect(credentialText).toContain("user-key-secret");
+    expect(credentialText).not.toContain("service-secret");
+    expect((await stat(userConfigDir)).mode & 0o777).toBe(0o700);
+    expect((await stat(credentialPath)).mode & 0o777).toBe(0o600);
+  });
+
+  it("persists only JSON-safe non-secret project preferences", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    await mkdir(projectDir);
+
+    await bindCodexProject({
+      projectDir,
+      userConfigDir: join(root, "user-config"),
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      preferences: { dynamicRecall: true, contextLimit: 3, profile: "concise" },
+      fetcher: successfulApi(),
+    });
+
+    const projectText = await readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH), "utf8");
+    expect(JSON.parse(projectText)).toMatchObject({
+      preferences: { dynamicRecall: true, contextLimit: 3, profile: "concise" },
+    });
+    expect(projectText).not.toContain("user-key-secret");
+    expect(projectText).not.toContain("service-secret");
+  });
+
+  it("rejects an invalid user key before creating either config", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    const userConfigDir = join(root, "user-config");
+    await mkdir(projectDir);
+    const fetcher: typeof fetch = vi.fn(async () => (
+      jsonResponse({ code: 0, data: { valid: false } })
+    ));
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir,
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "invalid-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      fetcher,
+    })).rejects.toThrow("User key is invalid or unauthorized");
+
+    await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(resolveCredentialPath(userConfigDir))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a malformed auth success response before metadata access", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    const userConfigDir = join(root, "user-config");
+    await mkdir(projectDir);
+    const fetcher: typeof fetch = vi.fn(async () => jsonResponse({
+      code: 0,
+      data: { valid: true, user: { user_id: { value: "user-1" } } },
+    }));
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir,
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      fetcher,
+    })).rejects.toMatchObject({
+      code: "validation_failed",
+      message: "Unable to validate user key: MemoryCore authentication returned malformed data",
+    });
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(resolveCredentialPath(userConfigDir))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("fails closed when user-key verification is unavailable", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    const userConfigDir = join(root, "user-config");
+    await mkdir(projectDir);
+    const fetcher: typeof fetch = vi.fn(async () => {
+      throw new Error("network unavailable");
+    });
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir,
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      fetcher,
+    })).rejects.toMatchObject({ code: "validation_failed" });
+
+    await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH)))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(resolveCredentialPath(userConfigDir)))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each([
+    {
+      label: "Team",
+      ids: { teamId: "team-other", agentId: "agent-1", taskId: "task-1" },
+      message: "Team 'team-other' is missing or unauthorized for the verified user",
+    },
+    {
+      label: "Agent",
+      ids: { teamId: "team-1", agentId: "agent-other", taskId: "task-1" },
+      message: "Agent 'agent-other' is missing or unauthorized for Team 'team-1'",
+    },
+    {
+      label: "Task",
+      ids: { teamId: "team-1", agentId: "agent-1", taskId: "task-other" },
+      message: "Task 'task-other' is missing or unauthorized for Team 'team-1'",
+    },
+  ])("rejects a missing or unauthorized $label without persistence", async ({ ids, message }) => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    const userConfigDir = join(root, "user-config");
+    await mkdir(projectDir);
+    const fetcher = successfulApi();
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir,
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      ...ids,
+      fetcher,
+    })).rejects.toThrow(message);
+
+    await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(resolveCredentialPath(userConfigDir))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each([
+    { label: "Team", ids: { teamId: "", agentId: "agent-1", taskId: "task-1" } },
+    { label: "Agent", ids: { teamId: "team-1", agentId: "", taskId: "task-1" } },
+    { label: "Task", ids: { teamId: "team-1", agentId: "agent-1", taskId: "" } },
+  ])("rejects a missing $label ID before validation or persistence", async ({ label, ids }) => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    const fetcher = successfulApi();
+    await mkdir(projectDir);
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir: join(root, "user-config"),
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      ...ids,
+      fetcher,
+    })).rejects.toThrow(`${label} ID is required`);
+
+    expect(fetcher).not.toHaveBeenCalled();
+    await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH)))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each([0, -1, 1.5])(
+    "rejects invalid timeout %s before validation or persistence",
+    async (timeoutMs) => {
+      const root = await makeTempRoot();
+      const projectDir = join(root, "project");
+      const fetcher = successfulApi();
+      await mkdir(projectDir);
+
+      await expect(bindCodexProject({
+        projectDir,
+        userConfigDir: join(root, "user-config"),
+        endpoint: "https://memory.example",
+        serviceId: "memory-1",
+        serviceToken: "service-secret",
+        userKey: "user-key-secret",
+        teamId: "team-1",
+        agentId: "agent-1",
+        taskId: "task-1",
+        timeoutMs,
+        fetcher,
+      })).rejects.toMatchObject({ code: "invalid_configuration" });
+
+      expect(fetcher).not.toHaveBeenCalled();
+      await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH)))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
+  it("does not expose dependency responses or credentials in validation failures", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    await mkdir(projectDir);
+    const base = successfulApi();
+    const fetcher: typeof fetch = vi.fn(async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/v3/meta/team/list") {
+        return new Response(
+          "internal backend trace user-key-secret service-secret",
+          { status: 500 },
+        );
+      }
+      return base(input, init);
+    });
+
+    let message = "";
+    try {
+      await bindCodexProject({
+        projectDir,
+        userConfigDir: join(root, "user-config"),
+        endpoint: "https://memory.example",
+        authUrl: "https://auth.example",
+        serviceId: "memory-1",
+        serviceToken: "service-secret",
+        userKey: "user-key-secret",
+        teamId: "team-1",
+        agentId: "agent-1",
+        taskId: "task-1",
+        fetcher,
+      });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    expect(message).toContain("Unable to validate Team");
+    expect(message).not.toContain("internal backend trace");
+    expect(message).not.toContain("user-key-secret");
+    expect(message).not.toContain("service-secret");
+  });
+
+  it("rejects a malformed existing credential map without rewriting it", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    const userConfigDir = join(root, "user-config");
+    const credentialPath = resolveCredentialPath(userConfigDir);
+    await mkdir(projectDir);
+    await mkdir(userConfigDir, { mode: 0o700 });
+    const malformed = `${JSON.stringify({
+      version: 1,
+      user_keys: { "memory-old": 42 },
+    })}\n`;
+    await writeFile(credentialPath, malformed, { mode: 0o600 });
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir,
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      fetcher: successfulApi(),
+    })).rejects.toMatchObject({ code: "credential_store_invalid" });
+
+    await expect(readFile(credentialPath, "utf8")).resolves.toBe(malformed);
+    await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH)))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("retains every service credential across concurrent project binds", async () => {
+    const root = await makeTempRoot();
+    const userConfigDir = join(root, "user-config");
+    const projectA = join(root, "project-a");
+    const projectB = join(root, "project-b");
+    await Promise.all([mkdir(projectA), mkdir(projectB)]);
+
+    const input = {
+      userConfigDir,
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+    };
+    await Promise.all([
+      bindCodexProject({
+        ...input,
+        projectDir: projectA,
+        serviceId: "memory-a",
+        fetcher: successfulApi(),
+      }),
+      bindCodexProject({
+        ...input,
+        projectDir: projectB,
+        serviceId: "memory-b",
+        fetcher: successfulApi(),
+      }),
+    ]);
+
+    expect(parseJsonRecord(
+      await readFile(resolveCredentialPath(userConfigDir), "utf8"),
+    )).toMatchObject({
+      user_keys: {
+        "memory-a": "user-key-secret",
+        "memory-b": "user-key-secret",
+      },
+    });
+  });
+
+  it("recovers a credential update after the previous process left its lock", async () => {
+    const root = await makeTempRoot();
+    const userConfigDir = join(root, "user-config");
+    const projectDir = join(root, "project");
+    const credentialPath = resolveCredentialPath(userConfigDir);
+    await Promise.all([
+      mkdir(projectDir),
+      mkdir(userConfigDir, { mode: 0o700 }),
+    ]);
+    await writeFile(
+      `${credentialPath}.lock`,
+      `${JSON.stringify({ pid: 2_147_483_647, token: "abandoned" })}\n`,
+      { mode: 0o600 },
+    );
+
+    await bindCodexProject({
+      projectDir,
+      userConfigDir,
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      fetcher: successfulApi(),
+    });
+
+    await expect(readFile(credentialPath, "utf8")).resolves.toContain("user-key-secret");
+    await expect(stat(`${credentialPath}.lock`)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a malformed metadata success response without persistence", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    const userConfigDir = join(root, "user-config");
+    await mkdir(projectDir);
+    const base = successfulApi();
+    const fetcher: typeof fetch = vi.fn(async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/v3/meta/team/list") {
+        return jsonResponse({
+          code: 0,
+          data: {
+            items: [{ team_id: "team-1", name: "Team" }],
+            total: "1",
+            limit: 100,
+            offset: 0,
+          },
+        });
+      }
+      return base(input, init);
+    });
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir,
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      fetcher,
+    })).rejects.toThrow("Unable to validate Team");
+
+    await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(resolveCredentialPath(userConfigDir))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each([
+    { label: "Team", path: "/v3/meta/team/list" },
+    { label: "Agent", path: "/v3/meta/agent/list" },
+    { label: "Task", path: "/v3/meta/task/list" },
+  ])("rejects malformed $label metadata entities with a clear validation error", async ({ label, path: malformedPath }) => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    const userConfigDir = join(root, "user-config");
+    await mkdir(projectDir);
+    const base = successfulApi();
+    const fetcher: typeof fetch = vi.fn(async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const path = new URL(String(input)).pathname;
+      if (path === malformedPath) {
+        return jsonResponse({
+          code: 0,
+          data: { items: [null], total: 1, limit: 100, offset: 0 },
+        });
+      }
+      return base(input, init);
+    });
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir,
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      fetcher,
+    })).rejects.toMatchObject({
+      code: "validation_failed",
+      message: `Unable to validate ${label}: MemoryCore metadata returned malformed data`,
+    });
+
+    await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH)))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(resolveCredentialPath(userConfigDir)))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("refuses secret-like project preferences before validation or persistence", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    const userConfigDir = join(root, "user-config");
+    await mkdir(projectDir);
+    const fetcher = successfulApi();
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir,
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      preferences: { apiKey: "must-not-be-local" },
+      fetcher,
+    })).rejects.toThrow("Project binding contains forbidden secret field 'apiKey'");
+
+    expect(fetcher).not.toHaveBeenCalled();
+    await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(resolveCredentialPath(userConfigDir))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("refuses common compound secret names in project preferences", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    await mkdir(projectDir);
+    const fetcher = successfulApi();
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir: join(root, "user-config"),
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      preferences: { clientSecret: "must-not-be-local" },
+      fetcher,
+    })).rejects.toThrow("Project binding contains forbidden secret field 'clientSecret'");
+
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("refuses prefixed secret names in project preferences", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    await mkdir(projectDir);
+    const fetcher = successfulApi();
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir: join(root, "user-config"),
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      preferences: { memoryAPIKey: "must-not-be-local" },
+      fetcher,
+    })).rejects.toThrow("Project binding contains forbidden secret field 'memoryAPIKey'");
+
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("refuses to place the credential store inside the project", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    await mkdir(projectDir);
+    const fetcher = successfulApi();
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir: join(projectDir, ".codex", "user-config"),
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      fetcher,
+    })).rejects.toThrow("Credential store must be outside the project");
+
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("refuses non-finite numeric preferences before persistence", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    await mkdir(projectDir);
+    const fetcher = successfulApi();
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir: join(root, "user-config"),
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      preferences: { contextLimit: Number.NaN },
+      fetcher,
+    })).rejects.toThrow("Binding preference 'contextLimit' must be JSON-safe");
+
+    expect(fetcher).not.toHaveBeenCalled();
+    await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH)))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+});

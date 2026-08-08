@@ -50,6 +50,10 @@ import {
   isRateLimitExceededError,
   recordInputTokenUsage,
 } from "./rate-limit/guard.js";
+import {
+  canonicalizeAgentSource,
+  createSessionNamespace,
+} from "./agent-sources.js";
 
 /**
  * Build a per-request TdaiClient. `spaceId` (extracted from the request path
@@ -521,7 +525,7 @@ export async function handleChatCompletions(
   const pathParts = c.req.path.split("/").filter(Boolean);
   const agentFromPath = pathParts[0] && !["v1", "proxy", "skill-bridge", "memory-bridge"].includes(pathParts[0])
     ? pathParts[0] : undefined;
-  const agentSource = agentFromPath ?? "claude-code";
+  const agentSource = canonicalizeAgentSource(agentFromPath, "claude-code");
 
   // ── Identity inspection ──────────────────────────────────────────────────
   const reqHeaders: Record<string, string> = {};
@@ -579,7 +583,7 @@ export async function handleChatCompletions(
       const presetIdentity = parsePresetIdentity(config.sessionInit, lcHeaders);
 
       // ── Session Recovery: try L2b binding before falling into session-init form ──
-      const compositeKey = `${agentSource}:${sessionKey}`;
+      const compositeKey = createSessionNamespace(agentSource, sessionKey);
       // Identity for repo/binding writes. userId 缺失时 fallback 到 `anonymous`
       // 复合键，保证 key path 分段合法（`u=anonymous` 走独立命名空间，天然与
       // 有 userId 的请求隔离）。参见 §4.4 边界处理。

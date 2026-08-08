@@ -43,6 +43,7 @@ import type {
 } from "../types.js";
 import { HOOK_PRIORITY } from "../types.js";
 import { getTdaiIdentity } from "../../tdai/identity.js";
+import { normalizeAgentSource } from "../../agent-sources.js";
 
 export interface TdaiMemoryToolsInjectorConfig {
   /**
@@ -57,6 +58,7 @@ export function renderTdaiMemoryToolsBlock(
   proxyBaseUrl: string,
   sessionId?: string,
   spaceId?: string,
+  agentSource?: string,
 ): string {
   const base = proxyBaseUrl.replace(/\/$/, "");
   const bridge = `${base}/memory-bridge/v3`;
@@ -64,7 +66,11 @@ export function renderTdaiMemoryToolsBlock(
   // 让 proxy 复用 session 里的身份 (user_id / team_id / agent_id)。
   const sessionHeader = sessionId ? ` -H 'x-conversation-id: ${sessionId}'` : "";
   const tenantHeader = spaceId ? ` -H 'x-tdai-service-id: ${spaceId}'` : "";
-  const authHeader = `${tenantHeader}${sessionHeader}`;
+  const normalizedSource = normalizeAgentSource(agentSource);
+  const sourceHeader = normalizedSource === "unknown"
+    ? ""
+    : ` -H 'x-agent-source: ${normalizedSource}'`;
+  const authHeader = `${tenantHeader}${sessionHeader}${sourceHeader}`;
 
   const lines: string[] = [
     "<tdai_memory_tools>",
@@ -124,6 +130,7 @@ export function renderTdaiMemoryToolsBlock(
     "- 所有 curl 必须带：" +
       (spaceId ? `x-tdai-service-id: ${spaceId}、` : "x-tdai-service-id（当前 memory 实例，见示例）、") +
       (sessionId ? `x-conversation-id: ${sessionId}` : "x-conversation-id（来自当前会话）") +
+      (normalizedSource === "unknown" ? "" : `、x-agent-source: ${normalizedSource}`) +
       "；Content-Type: application/json。",
     "",
     "## 完整示例",
@@ -159,18 +166,31 @@ export class TdaiMemoryToolsInjector implements InjectionHook {
       | Record<string, unknown>
       | undefined;
     const spaceId = typeof session?.space_id === "string" ? session.space_id : undefined;
-    return this.renderBlocks(identity.sessionId, spaceId);
+    return this.renderBlocks(identity.sessionId, spaceId, ctx.metadata.agentSource);
   }
 
   prewarm(input: PrewarmInput): ContextBlock[] {
     if (input.assetCapabilities?.chat_memory === false) return [];
-    return this.renderBlocks(input.sessionInfo.session_id, input.sessionInfo.space_id);
+    return this.renderBlocks(
+      input.sessionInfo.session_id,
+      input.sessionInfo.space_id,
+      input.agentSource,
+    );
   }
 
-  private renderBlocks(sessionId: string, spaceId?: string): ContextBlock[] {
+  private renderBlocks(
+    sessionId: string,
+    spaceId?: string,
+    agentSource?: string,
+  ): ContextBlock[] {
     return [{
       type: "text",
-      content: renderTdaiMemoryToolsBlock(this.cfg.proxyBaseUrl, sessionId, spaceId),
+      content: renderTdaiMemoryToolsBlock(
+        this.cfg.proxyBaseUrl,
+        sessionId,
+        spaceId,
+        agentSource,
+      ),
       metadata: {
         source: this.id,
         sessionId,

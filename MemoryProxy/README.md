@@ -81,6 +81,45 @@ Skills and Knowledge follow the same idea:
 
 ## Quick start
 
+### Codex project binding
+
+Codex uses a project-local, non-secret Team/Agent/Task binding. The bind command
+verifies the user key and confirms that all three IDs are visible through the
+MemoryCore metadata APIs before writing either file. Task is required by the
+current runtime contract.
+
+```bash
+export MEMORY_CORE_ENDPOINT=http://127.0.0.1:8420
+export MEMORY_CORE_SERVICE_TOKEN=service-token-from-deployment-config
+export MEMORY_HUB_USER_KEY=your-memory-hub-user-key
+
+npm run codex -- bind \
+  --service-id mem-example001 \
+  --team-id team-id \
+  --agent-id agent-id \
+  --task-id task-id
+
+npm run codex -- binding-status
+npm run codex -- doctor
+npm run codex -- unbind
+```
+
+The project file is `.codex/memory-binding.json` and contains only binding IDs
+and preferences. The Memory Hub user key is stored separately under the user's
+configuration directory (`$XDG_CONFIG_HOME/tencentdb-agent-memory/codex`, or
+`~/.config/tencentdb-agent-memory/codex`) with directory mode `0700` and file
+mode `0600`; a credential directory inside the bound project is rejected.
+Credentials are accepted from environment variables rather than command-line
+options so they are not exposed in shell history or process arguments. `unbind
+--forget-credential` also removes the key for that Memory service. Status,
+doctor, and unbind are local operations and never invoke a model.
+
+These credentials have separate roles: `MEMORY_HUB_USER_KEY` authorizes the
+user binding and `MEMORY_CORE_SERVICE_TOKEN` authenticates the local integration
+to MemoryCore. Neither is the proxy model credential (`PROXY_UPSTREAM_API_KEY`
+or `upstream.apiKey`) nor the internal memory-distillation model credential
+(`MEMORY_LLM_API_KEY`).
+
 ### 1. Install dependencies
 
 ```bash

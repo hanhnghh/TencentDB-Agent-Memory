@@ -4,6 +4,7 @@
 // MemoryLevel is fixed "proxy", MemoryDelta is 0, CreditDelta = computed credit.
 
 import type { CreditPricingConfig, CreditReportConfig } from "./types.js";
+import { normalizeAgentSource } from "./agent-sources.js";
 import { getModelPricing } from "./pricing.js";
 import { log } from "./report/log.js";
 
@@ -74,7 +75,10 @@ export function extractSpaceIdFromPath(path: string): string | null {
   if (match) {
     const agent = safePath.split("/").filter(Boolean)[0] ?? "";
     // Only capture spaceId when the first segment looks like an agent name
-    if (/^(claude-code|codebuddy|cursor|hermes|openclaw)$/i.test(agent)) {
+    if (
+      normalizeAgentSource(agent) !== "unknown" ||
+      /^(cursor|hermes|openclaw)$/i.test(agent)
+    ) {
       return match[1] || null;
     }
   }

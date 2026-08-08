@@ -24,6 +24,7 @@
  */
 
 import type { SessionInitState, SessionInitStatus, SessionInfo, AgentDetail, TaskDetail } from "./types.js";
+import { createSessionNamespace } from "../agent-sources.js";
 import { getSessionRepo, type SessionRepo } from "../db/sessionRepo.js";
 import type { BindingRepo, SessionBinding } from "../db/binding-repo.js";
 import type { MetadataClient } from "../meta/client.js";
@@ -208,7 +209,7 @@ export class SessionStore {
         //   `${agentSource}:${sessionId}`
         // Also bind full identity so subsequent set() persists back through
         // the correct (userId, agentSource, sessionId) key path.
-        const keyId = `${row.agentSource}:${row.sessionId}`;
+        const keyId = createSessionNamespace(row.agentSource, row.sessionId);
         if (!this.states.has(keyId)) {
           this.states.set(keyId, row.state);
           this.identities.set(keyId, {

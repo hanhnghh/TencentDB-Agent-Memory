@@ -81,6 +81,42 @@ Skill 与 Knowledge 沿用同样的思路：
 
 ## 快速开始
 
+### Codex 项目绑定
+
+Codex 使用项目本地、且不含密钥的 Team/Agent/Task 绑定。`bind` 命令会先验证
+用户密钥，并通过 MemoryCore metadata API 确认当前用户能够访问这三个 ID，
+全部验证成功后才会写入文件。当前运行时契约要求必须绑定 Task。
+
+```bash
+export MEMORY_CORE_ENDPOINT=http://127.0.0.1:8420
+export MEMORY_CORE_SERVICE_TOKEN=service-token-from-deployment-config
+export MEMORY_HUB_USER_KEY=your-memory-hub-user-key
+
+npm run codex -- bind \
+  --service-id mem-example001 \
+  --team-id team-id \
+  --agent-id agent-id \
+  --task-id task-id
+
+npm run codex -- binding-status
+npm run codex -- doctor
+npm run codex -- unbind
+```
+
+项目配置位于 `.codex/memory-binding.json`，只包含绑定 ID 和偏好设置等非敏感
+信息。Memory Hub 用户密钥单独存放在用户配置目录
+（`$XDG_CONFIG_HOME/tencentdb-agent-memory/codex`，或
+`~/.config/tencentdb-agent-memory/codex`）中；目录权限为 `0700`，文件权限为
+`0600`。如果凭据目录位于已绑定项目内，命令会拒绝使用。密钥只通过环境变量
+接收，不接受命令行参数，避免泄露到 shell 历史或进程参数。使用
+`unbind --forget-credential` 还会删除该 Memory 服务对应的用户密钥。
+`binding-status`、`doctor` 和 `unbind` 都是本地操作，不会调用模型。
+
+这些凭据的用途彼此独立：`MEMORY_HUB_USER_KEY` 用于授权用户绑定，
+`MEMORY_CORE_SERVICE_TOKEN` 用于本地集成向 MemoryCore 鉴权。两者都不是代理
+模型凭据（`PROXY_UPSTREAM_API_KEY` 或 `upstream.apiKey`），也不是内部记忆提炼
+模型凭据（`MEMORY_LLM_API_KEY`）。
+
 ### 1. 安装依赖
 
 ```bash

@@ -21,6 +21,7 @@
  */
 
 import type { Context } from "hono";
+import { createSessionNamespaceCandidates } from "../agent-sources.js";
 import { extractBearerToken } from "../opik.js";
 import { apiKeyToKeyId } from "../opik.js";
 import { getSessionStore } from "../session/store.js";
@@ -102,14 +103,18 @@ function toIdFields(state: import("../session/types.js").SessionInitState | unde
  * L1 fast path — try in-memory Map with prefix fallback.
  * Returns null on miss (caller decides whether to probe L2).
  */
-function loadSessionIdsL1(sessionKey: string): SessionIdFields | null {
-  let state = getSessionStore().get(sessionKey);
-  // 与 skill-bridge 对齐：尝试 codebuddy: / claude-code: 前缀兜底
-  if (!state && !sessionKey.includes(":")) {
-    state = getSessionStore().get(`codebuddy:${sessionKey}`)
-        ?? getSessionStore().get(`claude-code:${sessionKey}`);
+function loadSessionIdsL1(
+  sessionKey: string,
+  explicitSource?: string,
+): SessionIdFields | null {
+  const candidates = sessionKey.includes(":")
+    ? [sessionKey]
+    : createSessionNamespaceCandidates(sessionKey, explicitSource);
+  for (const candidate of candidates) {
+    const state = getSessionStore().get(candidate);
+    if (state) return toIdFields(state);
   }
-  return toIdFields(state);
+  return null;
 }
 
 /**
@@ -127,34 +132,38 @@ async function loadSessionIdsL2(
   apiKey: string,
   spaceId: string,
   sessionKey: string,
+  explicitSource?: string,
 ): Promise<SessionIdFields | null> {
-  // 从 sessionKey 反解 agentSource + sessionId：
-  //   "claude-code:conv-abc"  → agentSource=claude-code, sessionId=conv-abc
-  //   "codebuddy:conv-abc"    → agentSource=codebuddy, sessionId=conv-abc
-  //   "conv-abc" (无前缀)      → agentSource=claude-code (默认), sessionId=conv-abc
-  let agentSource = "claude-code";
-  let sessionId = sessionKey;
-  const colonIdx = sessionKey.indexOf(":");
-  if (colonIdx >= 0) {
-    agentSource = sessionKey.slice(0, colonIdx);
-    sessionId = sessionKey.slice(colonIdx + 1);
-  }
-
   // 拿 userId：先 verify（如果 auth 关了就没法走 L2 fallthrough）
   if (!isAuthEnabled() || !apiKey) return null;
   const verifyResult = await verifyUserKey(apiKey, spaceId);
   if (verifyResult.rejected || !verifyResult.userId) return null;
   const userId = verifyResult.userId;
 
-  const identity = { userId, agentSource, sessionId, spaceId };
-  let recovered;
-  try {
-    recovered = await getSessionStore().getOrRecover(sessionKey, identity, {});
-  } catch (err) {
-    console.warn(`${TAG} L2 fallthrough error session=${sessionKey}: ${(err as Error).message}`);
-    return null;
+  const candidates = sessionKey.includes(":")
+    ? [sessionKey]
+    : createSessionNamespaceCandidates(sessionKey, explicitSource);
+  for (const compositeKey of candidates) {
+    const colonIdx = compositeKey.indexOf(":");
+    const agentSource = colonIdx > 0 ? compositeKey.slice(0, colonIdx) : "claude-code";
+    const sessionId = colonIdx > 0 ? compositeKey.slice(colonIdx + 1) : compositeKey;
+    try {
+      const recovered = await getSessionStore().getOrRecover(
+        compositeKey,
+        { userId, agentSource, sessionId, spaceId },
+        {},
+      );
+      const ids = toIdFields(recovered);
+      if (ids) return ids;
+    } catch (err) {
+      console.warn(
+        `${TAG} L2 fallthrough error session=${compositeKey} type=${
+          err instanceof Error ? err.name : "UnknownError"
+        }`,
+      );
+    }
   }
-  return toIdFields(recovered);
+  return null;
 }
 
 function envelope(code: number, message: string, httpStatus = 200): Response {
@@ -203,7 +212,11 @@ async function resolveMemoryCtxs(config: ProxyConfig, ids: SessionIdFields, sess
     };
     return await resolveFixedAssetCtxs(fakeCtx, identity, metadataClient);
   } catch (err) {
-    console.warn(`${TAG} fixed asset ctx resolve failed: ${(err as Error).message}`);
+    console.warn(
+      `${TAG} fixed asset ctx resolve failed type=${
+        err instanceof Error ? err.name : "UnknownError"
+      }`,
+    );
     return [selfCtx(ids)];
   }
 }
@@ -255,22 +268,31 @@ export function createMemoryBridgeHandler(
     }
 
     const sessionKey = deriveSessionKey(c);
-    let ids = loadSessionIdsL1(sessionKey);
+    const explicitSource = c.req.header("x-agent-source");
+    const requestedSpaceId = c.req.header("x-tdai-service-id")
+      ?? config.tdai?.serviceId
+      ?? config.coreSkill?.serviceId
+      ?? "";
+    let ids = loadSessionIdsL1(sessionKey, explicitSource);
     if (!ids) {
       // §6.1 修复：跨 pod L2 fallthrough。需要 apiKey + spaceId 才能走 verify。
       const auth = c.req.header("authorization") ?? c.req.header("Authorization") ?? "";
       const apiKey = extractBearerToken(auth);
-      const spaceId = c.req.header("x-tdai-service-id")
-        ?? config.tdai?.serviceId
-        ?? config.coreSkill?.serviceId
-        ?? "";
-      if (apiKey && spaceId) {
-        console.log(`${TAG} session=${sessionKey} L1 miss → L2 fallthrough (apiKey=${apiKeyToKeyId(apiKey)} spaceId=${spaceId})`);
-        ids = await loadSessionIdsL2(apiKey, spaceId, sessionKey);
+      if (apiKey && requestedSpaceId) {
+        console.log(`${TAG} session=${sessionKey} L1 miss → L2 fallthrough (apiKey=${apiKeyToKeyId(apiKey)} spaceId=${requestedSpaceId})`);
+        ids = await loadSessionIdsL2(
+          apiKey,
+          requestedSpaceId,
+          sessionKey,
+          explicitSource,
+        );
       }
     }
     if (!ids) {
       return envelope(40101, `${TAG} session not initialized; cannot derive identity`, 401);
+    }
+    if (ids.space_id && requestedSpaceId && ids.space_id !== requestedSpaceId) {
+      return envelope(40301, `${TAG} session does not belong to the requested service`, 403);
     }
 
     let inboundBody: Record<string, unknown> = {};
@@ -284,22 +306,13 @@ export function createMemoryBridgeHandler(
           return envelope(40001, `${TAG} body must be a JSON object`, 400);
         }
       }
-    } catch (err) {
-      return envelope(40001, `${TAG} invalid JSON body: ${(err as Error).message}`, 400);
+    } catch {
+      return envelope(40001, `${TAG} invalid JSON body`, 400);
     }
 
     // 强制注入 session IdFields — LLM 不能伪造身份。
     // search 类默认同时查 self + 借入 chat_memory；非 search 类默认 self，可通过 body.agent_id
     // 选择 <tdai_profile_memory> 里暴露的 imported agent_id。
-    const modelSessionId =
-      typeof inboundBody.session_id === "string" && inboundBody.session_id.trim()
-        ? inboundBody.session_id.trim()
-        : undefined;
-    const modelTaskId =
-      typeof inboundBody.task_id === "string" && inboundBody.task_id.trim()
-        ? inboundBody.task_id.trim()
-        : undefined;
-
     const upstreamUrl = `${config.coreSkill.endpoint.replace(/\/$/, "")}/v3/${sub}`;
     const upstreamToken =
       config.tdai?.apiKey || config.coreSkill.serviceToken || "local-proxy";
@@ -312,16 +325,15 @@ export function createMemoryBridgeHandler(
     };
 
     const ctxs = await resolveMemoryCtxs(config, ids, sessionKey);
-    // task_id 优先级：caller 显式传 > session 注入。session_id 保持"仅 caller 显式传"，
-    // 因为 search 类希望默认跨 session（agent 维度）；task_id 属于身份维度，仍应强制。
-    const effectiveTaskId = modelTaskId ?? ids.task_id;
+    // Identity fields always come from the validated session. Caller-supplied
+    // values are overwritten at this bridge boundary.
     const makeOutbound = (target: FixedAssetCtx): Record<string, unknown> => ({
       ...inboundBody,
       user_id: target.userId,
       team_id: target.teamId,
       agent_id: target.agentId,
-      ...(modelSessionId ? { session_id: modelSessionId } : {}),
-      ...(effectiveTaskId ? { task_id: effectiveTaskId } : {}),
+      session_id: ids.session_id,
+      ...(ids.task_id ? { task_id: ids.task_id } : {}),
     });
 
     const callUpstream = async (target: FixedAssetCtx): Promise<{ status: number; text: string; contentType: string }> => {
@@ -376,9 +388,11 @@ export function createMemoryBridgeHandler(
       upstream = await callUpstream(selectTargetCtx(ctxs, inboundBody.agent_id));
     } catch (err) {
       console.warn(
-        `${TAG} upstream fetch failed sub=${sub} err=${(err as Error).message}`,
+        `${TAG} upstream fetch failed sub=${sub} type=${
+          err instanceof Error ? err.name : "UnknownError"
+        }`,
       );
-      return envelope(50301, `${TAG} upstream unavailable: ${(err as Error).message}`, 502);
+      return envelope(50301, `${TAG} upstream unavailable`, 502);
     }
 
     const respText = upstream.text;
