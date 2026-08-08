@@ -24,6 +24,7 @@ import {
   PROXY_ROUND_INPUTS,
   USER_PROMPT,
 } from "./fixtures.js";
+import { parseRequestBody } from "./test-support.js";
 
 const tdaiIdentity: TdaiIdentity = {
   teamId: PARITY_IDENTITY.teamId,
@@ -141,14 +142,14 @@ describe("memory parity: observed legacy intermediate L0 behavior", () => {
         });
       }
       if (url.endsWith("/v3/skill/conversation/add")) {
-        skillRequests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        skillRequests.push(parseRequestBody(init));
         return new Response(JSON.stringify({ code: 0, data: { status: "ok" } }), {
           status: 200,
           headers: { "content-type": "application/json" },
         });
       }
       if (url.endsWith("/v3/conversation/add")) {
-        l0Requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        l0Requests.push(parseRequestBody(init));
         return new Response(JSON.stringify({ code: 0, data: {} }), {
           status: 200,
           headers: { "content-type": "application/json" },
@@ -246,14 +247,14 @@ describe("memory parity: observed legacy intermediate L0 behavior", () => {
         });
       }
       if (url.endsWith("/v3/skill/conversation/add")) {
-        skillRequests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        skillRequests.push(parseRequestBody(init));
         return new Response(JSON.stringify({ code: 0, data: { status: "ok" } }), {
           status: 200,
           headers: { "content-type": "application/json" },
         });
       }
       if (url.endsWith("/v3/conversation/add")) {
-        l0Requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        l0Requests.push(parseRequestBody(init));
         return new Response(JSON.stringify({ code: 0, data: {} }), {
           status: 200,
           headers: { "content-type": "application/json" },
@@ -305,7 +306,7 @@ describe("memory parity: observed legacy intermediate L0 behavior", () => {
   it("records each proxy HTTP response independently, including an intermediate tool-loop response", async () => {
     const writes: Array<Record<string, unknown>> = [];
     const fetcher: typeof fetch = async (_input, init) => {
-      writes.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      writes.push(parseRequestBody(init));
       return new Response(JSON.stringify({ code: 0, data: {} }), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -418,7 +419,7 @@ describe("memory parity: approved completed-round target", () => {
         });
       }
       if (url.endsWith("/v3/conversation/add")) {
-        l0Requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        l0Requests.push(parseRequestBody(init));
       }
       return new Response(JSON.stringify({ code: 0, data: { items: [] } }), {
         status: 200,
@@ -510,7 +511,7 @@ describe("memory parity: approved completed-round target", () => {
         });
       }
       if (url.endsWith("/v3/conversation/add")) {
-        l0Requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        l0Requests.push(parseRequestBody(init));
       }
       return new Response(JSON.stringify({ code: 0, data: { items: [] } }), {
         status: 200,
@@ -556,88 +557,88 @@ describe("memory parity: approved completed-round target", () => {
   it.each(PROXY_ROUND_INPUTS)(
     "$protocol proxy commits the full normalized tool-aware round to skill ingestion only after the final response",
     async (fixture) => {
-    const requests: Array<{ url: string; init?: RequestInit }> = [];
-    const fetcher: typeof fetch = async (url, init) => {
+      const requests: Array<{ url: string; init?: RequestInit }> = [];
+      const fetcher: typeof fetch = async (url, init) => {
         requests.push({ url: String(url), init });
         return new Response(JSON.stringify({ code: 0, data: { status: "ok" } }), {
           status: 200,
           headers: { "content-type": "application/json" },
         });
       };
-    const client = new CoreSkillClient(coreSkillConfig, fetcher);
-    setCoreSkillClient(client);
-    const config = memoryParityConfig();
-    const sessionInfo = {
-      session_id: PARITY_IDENTITY.sessionId,
-      space_id: PARITY_IDENTITY.spaceId,
-      user_id: PARITY_IDENTITY.userId,
-      team_id: PARITY_IDENTITY.teamId,
-      agent_id: PARITY_IDENTITY.agentId,
-      task_id: PARITY_IDENTITY.taskId,
-    };
+      const client = new CoreSkillClient(coreSkillConfig, fetcher);
+      setCoreSkillClient(client);
+      const config = memoryParityConfig();
+      const sessionInfo = {
+        session_id: PARITY_IDENTITY.sessionId,
+        space_id: PARITY_IDENTITY.spaceId,
+        user_id: PARITY_IDENTITY.userId,
+        team_id: PARITY_IDENTITY.teamId,
+        agent_id: PARITY_IDENTITY.agentId,
+        task_id: PARITY_IDENTITY.taskId,
+      };
 
-    await triggerSkillExtractIfReady({
-      config,
-      sessionKey: PARITY_IDENTITY.sessionId,
-      agentSource: fixture.agentSource,
-      sessionInfo,
-      inputMessages: fixture.messages,
-      assistantMessage: fixture.protocol === "anthropic"
-        ? {
-            role: "assistant",
-            content: [{ type: "tool_use", id: "still-running", name: "read", input: {} }],
-          }
-        : {
-            role: "assistant",
-            content: null,
-            tool_calls: [{
-              id: "still-running",
-              type: "function",
-              function: { name: "read", arguments: "{}" },
-            }],
-          },
-      protocol: fixture.protocol,
-    });
-    expect(requests).toHaveLength(0);
+      await triggerSkillExtractIfReady({
+        config,
+        sessionKey: PARITY_IDENTITY.sessionId,
+        agentSource: fixture.agentSource,
+        sessionInfo,
+        inputMessages: fixture.messages,
+        assistantMessage: fixture.protocol === "anthropic"
+          ? {
+              role: "assistant",
+              content: [{ type: "tool_use", id: "still-running", name: "read", input: {} }],
+            }
+          : {
+              role: "assistant",
+              content: null,
+              tool_calls: [{
+                id: "still-running",
+                type: "function",
+                function: { name: "read", arguments: "{}" },
+              }],
+            },
+        protocol: fixture.protocol,
+      });
+      expect(requests).toHaveLength(0);
 
-    await triggerSkillExtractIfReady({
-      config,
-      sessionKey: PARITY_IDENTITY.sessionId,
-      agentSource: fixture.agentSource,
-      sessionInfo,
-      inputMessages: fixture.messages,
-      assistantMessage: fixture.assistantMessage,
-      protocol: fixture.protocol,
-      assetCapabilities: {
-        skill: false,
-        llm_wiki: true,
-        code_graph: true,
-        chat_memory: true,
-      },
-    });
-    expect(requests).toHaveLength(0);
+      await triggerSkillExtractIfReady({
+        config,
+        sessionKey: PARITY_IDENTITY.sessionId,
+        agentSource: fixture.agentSource,
+        sessionInfo,
+        inputMessages: fixture.messages,
+        assistantMessage: fixture.assistantMessage,
+        protocol: fixture.protocol,
+        assetCapabilities: {
+          skill: false,
+          llm_wiki: true,
+          code_graph: true,
+          chat_memory: true,
+        },
+      });
+      expect(requests).toHaveLength(0);
 
-    await triggerSkillExtractIfReady({
-      config,
-      sessionKey: PARITY_IDENTITY.sessionId,
-      agentSource: fixture.agentSource,
-      sessionInfo,
-      inputMessages: fixture.messages,
-      assistantMessage: fixture.assistantMessage,
-      protocol: fixture.protocol,
-    });
+      await triggerSkillExtractIfReady({
+        config,
+        sessionKey: PARITY_IDENTITY.sessionId,
+        agentSource: fixture.agentSource,
+        sessionInfo,
+        inputMessages: fixture.messages,
+        assistantMessage: fixture.assistantMessage,
+        protocol: fixture.protocol,
+      });
 
-    expect(requests).toHaveLength(1);
-    expect(requests[0].url).toBe("http://core.fixture/v3/skill/conversation/add");
-    expect(JSON.parse(String(requests[0].init?.body))).toMatchObject({
-      session_id: PARITY_IDENTITY.sessionId,
-      space_id: PARITY_IDENTITY.spaceId,
-      user_id: PARITY_IDENTITY.userId,
-      team_id: PARITY_IDENTITY.teamId,
-      agent_id: PARITY_IDENTITY.agentId,
-      task_id: PARITY_IDENTITY.taskId,
-      messages: COMPLETED_ROUND_GOLDEN,
-    });
+      expect(requests).toHaveLength(1);
+      expect(requests[0].url).toBe("http://core.fixture/v3/skill/conversation/add");
+      expect(parseRequestBody(requests[0].init)).toMatchObject({
+        session_id: PARITY_IDENTITY.sessionId,
+        space_id: PARITY_IDENTITY.spaceId,
+        user_id: PARITY_IDENTITY.userId,
+        team_id: PARITY_IDENTITY.teamId,
+        agent_id: PARITY_IDENTITY.agentId,
+        task_id: PARITY_IDENTITY.taskId,
+        messages: COMPLETED_ROUND_GOLDEN,
+      });
     },
   );
 });

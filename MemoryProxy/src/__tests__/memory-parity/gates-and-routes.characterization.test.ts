@@ -20,6 +20,7 @@ import {
   PARITY_SESSION_INFO,
   PARITY_TASK,
 } from "./fixtures.js";
+import { parseRequestBody } from "./test-support.js";
 
 afterEach(() => {
   __resetSessionStoreForTests();
@@ -198,6 +199,10 @@ describe("memory parity: ACL and capability gates", () => {
   );
 
   it("fails ACL checks closed when the authorization service is unavailable", async () => {
+    const fetcher = vi.fn(async () => {
+      throw new TypeError("metadata unavailable");
+    });
+    vi.stubGlobal("fetch", fetcher);
     const client = new TdaiClient({
       enabled: true,
       endpoint: "http://memory.fixture",
@@ -210,7 +215,6 @@ describe("memory parity: ACL and capability gates", () => {
       l2Limit: 3,
       timeoutMs: 50,
     });
-    vi.spyOn(client, "checkAcl").mockRejectedValue(new Error("metadata unavailable"));
 
     await expect(checkAclOrDeny(client, {
       user_key: "user-key",
@@ -218,6 +222,7 @@ describe("memory parity: ACL and capability gates", () => {
       action: "read",
       agent_id: "agent-a",
     })).resolves.toEqual({ allowed: false, reason: "acl_check_error" });
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it("preserves an explicit ACL rejection from the authorization service", async () => {
@@ -250,7 +255,7 @@ describe("memory parity: ACL and capability gates", () => {
     const [input, init] = fetcher.mock.calls[0];
     expect(String(input)).toBe("http://memory.fixture/v3/meta/acl/check");
     expect(new Headers(init?.headers).get("x-tdai-user-key")).toBe("user-key");
-    expect(JSON.parse(String(init?.body))).toMatchObject({
+    expect(parseRequestBody(init)).toMatchObject({
       user_key: "user-key",
       action: "read",
       agent_id: PARITY_IDENTITY.agentId,
@@ -371,8 +376,8 @@ describe("memory parity: existing proxy and bridge routes", () => {
     const [, anthropicInit] = upstreamCalls[1];
     expect(new Headers(openAiInit?.headers).get("authorization")).toBe("Bearer client-key");
     expect(new Headers(anthropicInit?.headers).get("x-api-key")).toBe("client-key");
-    expect(JSON.parse(String(openAiInit?.body))).toEqual(openAiRequest);
-    expect(JSON.parse(String(anthropicInit?.body))).toEqual(anthropicRequest);
+    expect(parseRequestBody(openAiInit)).toEqual(openAiRequest);
+    expect(parseRequestBody(anthropicInit)).toEqual(anthropicRequest);
   });
 
   it("preserves OpenAI and Anthropic streaming event boundaries", async () => {
@@ -398,7 +403,7 @@ describe("memory parity: existing proxy and bridge routes", () => {
     const upstreamBodies: Array<Record<string, unknown>> = [];
     const fetcher: typeof fetch = async (_input, init) => {
       const headers = new Headers(init?.headers);
-      upstreamBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      upstreamBodies.push(parseRequestBody(init));
       const body = headers.has("x-api-key") ? anthropicEvents : openAiEvents;
       return new Response(body, {
         status: 200,
@@ -550,7 +555,7 @@ describe("memory parity: existing proxy and bridge routes", () => {
         .toMatch(/^Bearer (service-token|memory-token)$/);
       expect(headers.get("x-tdai-service-id")).toBe(PARITY_IDENTITY.spaceId);
       expect(headers.get("content-type")).toBe("application/json");
-      expect(JSON.parse(String(init?.body))).toMatchObject({
+      expect(parseRequestBody(init)).toMatchObject({
         team_id: PARITY_IDENTITY.teamId,
         user_id: PARITY_IDENTITY.userId,
         agent_id: PARITY_IDENTITY.agentId,
