@@ -20,7 +20,10 @@ import { initAuth } from "./auth.js";
 import { initSystemUsers } from "./systemUser.js";
 import { checkConnectivity } from "./connectivity.js";
 import { initProxyStorage, getEffectiveBackend } from "./storage/factory.js";
-import { createProxyMemoryRuntime } from "./runtime/proxy-production.js";
+import {
+  createProxyMemoryRuntime,
+  isProxyMemoryRuntimeRequired,
+} from "./runtime/proxy-production.js";
 
 const overrides = parseArgv(process.argv);
 const config = buildConfig(overrides);
@@ -64,7 +67,7 @@ if (config.storage.enabled && config.storage.backend === "cos" && effectiveStora
   });
 }
 
-const proxyMemoryRuntime = config.sessionInit.enabled
+const proxyMemoryRuntime = isProxyMemoryRuntimeRequired(config)
   ? await createProxyMemoryRuntime(config)
   : undefined;
 const app = createApp(config, {

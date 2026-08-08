@@ -40,6 +40,17 @@ export interface ManagedProxyMemoryRuntime {
   shutdown(): Promise<void>;
 }
 
+/** Whether this deployment has any proxy memory orchestration to own. */
+export function isProxyMemoryRuntimeRequired(config: ProxyConfig): boolean {
+  const hasInjection = config.injection.enabled && config.injection.injectors.length > 0;
+  const hasL0Extraction = config.extraction.extractors.includes("tdai-memory") &&
+    config.tdai.enabled && config.tdai.memory.enabled && config.tdai.memory.writeL0;
+  const hasSkillExtraction = config.extraction.extractors.includes("skill") &&
+    Boolean(config.coreSkill.endpoint && config.coreSkill.serviceToken);
+  const hasExtraction = config.extraction.enabled && (hasL0Extraction || hasSkillExtraction);
+  return config.sessionInit.enabled || hasInjection || hasExtraction;
+}
+
 /** Build the app-scoped production runtime and start its durable delivery worker. */
 export async function createProxyMemoryRuntime(
   config: ProxyConfig,

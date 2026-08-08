@@ -51,18 +51,20 @@ import {
   canonicalizeAgentSource,
   createSessionNamespace,
 } from "./agent-sources.js";
-import {
-  MemoryRuntimeAuthorizationError,
-  MemoryRuntimeBindingError,
-  MemoryRuntimeContextError,
-  type MemoryRuntimeContract,
-  type PrepareContextResult,
+import type {
+  MemoryRuntimeContract,
+  PrepareContextResult,
 } from "./runtime/index.js";
 import {
   AnthropicStreamAccumulator,
   buildAnthropicCompletedRound,
 } from "./runtime/anthropic-adapter.js";
 import type { ProxyMemoryRuntimeProvider } from "./runtime/proxy-production.js";
+import {
+  classifyMemoryRuntimePrepareError,
+  sessionInfoFromRuntime,
+} from "./runtime/proxy-boundary.js";
+import { log } from "./report/log.js";
 
 const SKIP_REQUEST_HEADERS = new Set([
   "host",
@@ -849,21 +851,32 @@ export async function handleAnthropicMessages(
         hasTools = Array.isArray(body.tools) && body.tools.length > 0;
       }
     } catch (err: unknown) {
-      if (!(err instanceof MemoryRuntimeContextError)) {
-        const errorType = err instanceof MemoryRuntimeAuthorizationError ||
-            err instanceof MemoryRuntimeBindingError
-          ? err.name
-          : "MemoryRuntimeSecurityError";
-        console.warn(`[memory-runtime] Anthropic access denied: ${errorType}`);
+      const failure = classifyMemoryRuntimePrepareError(err);
+      if (failure.kind === "forbidden") {
+        log.warn("memory_runtime.prepare_forbidden", {
+          protocol: "anthropic",
+          errorType: failure.error.name,
+        });
         return c.json({
           type: "error",
           error: { type: "permission_error", message: "Memory access denied" },
         }, 403);
       }
-      console.warn(
-        "[memory-runtime] Anthropic prepare skipped:",
-        err instanceof Error ? err.message : String(err),
-      );
+      if (failure.kind === "unavailable") {
+        log.error(
+          "memory_runtime.prepare_unavailable",
+          { protocol: "anthropic" },
+          failure.error instanceof Error ? failure.error : new Error(String(failure.error)),
+        );
+        return c.json({
+          type: "error",
+          error: { type: "api_error", message: "Memory service unavailable" },
+        }, 503);
+      }
+      log.warn("memory_runtime.prepare_degraded", {
+        protocol: "anthropic",
+        error: failure.error.message,
+      });
       runtimePrepared = null;
     }
   }
@@ -1438,19 +1451,6 @@ async function commitAnthropicCompletedRound(input: {
   const completedRound = buildAnthropicCompletedRound(input);
   if (!completedRound) return;
   await input.runtime.commitCompletedRound(completedRound);
-}
-
-function sessionInfoFromRuntime(prepared: PrepareContextResult): Record<string, unknown> {
-  const identity = prepared.session.identity;
-  return {
-    session_id: identity.sessionId,
-    space_id: identity.serviceId,
-    user_id: identity.userId,
-    team_id: identity.teamId,
-    agent_id: identity.agentId,
-    task_id: identity.taskId,
-    identity_verified: true,
-  };
 }
 
 function createCompletionBarrierStream(

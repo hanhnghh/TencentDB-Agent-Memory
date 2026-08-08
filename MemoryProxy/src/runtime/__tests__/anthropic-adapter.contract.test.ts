@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   COMPLETED_ROUND_GOLDEN,
   FINAL_ASSISTANT,
+  NORMALIZATION_SCENARIOS,
   PARITY_IDENTITY,
   PROXY_ROUND_INPUTS,
   USER_PROMPT,
@@ -102,4 +103,43 @@ describe("Anthropic MemoryRuntime adapter", () => {
       malformedEventCount: 0,
     });
   });
+
+  it.each(NORMALIZATION_SCENARIOS)(
+    "preserves the $id shared normalization contract at the runtime seam",
+    ({ proxyInputs, golden }) => {
+      const input = proxyInputs.find((entry) => entry.protocol === "anthropic");
+      if (!input) throw new Error("Anthropic normalization fixture is required");
+
+      const round = buildAnthropicCompletedRound({
+        identity,
+        turnSequence: 1,
+        inputMessages: input.messages,
+        assistantMessage: input.assistantMessage,
+      });
+
+      expect(toNormalizedRound(round)).toEqual(golden);
+    },
+  );
 });
+
+function toNormalizedRound(round: ReturnType<typeof buildAnthropicCompletedRound>): unknown[] | null {
+  if (!round) return null;
+  return [
+    { role: "user", content: round.realPrompt },
+    ...round.events.map((event) => {
+      if (event.type === "tool_call") return {
+        role: "tool_call",
+        content: JSON.stringify(event.input),
+        tool_call_id: event.toolCallId,
+        tool_name: event.toolName,
+      };
+      if (event.type === "tool_result") return {
+        role: "tool_result",
+        content: event.content,
+        tool_call_id: event.toolCallId,
+      };
+      return { role: "assistant", content: event.content };
+    }),
+    { role: "assistant", content: round.finalResponse },
+  ];
+}

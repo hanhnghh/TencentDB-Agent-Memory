@@ -18,7 +18,10 @@ import {
   PARITY_TASK,
 } from "../../__tests__/memory-parity/fixtures.js";
 import { parseRequestBody } from "../../__tests__/memory-parity/test-support.js";
-import { createProxyMemoryRuntime } from "../proxy-production.js";
+import {
+  createProxyMemoryRuntime,
+  isProxyMemoryRuntimeRequired,
+} from "../proxy-production.js";
 
 const roots: string[] = [];
 const previousOutboxPath = process.env.PROXY_OUTBOX_PATH;
@@ -38,6 +41,27 @@ afterEach(async () => {
 });
 
 describe("proxy production MemoryRuntime", () => {
+  it("is required for enabled write orchestration even when session init is disabled", () => {
+    const config: ProxyConfig = structuredClone(DEFAULT_CONFIG);
+    config.sessionInit.enabled = false;
+    config.extraction.enabled = true;
+    config.extraction.extractors = ["tdai-memory"];
+    config.tdai.enabled = true;
+    config.tdai.memory.enabled = true;
+    config.tdai.memory.writeL0 = true;
+
+    expect(isProxyMemoryRuntimeRequired(config)).toBe(true);
+  });
+
+  it("is not required when every memory read and write path is disabled", () => {
+    const config: ProxyConfig = structuredClone(DEFAULT_CONFIG);
+    config.sessionInit.enabled = false;
+    config.injection.enabled = false;
+    config.extraction.enabled = false;
+
+    expect(isProxyMemoryRuntimeRequired(config)).toBe(false);
+  });
+
   it("resolves binding, enforces ACL/capabilities and durably delivers both channels", async () => {
     const root = await mkdtemp(join(tmpdir(), "openai-memory-runtime-"));
     roots.push(root);

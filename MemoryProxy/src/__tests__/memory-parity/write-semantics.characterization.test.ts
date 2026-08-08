@@ -680,6 +680,47 @@ describe("memory parity: approved completed-round target", () => {
     expect(runtime.commitCompletedRound).not.toHaveBeenCalled();
   });
 
+  it("returns Anthropic service unavailable when runtime preparation fails unexpectedly", async () => {
+    const config = memoryParityConfig();
+    await seedParitySession();
+    const upstream = vi.fn();
+    vi.stubGlobal("fetch", upstream);
+    const runtime: MemoryRuntimeContract = {
+      prepareContext: async () => {
+        throw new Error("capability backend unavailable");
+      },
+      commitCompletedRound: vi.fn(),
+    };
+    const app = createApp(config, { memoryRuntimeProvider: { forRequest: () => runtime } });
+
+    const response = await app.request(
+      `/claude-code/${PARITY_IDENTITY.spaceId}/v1/messages`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "client-key",
+          "x-conversation-id": PARITY_IDENTITY.sessionId,
+          "x-user-id": PARITY_IDENTITY.userId,
+        },
+        body: JSON.stringify({
+          model: "fixture-model",
+          max_tokens: 128,
+          stream: false,
+          messages: [{ role: "user", content: [{ type: "text", text: USER_PROMPT }] }],
+        }),
+      },
+    );
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      type: "error",
+      error: { type: "api_error", message: "Memory service unavailable" },
+    });
+    expect(upstream).not.toHaveBeenCalled();
+    expect(runtime.commitCompletedRound).not.toHaveBeenCalled();
+  });
+
   it("binds and commits through runtime when legacy session recovery fails", async () => {
     const config = memoryParityConfig();
     await seedParitySession();
@@ -1391,6 +1432,129 @@ describe("memory parity: approved completed-round target", () => {
     });
     expect(upstream).not.toHaveBeenCalled();
     expect(runtime.commitCompletedRound).not.toHaveBeenCalled();
+  });
+
+  it("returns OpenAI service unavailable when runtime preparation fails unexpectedly", async () => {
+    const config = memoryParityConfig();
+    await seedParitySession("codebuddy");
+    const upstream = vi.fn();
+    vi.stubGlobal("fetch", upstream);
+    const runtime: MemoryRuntimeContract = {
+      prepareContext: async () => {
+        throw new Error("capability backend unavailable");
+      },
+      commitCompletedRound: vi.fn(),
+    };
+    const app = createApp(config, { memoryRuntimeProvider: { forRequest: () => runtime } });
+
+    const response = await app.request(
+      `/codebuddy/${PARITY_IDENTITY.spaceId}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer client-key",
+          "content-type": "application/json",
+          "x-conversation-id": PARITY_IDENTITY.sessionId,
+          "x-user-id": PARITY_IDENTITY.userId,
+        },
+        body: JSON.stringify({
+          model: "fixture-model",
+          stream: false,
+          messages: [{ role: "user", content: USER_PROMPT }],
+        }),
+      },
+    );
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        message: "Memory service unavailable",
+        type: "service_unavailable_error",
+        code: "memory_service_unavailable",
+      },
+    });
+    expect(upstream).not.toHaveBeenCalled();
+    expect(runtime.commitCompletedRound).not.toHaveBeenCalled();
+  });
+
+  it("commits through MemoryRuntime when session init is disabled", async () => {
+    const config = memoryParityConfig();
+    config.sessionInit.enabled = false;
+    await seedParitySession("codebuddy");
+    const committed: CommitCompletedRoundInput[] = [];
+    const runtime: MemoryRuntimeContract = {
+      prepareContext: async () => ({
+        session: {
+          identity: {
+            serviceId: PARITY_IDENTITY.spaceId,
+            teamId: PARITY_IDENTITY.teamId,
+            userId: PARITY_IDENTITY.userId,
+            agentId: PARITY_IDENTITY.agentId,
+            taskId: PARITY_IDENTITY.taskId,
+            agentSource: "codebuddy",
+            sessionId: PARITY_IDENTITY.sessionId,
+          },
+          agent: PARITY_AGENT,
+          task: PARITY_TASK,
+        },
+        blocks: [],
+        capabilities: {
+          memory: { enabled: true },
+          skill: { enabled: true },
+          knowledge: { wiki: { enabled: false }, codeGraph: { enabled: false } },
+        },
+        diagnostics: {
+          binding: "cached",
+          prewarmed: [],
+          cacheHits: [],
+          degraded: [],
+        },
+      }),
+      commitCompletedRound: async (input) => {
+        committed.push(input);
+        return { status: "skipped", sourceEventId: input.sourceEventId, reason: "fixture" };
+      },
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      if (String(input) === config.upstream.url) {
+        return new Response(JSON.stringify({
+          id: "chatcmpl-session-init-disabled",
+          choices: [{ message: { role: "assistant", content: FINAL_ASSISTANT } }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ code: 0 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }));
+    const app = createApp(config, { memoryRuntimeProvider: { forRequest: () => runtime } });
+
+    const response = await app.request(
+      `/codebuddy/${PARITY_IDENTITY.spaceId}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer client-key",
+          "content-type": "application/json",
+          "x-conversation-id": PARITY_IDENTITY.sessionId,
+          "x-user-id": PARITY_IDENTITY.userId,
+        },
+        body: JSON.stringify({
+          model: "fixture-model",
+          stream: false,
+          messages: [{ role: "user", content: USER_PROMPT }],
+        }),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(committed).toHaveLength(1);
+    expect(committed[0]).toMatchObject({
+      identity: { serviceId: PARITY_IDENTITY.spaceId },
+      realPrompt: USER_PROMPT,
+      finalResponse: FINAL_ASSISTANT,
+    });
   });
 
   it("does not acknowledge an upstream success when durable enqueue fails", async () => {

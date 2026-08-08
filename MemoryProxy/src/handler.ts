@@ -47,15 +47,17 @@ import {
   canonicalizeAgentSource,
   createSessionNamespace,
 } from "./agent-sources.js";
-import {
-  MemoryRuntimeAuthorizationError,
-  MemoryRuntimeBindingError,
-  MemoryRuntimeContextError,
-  type MemoryRuntimeContract,
-  type PrepareContextResult,
+import type {
+  MemoryRuntimeContract,
+  PrepareContextResult,
 } from "./runtime/index.js";
 import { buildOpenAICompletedRound } from "./runtime/openai-adapter.js";
+import {
+  classifyMemoryRuntimePrepareError,
+  sessionInfoFromRuntime,
+} from "./runtime/proxy-boundary.js";
 import type { ProxyMemoryRuntimeProvider } from "./runtime/proxy-production.js";
+import { log } from "./report/log.js";
 
 /**
  * Flatten messages into Opik-friendly chat messages (no truncation).
@@ -731,12 +733,12 @@ export async function handleChatCompletions(
         messages = Array.isArray(body.messages) ? body.messages : messages;
       }
     } catch (err: unknown) {
-      if (!(err instanceof MemoryRuntimeContextError)) {
-        const errorType = err instanceof MemoryRuntimeAuthorizationError ||
-            err instanceof MemoryRuntimeBindingError
-          ? err.name
-          : "MemoryRuntimeSecurityError";
-        console.warn(`[memory-runtime] OpenAI access denied: ${errorType}`);
+      const failure = classifyMemoryRuntimePrepareError(err);
+      if (failure.kind === "forbidden") {
+        log.warn("memory_runtime.prepare_forbidden", {
+          protocol: "openai",
+          errorType: failure.error.name,
+        });
         return c.json({
           error: {
             message: "Memory access denied",
@@ -745,10 +747,24 @@ export async function handleChatCompletions(
           },
         }, 403);
       }
-      console.warn(
-        "[memory-runtime] OpenAI prepare skipped:",
-        err instanceof Error ? err.message : String(err),
-      );
+      if (failure.kind === "unavailable") {
+        log.error(
+          "memory_runtime.prepare_unavailable",
+          { protocol: "openai" },
+          failure.error instanceof Error ? failure.error : new Error(String(failure.error)),
+        );
+        return c.json({
+          error: {
+            message: "Memory service unavailable",
+            type: "service_unavailable_error",
+            code: "memory_service_unavailable",
+          },
+        }, 503);
+      }
+      log.warn("memory_runtime.prepare_degraded", {
+        protocol: "openai",
+        error: failure.error.message,
+      });
       runtimePrepared = null;
     }
   }
@@ -1274,19 +1290,6 @@ async function commitOpenAICompletedRound(input: {
   await input.runtime.commitCompletedRound(completedRound);
 }
 
-
-function sessionInfoFromRuntime(prepared: PrepareContextResult): Record<string, unknown> {
-  const identity = prepared.session.identity;
-  return {
-    session_id: identity.sessionId,
-    space_id: identity.serviceId,
-    user_id: identity.userId,
-    team_id: identity.teamId,
-    agent_id: identity.agentId,
-    task_id: identity.taskId,
-    identity_verified: true,
-  };
-}
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
