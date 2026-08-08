@@ -92,6 +92,31 @@ describe("Codex binding operations", () => {
     expect(JSON.stringify(diagnosis)).not.toContain("user-key-secret");
   });
 
+  it("diagnoses a credential store placed inside the project", async () => {
+    const dirs = await setup();
+    await bind(dirs.projectDir, dirs.userConfigDir);
+    const localConfigDir = join(dirs.projectDir, ".codex", "user-config");
+    await mkdir(localConfigDir, { recursive: true, mode: 0o700 });
+    await chmod(localConfigDir, 0o700);
+    await writeFile(
+      resolveCredentialPath(localConfigDir),
+      `${JSON.stringify({ version: 1, user_keys: { "memory-1": "user-key-secret" } })}\n`,
+      { mode: 0o600 },
+    );
+
+    const diagnosis = await doctorCodexBinding({
+      projectDir: dirs.projectDir,
+      userConfigDir: localConfigDir,
+    });
+
+    expect(diagnosis.ok).toBe(false);
+    expect(diagnosis.checks).toContainEqual(expect.objectContaining({
+      name: "credential_location",
+      status: "fail",
+    }));
+    expect(JSON.stringify(diagnosis)).not.toContain("user-key-secret");
+  });
+
   it("unbinds without model or network interaction and optionally forgets the credential", async () => {
     const dirs = await setup();
     await bind(dirs.projectDir, dirs.userConfigDir);
@@ -124,6 +149,44 @@ describe("Codex binding operations", () => {
       credentialRemoved: false,
     });
     await expect(stat(projectPath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("removes an invalid project binding when credential cleanup was requested", async () => {
+    const dirs = await setup();
+    const projectPath = join(dirs.projectDir, PROJECT_BINDING_RELATIVE_PATH);
+    await mkdir(dirname(projectPath), { recursive: true });
+    await writeFile(projectPath, "{not-json");
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+
+    await expect(unbindCodexProject({
+      ...dirs,
+      forgetCredential: true,
+    })).resolves.toEqual({
+      removed: true,
+      credentialRemoved: false,
+    });
+    await expect(stat(projectPath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("removes the project binding when the credential store is malformed", async () => {
+    const dirs = await setup();
+    await bind(dirs.projectDir, dirs.userConfigDir);
+    await writeFile(resolveCredentialPath(dirs.userConfigDir), "{not-json", { mode: 0o600 });
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+
+    await expect(unbindCodexProject({
+      ...dirs,
+      forgetCredential: true,
+    })).resolves.toEqual({
+      removed: true,
+      credentialRemoved: false,
+    });
+    await expect(stat(join(dirs.projectDir, PROJECT_BINDING_RELATIVE_PATH)))
+      .rejects.toMatchObject({ code: "ENOENT" });
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 

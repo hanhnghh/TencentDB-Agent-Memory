@@ -108,11 +108,11 @@ The project file is `.codex/memory-binding.json` and contains only binding IDs
 and preferences. The Memory Hub user key is stored separately under the user's
 configuration directory (`$XDG_CONFIG_HOME/tencentdb-agent-memory/codex`, or
 `~/.config/tencentdb-agent-memory/codex`) with directory mode `0700` and file
-mode `0600`. Credentials are accepted from environment variables rather than
-command-line options so they are not exposed in shell history or process
-arguments. `unbind --forget-credential` also removes the key for that Memory
-service. Status, doctor, and unbind are local operations and never invoke a
-model.
+mode `0600`; a credential directory inside the bound project is rejected.
+Credentials are accepted from environment variables rather than command-line
+options so they are not exposed in shell history or process arguments. `unbind
+--forget-credential` also removes the key for that Memory service. Status,
+doctor, and unbind are local operations and never invoke a model.
 
 ### 1. Install dependencies
 

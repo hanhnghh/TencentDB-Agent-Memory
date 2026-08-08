@@ -26,11 +26,20 @@ export interface VerifyUserResult {
 export interface UserKeyVerifierConfig {
   url: string;
   timeoutMs: number;
+  /** Optional MemoryCore gateway credential; omitted by the legacy proxy verifier. */
+  serviceToken?: string;
 }
 
 interface UserKeyVerifierObserver {
   httpError?(status: number, serviceId: string): void;
   error?(reason: string, serviceId: string): void;
+}
+
+function redactVerifierSecrets(message: string, secrets: Array<string | undefined>): string {
+  return secrets
+    .filter((secret): secret is string => Boolean(secret))
+    .sort((a, b) => b.length - a.length)
+    .reduce((text, secret) => text.split(secret).join("[REDACTED]"), message);
 }
 
 // ── Module state ──────────────────────────────────────────────────────────────
@@ -106,12 +115,16 @@ export async function verifyUserKeyWithConfig(
   if (!userKey) return { userId: "", rejected: true, rejectReason: "missing user_key" };
 
   try {
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      "x-tdai-service-id": serviceId,
+    };
+    if (verifier.serviceToken) {
+      headers.Authorization = `Bearer ${verifier.serviceToken}`;
+    }
     const fetchOpts: RequestInit = {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-tdai-service-id": serviceId,
-      },
+      headers,
       body: JSON.stringify({ user_key: userKey }),
     };
     if (verifier.timeoutMs > 0) {
@@ -150,9 +163,10 @@ export async function verifyUserKeyWithConfig(
     return { userId: "", rejected: true, rejectReason: reason };
   } catch (err: unknown) {
     const isTimeout = err instanceof DOMException && err.name === "TimeoutError";
-    const reason = isTimeout
+    const unsafeReason = isTimeout
       ? `auth service timeout (${verifier.timeoutMs}ms)`
       : `auth service error: ${err instanceof Error ? err.message : String(err)}`;
+    const reason = redactVerifierSecrets(unsafeReason, [userKey, verifier.serviceToken]);
     observer?.error?.(reason, serviceId);
     return { userId: "", rejected: true, rejectReason: reason };
   }

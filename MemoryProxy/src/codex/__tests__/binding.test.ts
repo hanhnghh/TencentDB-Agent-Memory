@@ -37,6 +37,7 @@ function successfulApi(): typeof fetch {
 
     if (path === "/v3/meta/auth/verify") {
       expect(body).toEqual({ user_key: "user-key-secret" });
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer service-secret");
       return jsonResponse({ code: 0, data: { valid: true, user: { user_id: "user-1" } } });
     }
 
@@ -324,5 +325,78 @@ describe("validated Codex project binding", () => {
     })).rejects.toThrow("Project binding contains forbidden secret field 'clientSecret'");
 
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("refuses prefixed secret names in project preferences", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    await mkdir(projectDir);
+    const fetcher = successfulApi();
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir: join(root, "user-config"),
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      preferences: { memoryAPIKey: "must-not-be-local" },
+      fetcher,
+    })).rejects.toThrow("Project binding contains forbidden secret field 'memoryAPIKey'");
+
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("refuses to place the credential store inside the project", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    await mkdir(projectDir);
+    const fetcher = successfulApi();
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir: join(projectDir, ".codex", "user-config"),
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      fetcher,
+    })).rejects.toThrow("Credential store must be outside the project");
+
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("refuses non-finite numeric preferences before persistence", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    await mkdir(projectDir);
+    const fetcher = successfulApi();
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir: join(root, "user-config"),
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      preferences: { contextLimit: Number.NaN },
+      fetcher,
+    })).rejects.toThrow("Binding preference 'contextLimit' must be JSON-safe");
+
+    expect(fetcher).not.toHaveBeenCalled();
+    await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH)))
+      .rejects.toMatchObject({ code: "ENOENT" });
   });
 });

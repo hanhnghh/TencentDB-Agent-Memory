@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { resolveAgentAdapter } from "../agent-adapters/index.js";
+import { extractSpaceIdFromPath } from "../credit-reporter.js";
+import { normalizeWhitelistRequestPath } from "../routes/whitelist.js";
 import {
   createSessionNamespace,
   normalizeAgentSource,
@@ -12,6 +14,16 @@ describe("Codex agent source registry", () => {
   it("recognizes Codex without treating it as an unknown client", () => {
     expect(normalizeAgentSource("codex")).toBe("codex");
     expect(resolveAgentAdapter("codex").agentKind).toBe("codex");
+    expect(extractSpaceIdFromPath("/codex/memory-1/v1/messages")).toBe("memory-1");
+    expect(normalizeWhitelistRequestPath("/codex/memory-1/v1/messages")).toBe("/v1/messages");
+  });
+
+  it("preserves legacy agent path recognition", () => {
+    expect(extractSpaceIdFromPath("/claude-code/memory-1/v1/messages")).toBe("memory-1");
+    expect(extractSpaceIdFromPath("/codebuddy/memory-1/v1/chat/completions")).toBe("memory-1");
+    expect(resolveAgentAdapter("claude-code").agentKind).toBe("claude-code");
+    expect(resolveAgentAdapter("codebuddy").agentKind).toBe("codebuddy");
+    expect(resolveAgentAdapter("unregistered").agentKind).toBe("unknown");
   });
 
   it("isolates identical session identities for every client namespace", () => {

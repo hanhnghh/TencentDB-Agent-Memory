@@ -138,6 +138,7 @@ function usage(): string {
     "",
     "Common options:",
     "  --project <path>  Project root (defaults to current directory)",
+    "  --user-config-dir <path>  Protected credential root (must be outside the project)",
   ].join("\n");
 }
 

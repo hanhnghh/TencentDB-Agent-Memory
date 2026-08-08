@@ -3,13 +3,22 @@ import {
   mkdir,
   open,
   readFile,
+  realpath,
   rename,
   stat,
   unlink,
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 
 import { verifyUserKeyWithConfig } from "../auth.js";
 import { MetadataClient } from "../meta/client.js";
@@ -225,8 +234,11 @@ const FORBIDDEN_SECRET_FIELDS = new Set([
   "user_key",
 ]);
 
+const COMPOUND_SECRET_FIELD_RE = /(?:^|_)(?:access_token|auth_token|api_key|bearer_token|client_secret|cookie|credentials?|id_token|password|passphrase|private_key|refresh_token|secret(?:_key)?|service_token|session_token|user_key)(?:_|$)/;
+
 function normalizeFieldName(key: string): string {
   return key
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
     .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
     .replace(/[-\s]+/g, "_")
     .toLowerCase();
@@ -235,11 +247,66 @@ function normalizeFieldName(key: string): string {
 function findForbiddenSecretField(value: unknown): string | null {
   if (!value || typeof value !== "object") return null;
   for (const [key, child] of Object.entries(value)) {
-    if (FORBIDDEN_SECRET_FIELDS.has(normalizeFieldName(key))) return key;
+    const normalized = normalizeFieldName(key);
+    if (
+      FORBIDDEN_SECRET_FIELDS.has(normalized) ||
+      COMPOUND_SECRET_FIELD_RE.test(normalized) ||
+      normalized.endsWith("_token")
+    ) return key;
     const nested = findForbiddenSecretField(child);
     if (nested) return nested;
   }
   return null;
+}
+
+async function canonicalizeProspectivePath(path: string): Promise<string> {
+  let cursor = resolve(path);
+  const missingSegments: string[] = [];
+  while (true) {
+    try {
+      return join(await realpath(cursor), ...missingSegments);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = dirname(cursor);
+      if (parent === cursor) return resolve(path);
+      missingSegments.unshift(basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
+function pathIsWithin(parent: string, candidate: string): boolean {
+  const child = relative(parent, candidate);
+  return child === "" || (
+    child !== ".." &&
+    !child.startsWith(`..${sep}`) &&
+    !isAbsolute(child)
+  );
+}
+
+async function assertCredentialOutsideProject(
+  projectDir: string,
+  credentialPath: string,
+): Promise<void> {
+  let projectRoot: string;
+  try {
+    const projectStats = await stat(projectDir);
+    if (!projectStats.isDirectory()) throw new Error("not a directory");
+    projectRoot = await realpath(projectDir);
+  } catch {
+    throw new CodexBindingError(
+      "invalid_configuration",
+      "Project root must be an existing directory",
+    );
+  }
+
+  const credentialLocation = await canonicalizeProspectivePath(credentialPath);
+  if (pathIsWithin(projectRoot, credentialLocation)) {
+    throw new CodexBindingError(
+      "secret_in_project_config",
+      "Credential store must be outside the project",
+    );
+  }
 }
 
 function parsePreferences(
@@ -261,6 +328,12 @@ function parsePreferences(
       throw new CodexBindingError(
         "invalid_project_binding",
         `Binding preference '${key}' must be a string, number, or boolean`,
+      );
+    }
+    if (typeof preference === "number" && !Number.isFinite(preference)) {
+      throw new CodexBindingError(
+        "invalid_project_binding",
+        `Binding preference '${key}' must be JSON-safe`,
       );
     }
     preferences[key] = preference as string | number | boolean;
@@ -347,9 +420,12 @@ export async function bindCodexProject(
   const timeoutMs = input.timeoutMs ?? 5_000;
   const fetcher = input.fetcher ?? globalThis.fetch.bind(globalThis);
   const secrets = [userKey, serviceToken];
+  const credentialPath = resolveCredentialPath(input.userConfigDir);
+
+  await assertCredentialOutsideProject(input.projectDir, credentialPath);
 
   const verified = await verifyUserKeyWithConfig(
-    { url: authUrl, timeoutMs },
+    { url: authUrl, timeoutMs, serviceToken },
     userKey,
     serviceId,
     fetcher,
@@ -415,7 +491,6 @@ export async function bindCodexProject(
       ? { preferences }
       : {}),
   };
-  const credentialPath = resolveCredentialPath(input.userConfigDir);
   const credentials = await readCredentialFile(credentialPath);
   credentials.user_keys[serviceId] = userKey;
 
@@ -494,6 +569,23 @@ export async function doctorCodexBinding(
       : "No user credential is configured for this service",
   });
 
+  try {
+    await assertCredentialOutsideProject(paths.projectDir, status.credentialPath);
+    checks.push({
+      name: "credential_location",
+      status: "pass",
+      message: "Credential store is outside the project",
+    });
+  } catch (error) {
+    checks.push({
+      name: "credential_location",
+      status: "fail",
+      message: error instanceof CodexBindingError
+        ? error.message
+        : "Credential store location could not be inspected",
+    });
+  }
+
   let credentialMode: number | null = null;
   let directoryMode: number | null = null;
   try {
@@ -546,23 +638,34 @@ export interface UnbindCodexProjectResult {
 export async function unbindCodexProject(
   input: UnbindCodexProjectInput,
 ): Promise<UnbindCodexProjectResult> {
-  const binding = input.forgetCredential
-    ? await readCodexProjectBinding(input.projectDir)
-    : null;
+  let binding: CodexProjectBinding | null = null;
+  if (input.forgetCredential) {
+    try {
+      binding = await readCodexProjectBinding(input.projectDir);
+    } catch (error) {
+      if (!(error instanceof CodexBindingError)) throw error;
+    }
+  }
   let credentialRemoved = false;
 
   if (input.forgetCredential && binding) {
-    const credentialPath = resolveCredentialPath(input.userConfigDir);
-    const credentials = await readCredentialFile(credentialPath);
-    if (Object.hasOwn(credentials.user_keys, binding.service_id)) {
-      delete credentials.user_keys[binding.service_id];
-      credentialRemoved = true;
-      if (Object.keys(credentials.user_keys).length === 0) {
-        await unlink(credentialPath).catch((error: NodeJS.ErrnoException) => {
-          if (error.code !== "ENOENT") throw error;
-        });
-      } else {
-        await atomicWriteJson(credentialPath, credentials, 0o600);
+    try {
+      const credentialPath = resolveCredentialPath(input.userConfigDir);
+      const credentials = await readCredentialFile(credentialPath);
+      if (Object.hasOwn(credentials.user_keys, binding.service_id)) {
+        delete credentials.user_keys[binding.service_id];
+        credentialRemoved = true;
+        if (Object.keys(credentials.user_keys).length === 0) {
+          await unlink(credentialPath).catch((error: NodeJS.ErrnoException) => {
+            if (error.code !== "ENOENT") throw error;
+          });
+        } else {
+          await atomicWriteJson(credentialPath, credentials, 0o600);
+        }
+      }
+    } catch (error) {
+      if (!(error instanceof CodexBindingError && error.code === "credential_store_invalid")) {
+        throw error;
       }
     }
   }
