@@ -92,7 +92,7 @@ describe("TypeScript SDK skill conversation receipt", () => {
 
     const failure = await client().conversationAdd(request).catch((error: unknown) => error);
     expect(failure).toMatchObject({
-      name: "TDAMError",
+      name: "TDAMTransportError",
       kind,
       retryable: true,
     });
@@ -122,7 +122,7 @@ describe("TypeScript SDK skill conversation receipt", () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("secret-response-body", { status: 200 })));
     const failure = await client().conversationAdd(request).catch((error: unknown) => error);
     expect(failure).toMatchObject({
-      name: "TDAMError",
+      name: "TDAMResponseError",
       kind: "invalid_response",
       retryable: false,
     });
@@ -154,7 +154,7 @@ describe("TypeScript SDK skill conversation receipt", () => {
     const failure = await transport.post("/v3/skill/listing", {})
       .catch((error: unknown) => error);
     expect(failure).toMatchObject({
-      name: "TDAMError",
+      name: "TDAMResponseError",
       kind: "invalid_response",
       retryable: false,
     });
@@ -171,7 +171,7 @@ describe("TypeScript SDK skill conversation receipt", () => {
     const failure = await transport.post("/v3/skill/listing", {})
       .catch((error: unknown) => error);
     expect(failure).toMatchObject({
-      name: "TDAMError",
+      name: "TDAMResponseError",
       kind: "invalid_response",
       retryable: false,
     });

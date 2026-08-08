@@ -71,6 +71,34 @@ function memoryParityConfig(): ProxyConfig {
   return config;
 }
 
+function l0SuccessResponse(init?: RequestInit): Response {
+  const body = parseRequestBody(init);
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const acceptedIds = messages.map((_, index) => `fixture-message-${index}`);
+  const sourceEventId = body.source_event_id;
+  const contentHash = body.content_hash;
+  const receipt = typeof sourceEventId === "string" && typeof contentHash === "string"
+    ? {
+        source_event_id: sourceEventId,
+        content_hash: contentHash,
+        status: "committed",
+        committed_at: "2026-08-08T00:00:00.000Z",
+      }
+    : undefined;
+  return new Response(JSON.stringify({
+    code: 0,
+    data: {
+      accepted_ids: acceptedIds,
+      accepted_versions: acceptedIds.map(() => "v1"),
+      total_count: acceptedIds.length,
+      receipt,
+    },
+  }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
 async function seedParitySession(
   agentSource: string = PARITY_IDENTITY.agentSource,
 ): Promise<void> {
@@ -150,10 +178,7 @@ describe("memory parity: observed legacy intermediate L0 behavior", () => {
       }
       if (url.endsWith("/v3/conversation/add")) {
         l0Requests.push(parseRequestBody(init));
-        return new Response(JSON.stringify({ code: 0, data: {} }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
+        return l0SuccessResponse(init);
       }
       throw new Error(`unexpected fixture URL: ${url}`);
     }));
@@ -255,10 +280,7 @@ describe("memory parity: observed legacy intermediate L0 behavior", () => {
       }
       if (url.endsWith("/v3/conversation/add")) {
         l0Requests.push(parseRequestBody(init));
-        return new Response(JSON.stringify({ code: 0, data: {} }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
+        return l0SuccessResponse(init);
       }
       throw new Error(`unexpected fixture URL: ${url}`);
     }));
@@ -307,10 +329,7 @@ describe("memory parity: observed legacy intermediate L0 behavior", () => {
     const writes: Array<Record<string, unknown>> = [];
     const fetcher: typeof fetch = async (_input, init) => {
       writes.push(parseRequestBody(init));
-      return new Response(JSON.stringify({ code: 0, data: {} }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+      return l0SuccessResponse(init);
     };
     vi.stubGlobal("fetch", vi.fn(fetcher));
     const config = memoryParityConfig().tdai;

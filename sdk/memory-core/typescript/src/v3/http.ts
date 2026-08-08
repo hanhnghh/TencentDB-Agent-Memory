@@ -120,7 +120,8 @@ export class V3HttpTransport {
       return result as T & { trace_id?: string };
     } catch (err) {
       if (err instanceof TDAMError) throw err;
-      const timedOut = controller.signal.aborted;
+      const timedOut = controller.signal.aborted
+        || (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError"));
       throw new TDAMTransportError(
         timedOut ? "timeout" : "network",
         timedOut ? `Request timed out after ${this.timeout}ms` : "Network request failed",
