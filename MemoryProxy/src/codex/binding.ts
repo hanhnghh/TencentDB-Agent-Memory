@@ -10,6 +10,7 @@ import {
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   basename,
   dirname,
@@ -26,6 +27,9 @@ import { MetadataClient } from "../meta/client.js";
 export const PROJECT_BINDING_RELATIVE_PATH = join(".codex", "memory-binding.json");
 const CREDENTIAL_FILE_NAME = "credentials.json";
 const CONFIG_VERSION = 1;
+const CREDENTIAL_LOCK_RETRY_MS = 25;
+const CREDENTIAL_LOCK_TIMEOUT_MS = 5_000;
+const MALFORMED_LOCK_STALE_MS = 30_000;
 
 export interface CodexProjectBinding {
   version: 1;
@@ -146,18 +150,25 @@ function validatedUrl(label: string, value: string): string {
   return url.toString().replace(/\/$/, "");
 }
 
-function redact(message: string, secrets: string[]): string {
-  return secrets
-    .filter(Boolean)
-    .sort((a, b) => b.length - a.length)
-    .reduce((text, secret) => text.split(secret).join("[REDACTED]"), message);
+function classifyValidationFailure(error: unknown): string {
+  const detail = error instanceof Error ? error.message : "";
+  if (/malformed|unexpected (?:null|token|end)|JSON/i.test(detail)) {
+    return "returned malformed data";
+  }
+  if (/timeout|timed out|abort/i.test(detail)) return "timed out";
+  const status = Number(detail.match(/\bHTTP (\d{3})\b/)?.[1]);
+  if (status === 429) return "throttled the request";
+  if (status >= 500) return "is unavailable";
+  if (status >= 400) return "rejected the request";
+  if (/envelope error/i.test(detail)) return "rejected the response";
+  if (/fetch failed/i.test(detail)) return "could not be reached";
+  return "request failed";
 }
 
-function wrapValidationError(scope: string, error: unknown, secrets: string[]): CodexBindingError {
-  const detail = error instanceof Error ? error.message : String(error);
+function wrapValidationError(scope: string, error: unknown): CodexBindingError {
   return new CodexBindingError(
     "validation_failed",
-    redact(`Unable to validate ${scope}: ${detail}`, secrets),
+    `Unable to validate ${scope}: MemoryCore metadata ${classifyValidationFailure(error)}`,
   );
 }
 
@@ -184,6 +195,88 @@ async function atomicWriteJson(path: string, value: unknown, mode: number): Prom
   }
 }
 
+interface CredentialLockOwner {
+  pid: number;
+  token: string;
+}
+
+function processIsRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+async function lockCanBeRemoved(lockPath: string): Promise<boolean> {
+  try {
+    const [text, lockStat] = await Promise.all([
+      readFile(lockPath, "utf8"),
+      stat(lockPath),
+    ]);
+    const owner = JSON.parse(text) as Partial<CredentialLockOwner>;
+    if (Number.isSafeInteger(owner.pid) && (owner.pid ?? 0) > 0) {
+      return !processIsRunning(owner.pid as number);
+    }
+    return Date.now() - lockStat.mtimeMs >= MALFORMED_LOCK_STALE_MS;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    return false;
+  }
+}
+
+async function withCredentialStoreLock<T>(
+  credentialPath: string,
+  action: () => Promise<T>,
+): Promise<T> {
+  const lockPath = `${credentialPath}.lock`;
+  await mkdir(dirname(lockPath), { recursive: true, mode: 0o700 });
+  const deadline = Date.now() + CREDENTIAL_LOCK_TIMEOUT_MS;
+  const owner: CredentialLockOwner = { pid: process.pid, token: randomUUID() };
+  let handle: Awaited<ReturnType<typeof open>> | null = null;
+
+  while (!handle) {
+    try {
+      handle = await open(lockPath, "wx", 0o600);
+      await handle.writeFile(`${JSON.stringify(owner)}\n`, "utf8");
+      await handle.sync();
+    } catch (error) {
+      if (handle) {
+        await handle.close().catch(() => undefined);
+        handle = null;
+        await unlink(lockPath).catch(() => undefined);
+      }
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (await lockCanBeRemoved(lockPath)) {
+        await unlink(lockPath).catch((unlinkError: NodeJS.ErrnoException) => {
+          if (unlinkError.code !== "ENOENT") throw unlinkError;
+        });
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new CodexBindingError(
+          "credential_store_busy",
+          "Protected credential store is busy; retry the local operation",
+        );
+      }
+      await delay(CREDENTIAL_LOCK_RETRY_MS);
+    }
+  }
+
+  try {
+    return await action();
+  } finally {
+    await handle.close().catch(() => undefined);
+    try {
+      const current = JSON.parse(await readFile(lockPath, "utf8")) as Partial<CredentialLockOwner>;
+      if (current.token === owner.token) await unlink(lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+}
+
 async function readCredentialFile(path: string): Promise<CredentialFile> {
   try {
     const parsed = JSON.parse(await readFile(path, "utf8")) as Partial<CredentialFile>;
@@ -191,13 +284,22 @@ async function readCredentialFile(path: string): Promise<CredentialFile> {
       parsed.version !== CONFIG_VERSION ||
       !parsed.user_keys ||
       typeof parsed.user_keys !== "object" ||
-      Array.isArray(parsed.user_keys)
+      Array.isArray(parsed.user_keys) ||
+      Object.keys(parsed).some((key) => !["version", "user_keys"].includes(key))
     ) {
       throw new Error("unsupported credential file format");
     }
     const userKeys = Object.create(null) as Record<string, string>;
     for (const [serviceId, userKey] of Object.entries(parsed.user_keys)) {
-      if (typeof userKey === "string" && userKey) userKeys[serviceId] = userKey;
+      if (
+        !serviceId.trim() ||
+        serviceId !== serviceId.trim() ||
+        typeof userKey !== "string" ||
+        !userKey.trim()
+      ) {
+        throw new Error("unsupported credential file format");
+      }
+      userKeys[serviceId] = userKey;
     }
     return { version: CONFIG_VERSION, user_keys: userKeys };
   } catch (error) {
@@ -419,7 +521,6 @@ export async function bindCodexProject(
   const authUrl = validatedUrl("Auth URL", input.authUrl ?? endpoint);
   const timeoutMs = input.timeoutMs ?? 5_000;
   const fetcher = input.fetcher ?? globalThis.fetch.bind(globalThis);
-  const secrets = [userKey, serviceToken];
   const credentialPath = resolveCredentialPath(input.userConfigDir);
 
   await assertCredentialOutsideProject(input.projectDir, credentialPath);
@@ -448,7 +549,7 @@ export async function bindCodexProject(
   try {
     teams = await metadata.listTeams(verified.userId);
   } catch (error) {
-    throw wrapValidationError("Team", error, secrets);
+    throw wrapValidationError("Team", error);
   }
   if (!teams.some((team) => team.team_id === teamId)) {
     throw new CodexBindingError(
@@ -465,7 +566,7 @@ export async function bindCodexProject(
       metadata.listTasks(teamId),
     ]);
   } catch (error) {
-    throw wrapValidationError("Agent/Task scope", error, secrets);
+    throw wrapValidationError("Agent/Task scope", error);
   }
   if (!agents.some((agent) => agent.agent_id === agentId && agent.team_id === teamId)) {
     throw new CodexBindingError(
@@ -491,13 +592,16 @@ export async function bindCodexProject(
       ? { preferences }
       : {}),
   };
-  const credentials = await readCredentialFile(credentialPath);
-  credentials.user_keys[serviceId] = userKey;
-
-  // Both writes happen only after every remote validation has succeeded.
-  await atomicWriteJson(credentialPath, credentials, 0o600);
   const projectConfigPath = resolveProjectBindingPath(input.projectDir);
-  await atomicWriteJson(projectConfigPath, binding, 0o644);
+  await withCredentialStoreLock(credentialPath, async () => {
+    const credentials = await readCredentialFile(credentialPath);
+    credentials.user_keys[serviceId] = userKey;
+
+    // Serialize the two-file update so concurrent binds cannot lose a key or
+    // leave the winning project binding paired with another writer's key.
+    await atomicWriteJson(credentialPath, credentials, 0o600);
+    await atomicWriteJson(projectConfigPath, binding, 0o644);
+  });
 
   return {
     binding,
@@ -634,48 +738,62 @@ export interface UnbindCodexProjectResult {
   credentialRemoved: boolean;
 }
 
+async function removeProjectBindingFile(projectDir: string): Promise<boolean> {
+  let removed = false;
+  await unlink(resolveProjectBindingPath(projectDir))
+    .then(() => { removed = true; })
+    .catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+    });
+  return removed;
+}
+
 /** Remove local binding state without invoking a model or network API. */
 export async function unbindCodexProject(
   input: UnbindCodexProjectInput,
 ): Promise<UnbindCodexProjectResult> {
-  let binding: CodexProjectBinding | null = null;
-  if (input.forgetCredential) {
+  if (!input.forgetCredential) {
+    return {
+      removed: await removeProjectBindingFile(input.projectDir),
+      credentialRemoved: false,
+    };
+  }
+
+  const credentialPath = resolveCredentialPath(input.userConfigDir);
+  await assertCredentialOutsideProject(input.projectDir, credentialPath);
+  return withCredentialStoreLock(credentialPath, async () => {
+    let binding: CodexProjectBinding | null = null;
     try {
       binding = await readCodexProjectBinding(input.projectDir);
     } catch (error) {
       if (!(error instanceof CodexBindingError)) throw error;
     }
-  }
-  let credentialRemoved = false;
+    let credentialRemoved = false;
 
-  if (input.forgetCredential && binding) {
-    try {
-      const credentialPath = resolveCredentialPath(input.userConfigDir);
-      const credentials = await readCredentialFile(credentialPath);
-      if (Object.hasOwn(credentials.user_keys, binding.service_id)) {
-        delete credentials.user_keys[binding.service_id];
-        credentialRemoved = true;
-        if (Object.keys(credentials.user_keys).length === 0) {
-          await unlink(credentialPath).catch((error: NodeJS.ErrnoException) => {
-            if (error.code !== "ENOENT") throw error;
-          });
-        } else {
-          await atomicWriteJson(credentialPath, credentials, 0o600);
+    if (binding) {
+      try {
+        const credentials = await readCredentialFile(credentialPath);
+        if (Object.hasOwn(credentials.user_keys, binding.service_id)) {
+          delete credentials.user_keys[binding.service_id];
+          credentialRemoved = true;
+          if (Object.keys(credentials.user_keys).length === 0) {
+            await unlink(credentialPath).catch((error: NodeJS.ErrnoException) => {
+              if (error.code !== "ENOENT") throw error;
+            });
+          } else {
+            await atomicWriteJson(credentialPath, credentials, 0o600);
+          }
+        }
+      } catch (error) {
+        if (!(error instanceof CodexBindingError && error.code === "credential_store_invalid")) {
+          throw error;
         }
       }
-    } catch (error) {
-      if (!(error instanceof CodexBindingError && error.code === "credential_store_invalid")) {
-        throw error;
-      }
     }
-  }
 
-  let removed = false;
-  await unlink(resolveProjectBindingPath(input.projectDir))
-    .then(() => { removed = true; })
-    .catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== "ENOENT") throw error;
-    });
-
-  return { removed, credentialRemoved };
+    return {
+      removed: await removeProjectBindingFile(input.projectDir),
+      credentialRemoved,
+    };
+  });
 }

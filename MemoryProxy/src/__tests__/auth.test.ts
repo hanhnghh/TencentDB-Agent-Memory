@@ -85,7 +85,7 @@ describe("user-key verifier extraction", () => {
     expect(result.rejectReason).not.toContain("service-secret");
   });
 
-  it("preserves OpenAI and Anthropic auth failures on a Codex source path", async () => {
+  it("preserves legacy OpenAI and Anthropic auth failures on a Codex source path", async () => {
     const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       expect(new Headers(init?.headers).get("x-tdai-service-id")).toBe("memory-1");
       return jsonResponse({ code: 0, data: { valid: false } });
@@ -94,10 +94,10 @@ describe("user-key verifier extraction", () => {
     initAuth({ enabled: true, url: "https://auth.example", timeoutMs: 5_000 });
     const app = new Hono();
     const config = {} as ProxyConfig;
-    app.post("/codex/:service/v1/chat/completions", (context) => (
+    app.post("/:source/:service/v1/chat/completions", (context) => (
       handleChatCompletions(context, config)
     ));
-    app.post("/codex/:service/v1/messages", (context) => (
+    app.post("/:source/:service/v1/messages", (context) => (
       handleAnthropicMessages(context, config)
     ));
 
@@ -111,19 +111,41 @@ describe("user-key verifier extraction", () => {
       headers: { "x-api-key": "invalid-user-key" },
       body: "{}",
     });
+    const legacyOpenAiResponse = await app.request(
+      "/codebuddy/memory-1/v1/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer invalid-user-key" },
+        body: "{}",
+      },
+    );
+    const legacyAnthropicResponse = await app.request(
+      "/claude-code/memory-1/v1/messages",
+      {
+        method: "POST",
+        headers: { "x-api-key": "invalid-user-key" },
+        body: "{}",
+      },
+    );
 
     expect(openAiResponse.status).toBe(401);
-    await expect(openAiResponse.json()).resolves.toEqual({
+    expect(legacyOpenAiResponse.status).toBe(401);
+    const openAiBody = await openAiResponse.json();
+    expect(await legacyOpenAiResponse.json()).toEqual(openAiBody);
+    expect(openAiBody).toEqual({
       error: "Authentication failed: invalid user_key",
     });
     expect(anthropicResponse.status).toBe(401);
-    await expect(anthropicResponse.json()).resolves.toEqual({
+    expect(legacyAnthropicResponse.status).toBe(401);
+    const anthropicBody = await anthropicResponse.json();
+    expect(await legacyAnthropicResponse.json()).toEqual(anthropicBody);
+    expect(anthropicBody).toEqual({
       type: "error",
       error: {
         type: "authentication_error",
         message: "Authentication failed: invalid user_key",
       },
     });
-    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher).toHaveBeenCalledTimes(4);
   });
 });

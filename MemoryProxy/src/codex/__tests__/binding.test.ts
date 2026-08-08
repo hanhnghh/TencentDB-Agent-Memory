@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, stat } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -198,7 +198,7 @@ describe("validated Codex project binding", () => {
     })).rejects.toThrow("Task ID is required");
   });
 
-  it("redacts credentials from remote validation failures", async () => {
+  it("does not expose dependency responses or credentials in validation failures", async () => {
     const root = await makeTempRoot();
     const projectDir = join(root, "project");
     await mkdir(projectDir);
@@ -206,7 +206,10 @@ describe("validated Codex project binding", () => {
     const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = new URL(String(input)).pathname;
       if (path === "/v3/meta/team/list") {
-        return new Response("user-key-secret service-secret", { status: 500 });
+        return new Response(
+          "internal backend trace user-key-secret service-secret",
+          { status: 500 },
+        );
       }
       return base(input, init);
     }) as typeof fetch;
@@ -231,9 +234,115 @@ describe("validated Codex project binding", () => {
     }
 
     expect(message).toContain("Unable to validate Team");
+    expect(message).not.toContain("internal backend trace");
     expect(message).not.toContain("user-key-secret");
     expect(message).not.toContain("service-secret");
-    expect(message).toContain("[REDACTED]");
+  });
+
+  it("rejects a malformed existing credential map without rewriting it", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    const userConfigDir = join(root, "user-config");
+    const credentialPath = resolveCredentialPath(userConfigDir);
+    await mkdir(projectDir);
+    await mkdir(userConfigDir, { mode: 0o700 });
+    const malformed = `${JSON.stringify({
+      version: 1,
+      user_keys: { "memory-old": 42 },
+    })}\n`;
+    await writeFile(credentialPath, malformed, { mode: 0o600 });
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir,
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      fetcher: successfulApi(),
+    })).rejects.toMatchObject({ code: "credential_store_invalid" });
+
+    await expect(readFile(credentialPath, "utf8")).resolves.toBe(malformed);
+    await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH)))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("retains every service credential across concurrent project binds", async () => {
+    const root = await makeTempRoot();
+    const userConfigDir = join(root, "user-config");
+    const projectA = join(root, "project-a");
+    const projectB = join(root, "project-b");
+    await Promise.all([mkdir(projectA), mkdir(projectB)]);
+
+    const input = {
+      userConfigDir,
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+    };
+    await Promise.all([
+      bindCodexProject({
+        ...input,
+        projectDir: projectA,
+        serviceId: "memory-a",
+        fetcher: successfulApi(),
+      }),
+      bindCodexProject({
+        ...input,
+        projectDir: projectB,
+        serviceId: "memory-b",
+        fetcher: successfulApi(),
+      }),
+    ]);
+
+    const credentials = JSON.parse(
+      await readFile(resolveCredentialPath(userConfigDir), "utf8"),
+    ) as { user_keys: Record<string, string> };
+    expect(credentials.user_keys).toEqual({
+      "memory-a": "user-key-secret",
+      "memory-b": "user-key-secret",
+    });
+  });
+
+  it("recovers a credential update after the previous process left its lock", async () => {
+    const root = await makeTempRoot();
+    const userConfigDir = join(root, "user-config");
+    const projectDir = join(root, "project");
+    const credentialPath = resolveCredentialPath(userConfigDir);
+    await Promise.all([
+      mkdir(projectDir),
+      mkdir(userConfigDir, { mode: 0o700 }),
+    ]);
+    await writeFile(
+      `${credentialPath}.lock`,
+      `${JSON.stringify({ pid: 2_147_483_647, token: "abandoned" })}\n`,
+      { mode: 0o600 },
+    );
+
+    await bindCodexProject({
+      projectDir,
+      userConfigDir,
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      fetcher: successfulApi(),
+    });
+
+    await expect(readFile(credentialPath, "utf8")).resolves.toContain("user-key-secret");
+    await expect(stat(`${credentialPath}.lock`)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("rejects a malformed metadata success response without persistence", async () => {
