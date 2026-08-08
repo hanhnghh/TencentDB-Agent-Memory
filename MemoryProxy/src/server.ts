@@ -224,7 +224,7 @@ export function createApp(config: ProxyConfig, options: CreateAppOptions = {}): 
 function classifyPublicPath(path: string): "hooks" | "malformed" | "allowed" {
   let decoded = path;
   for (let depth = 0; depth < 3; depth++) {
-    const normalized = decoded.toLowerCase();
+    const normalized = canonicalizePath(decoded).toLowerCase();
     if (normalized === "/hooks" || normalized.startsWith("/hooks/") ||
         normalized.startsWith("/hooks%")) {
       return "hooks";
@@ -238,4 +238,17 @@ function classifyPublicPath(path: string): "hooks" | "malformed" | "allowed" {
     }
   }
   return "malformed";
+}
+
+function canonicalizePath(path: string): string {
+  const segments: string[] = [];
+  for (const segment of path.replace(/\\/g, "/").split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") {
+      segments.pop();
+      continue;
+    }
+    segments.push(segment);
+  }
+  return `/${segments.join("/")}`;
 }

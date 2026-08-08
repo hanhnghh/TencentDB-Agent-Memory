@@ -218,7 +218,11 @@ describe("mode-aware runtime startup", () => {
     config.storage.enabled = true;
     config.storage.backend = "memory";
     config.extraction.enabled = false;
-    vi.stubGlobal("fetch", vi.fn(async () => new Response("ok")));
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({
+      id: "chatcmpl-runtime-mode",
+      choices: [{ message: { role: "assistant", content: "ok" } }],
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetcher);
 
     const running = await startRuntime(config);
     try {
@@ -242,6 +246,20 @@ describe("mode-aware runtime startup", () => {
         .toBe(404);
       expect((await requestJson(hookPort, "/v1/chat/completions", "POST")).status)
         .toBe(404);
+      const connectivityCalls = fetcher.mock.calls.length;
+      for (const path of [
+        "//hooks/session-start",
+        "/%2Fhooks/session-start",
+        "/%252Fhooks%252Fsession-start",
+        "/safe/../hooks/session-start",
+        "/%5Chooks%5Csession-start",
+      ]) {
+        expect((await requestJson(proxyPort, path, "POST", JSON.stringify({
+          model: "fixture-model",
+          messages: [{ role: "user", content: "hook payload" }],
+        }))).status).toBe(404);
+      }
+      expect(fetcher).toHaveBeenCalledTimes(connectivityCalls);
     } finally {
       await running.stop();
     }
@@ -252,9 +270,16 @@ function requestJson(
   port: number,
   path: string,
   method = "GET",
+  body?: string,
 ): Promise<{ status: number; body: unknown }> {
   return new Promise((resolve, reject) => {
-    const req = request({ hostname: "127.0.0.1", port, path, method }, (response) => {
+    const req = request({
+      hostname: "127.0.0.1",
+      port,
+      path,
+      method,
+      headers: body ? { "content-type": "application/json" } : undefined,
+    }, (response) => {
       const chunks: Buffer[] = [];
       response.on("data", (chunk: Buffer) => chunks.push(chunk));
       response.on("end", () => {
@@ -270,6 +295,6 @@ function requestJson(
       });
     });
     req.on("error", reject);
-    req.end();
+    req.end(body);
   });
 }
