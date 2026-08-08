@@ -31,6 +31,8 @@ import { getMetadataClient } from "../meta/client.js";
 import type { AgentContext } from "../injection/types.js";
 import { resolveFixedAssetCtxs, type FixedAssetCtx } from "../injection/injectors/tdai-fixed-asset.js";
 import type { TdaiIdentity } from "../tdai/types.js";
+import type { BridgeSessionAccessResolver } from "../bridge/session-access.js";
+import { resolveHttpBridgeSession } from "../bridge/http-session-access.js";
 
 const TAG = "[memory-bridge]";
 
@@ -239,6 +241,7 @@ function limitFromBody(body: Record<string, unknown>, fallback = 5): number {
 export interface MemoryBridgeDeps {
   fetcher?: typeof fetch;
   now?: () => number;
+  resolveSession?: BridgeSessionAccessResolver;
 }
 
 export function createMemoryBridgeHandler(
@@ -274,8 +277,29 @@ export function createMemoryBridgeHandler(
       ?? config.tdai?.serviceId
       ?? config.coreSkill?.serviceId
       ?? "";
-    let ids = loadSessionIdsL1(sessionKey, explicitSource);
-    if (!ids) {
+    let ids: SessionIdFields | null = null;
+    if (deps.resolveSession) {
+      const resolved = await resolveHttpBridgeSession(c, deps.resolveSession);
+      if (!resolved.ok) {
+        return envelope(resolved.code, `${TAG} ${resolved.message}`, resolved.httpStatus);
+      }
+      const { access } = resolved;
+      if (access.capabilities.memory.enabled !== true) {
+        return envelope(40301, `${TAG} memory capability is disabled`, 403);
+      }
+      ids = {
+        user_id: access.identity.userId,
+        team_id: access.identity.teamId,
+        agent_id: access.identity.agentId,
+        session_id: access.identity.sessionId,
+        task_id: access.identity.taskId,
+        user_key: access.userKey,
+        space_id: access.identity.serviceId,
+      };
+    } else {
+      ids = loadSessionIdsL1(sessionKey, explicitSource);
+    }
+    if (!ids && !deps.resolveSession) {
       // §6.1 修复：跨 pod L2 fallthrough。需要 apiKey + spaceId 才能走 verify。
       const auth = c.req.header("authorization") ?? c.req.header("Authorization") ?? "";
       const apiKey = extractBearerToken(auth);

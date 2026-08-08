@@ -160,7 +160,7 @@ export async function prewarmAll(
   }
 
   if (opts.persist !== false && entries.length > 0) {
-    repo.putMany(input.spaceId ?? "", input.userId, input.agentSource, sessionId, entries);
+    await repo.putMany(input.spaceId ?? "", input.userId, input.agentSource, sessionId, entries);
   }
 
   const durationMs = Date.now() - startedAt;

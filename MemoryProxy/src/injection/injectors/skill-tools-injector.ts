@@ -45,6 +45,8 @@ export interface SkillToolsInjectorConfig {
    * E.g. `http://127.0.0.1:8096`. Trailing slash trimmed.
    */
   proxyBaseUrl: string;
+  /** Loopback listener used by Codex subscription sessions. */
+  codexSidecarBaseUrl?: string;
   /**
    * 是否允许主模型创建/修改 skill。默认 false。
    * false 时只注入只读工具（search/list/view/files_read）。
@@ -76,6 +78,10 @@ export function renderSkillToolsBlock(
     ? ""
     : ` -H 'x-agent-source: ${normalizedSource}'`;
   const authHeader = `${tenantHeader}${sessionHeader}${sourceHeader}`;
+
+  if (normalizedSource === "codex") {
+    return renderCodexSkillTools(bridge, authHeader, allowLlmWrite);
+  }
 
   const readTools = [
     `  <tool name="skill_search">`,
@@ -238,8 +244,14 @@ export class SkillToolsInjector implements InjectionHook {
       }
     }
 
+    const isCodex = normalizeAgentSource(agentSource) === "codex";
+    let baseUrl = this.config.proxyBaseUrl;
+    if (isCodex) {
+      if (!this.config.codexSidecarBaseUrl) return [];
+      baseUrl = this.config.codexSidecarBaseUrl;
+    }
     const content = renderSkillToolsBlock(
-      this.config.proxyBaseUrl,
+      baseUrl,
       allowLlmWrite,
       sessionId,
       spaceId,
@@ -255,4 +267,31 @@ export class SkillToolsInjector implements InjectionHook {
       },
     }];
   }
+}
+
+function renderCodexSkillTools(
+  bridge: string,
+  authHeader: string,
+  allowLlmWrite: boolean,
+): string {
+  const operations = [
+    "search {query,top_k?,mode?}",
+    "get {skill_id,include_content?,include_manifest?}",
+    "files/read {skill_id,path,encoding?}",
+    ...(allowLlmWrite
+      ? ["create {name,content,resources?}", "update/patch/delete/files/write/files/remove"]
+      : []),
+  ];
+  return [
+    "<skill_tools>",
+    "Codex can use the loopback Agent Memory sidecar with Bash + curl.",
+    `Base: ${bridge}`,
+    `Headers: -H 'content-type: application/json'${authHeader}`,
+    ...operations.map((operation) => `- POST ${bridge}/${operation}`),
+    allowLlmWrite
+      ? "Skill writes still enforce owner, capability, visibility, and pinned-version checks."
+      : "Skill writes are disabled; use only the listed read operations.",
+    "Responses use {code,message,request_id,data?}; do not retry HTTP 4xx.",
+    "</skill_tools>",
+  ].join("\n");
 }

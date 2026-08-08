@@ -168,6 +168,32 @@ tool-aware skill round. Stable session/turn/source identities make duplicate
 tool events, repeated `Stop`, and replay after a sidecar restart idempotent.
 `SessionEnd` is advisory and is never required to commit a round.
 
+After a successful `SessionStart`, prepared context advertises only the
+capabilities enabled for the bound asset. Codex can then use the loopback
+sidecar for read-only memory search, visible skill operations, and authorized
+Wiki/CodeGraph tools. The sidecar resolves the initialized Codex session,
+overwrites caller-supplied identity, enforces the MemoryRuntime capability and
+Team/Agent/Task ACL decisions, and forwards only allowlisted operations. These
+bridge routes are not exposed through the public proxy catch-all.
+
+Hooks mode also provides model-free management commands. Set the active Codex
+session explicitly (or export `CODEX_SESSION_ID`); the sidecar URL defaults to
+`http://127.0.0.1:8097` and can be overridden only with another loopback HTTP
+URL via `--sidecar-url` or `CODEX_MEMORY_SIDECAR_URL`.
+
+```bash
+npm run codex -- mem-help
+npm run codex -- sync --session-id "$CODEX_SESSION_ID"
+npm run codex -- refresh --session-id "$CODEX_SESSION_ID"  # alias of sync
+npm run codex -- force-archive --session-id "$CODEX_SESSION_ID" --reason "capture workflow"
+npm run codex -- create-skill --session-id "$CODEX_SESSION_ID" \
+  --name migration-checklist --content-file ./SKILL.md
+```
+
+`create-skill` still obeys the configured skill write gate. `mem:*` request
+interception remains proxy-only; these CLI commands are explicit hooks-mode
+equivalents and never replace an assistant response.
+
 Codex does not expose every hosted or specialized tool through `PostToolUse`.
 Those events are intentionally omitted; the integration does not infer them
 from `transcript_path` or claim exact tool visibility on unsupported paths. If

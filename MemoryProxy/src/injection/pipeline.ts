@@ -376,7 +376,14 @@ export class InjectionPipeline {
       const readOnly = ctx.metadata.readOnly === true;
       if (fresh.length > 0 && !readOnly) {
         try {
-          this.hookCacheRepo.put(spaceId, userId, agentSource, sessionId, hook.id, fresh);
+          await this.hookCacheRepo.put(
+            spaceId,
+            userId,
+            agentSource,
+            sessionId,
+            hook.id,
+            fresh,
+          );
           console.log(`[hook-cache] session=${sessionId} hook=${hook.id} miss → self-heal put (blocks=${fresh.length})`);
         } catch (err) {
           console.warn(

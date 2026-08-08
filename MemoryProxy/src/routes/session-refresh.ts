@@ -16,15 +16,20 @@ import { getSessionStore } from "../session/store.js";
 import { prewarmFromConfig } from "../injection/index.js";
 import type { SessionInitState, AgentDetail, TaskDetail } from "../session/types.js";
 import { getMetadataClient } from "../meta/client.js";
+import { createSessionNamespace } from "../agent-sources.js";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
 export interface RefreshInput {
   sessionKey: string;
+  /** Prevalidated full-tuple key used by lifecycle transports. */
+  sessionCacheKey?: string;
   agentSource: string;
   config: ProxyConfig;
   spaceId: string;
   callerUserKey?: string;
+  /** Refresh binding metadata only; MemoryRuntime will rebuild its scoped context. */
+  skipContextPrewarm?: boolean;
 }
 
 export interface RefreshResult {
@@ -155,7 +160,7 @@ export async function refreshSessionCache(input: RefreshInput): Promise<RefreshR
   }
 
   // 从 SessionStore 取 session 状态
-  const compositeKey = `${agentSource}:${sessionKey}`;
+  const compositeKey = input.sessionCacheKey ?? createSessionNamespace(agentSource, sessionKey);
   const store = getSessionStore();
   const state: SessionInitState | undefined = store.get(compositeKey);
 
@@ -182,6 +187,16 @@ export async function refreshSessionCache(input: RefreshInput): Promise<RefreshR
   const { agentRefreshed, taskRefreshed } = await refreshAgentTaskDetail(
     state, compositeKey, config, spaceId, callerUserKey,
   );
+  if (input.skipContextPrewarm) {
+    return {
+      success: true,
+      refreshed: [],
+      skipped: [],
+      agentRefreshed,
+      taskRefreshed,
+      tookMs: Date.now() - t0,
+    };
+  }
 
   // Step 2: 用最新 state 里的 agent/task detail 构造 PrewarmInput。
   const latestState = store.get(compositeKey) ?? state;

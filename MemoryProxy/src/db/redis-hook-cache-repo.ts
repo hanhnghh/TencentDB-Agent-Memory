@@ -37,34 +37,59 @@ export class RedisHookCacheRepo implements HookCacheRepo {
     this.ttl = ttlSeconds ?? DEFAULT_TTL;
   }
 
-  put(
+  async put(
     spaceId: string,
     userId: string,
     agentSource: string,
     sessionId: string,
     hookId: string,
     blocks: ContextBlock[],
-  ): void {
+  ): Promise<void> {
     const key = keyOf(spaceId, userId, agentSource, sessionId);
-    this.redis.hset(key, hookId, JSON.stringify(blocks)).catch(() => {});
-    this.redis.expire(key, this.ttl).catch(() => {});
+    await Promise.all([
+      this.redis.hset(key, hookId, JSON.stringify(blocks)),
+      this.redis.expire(key, this.ttl),
+    ]).then(() => undefined).catch(() => undefined);
   }
 
-  putMany(
+  async putMany(
     spaceId: string,
     userId: string,
     agentSource: string,
     sessionId: string,
     entries: HookCacheEntry[],
-  ): void {
+  ): Promise<void> {
     if (entries.length === 0) return;
     const key = keyOf(spaceId, userId, agentSource, sessionId);
     const args: string[] = [];
     for (const e of entries) {
       args.push(e.hookId, JSON.stringify(e.blocks));
     }
-    this.redis.hset(key, ...args).catch(() => {});
-    this.redis.expire(key, this.ttl).catch(() => {});
+    await Promise.all([
+      this.redis.hset(key, ...args),
+      this.redis.expire(key, this.ttl),
+    ]).then(() => undefined).catch(() => undefined);
+  }
+
+  async replaceSession(
+    spaceId: string,
+    userId: string,
+    agentSource: string,
+    sessionId: string,
+    entries: HookCacheEntry[],
+  ): Promise<void> {
+    const key = keyOf(spaceId, userId, agentSource, sessionId);
+    const transaction = this.redis.multi().del(key);
+    if (entries.length > 0) {
+      const args: string[] = [];
+      for (const entry of entries) args.push(entry.hookId, JSON.stringify(entry.blocks));
+      transaction.hset(key, ...args).expire(key, this.ttl);
+    }
+    const results = await transaction.exec();
+    if (!results) throw new Error("Redis hook-cache replacement was not executed");
+    for (const [error] of results) {
+      if (error) throw error;
+    }
   }
 
   async get(
@@ -112,12 +137,14 @@ export class RedisHookCacheRepo implements HookCacheRepo {
     }
   }
 
-  clearBySession(
+  async clearBySession(
     spaceId: string,
     userId: string,
     agentSource: string,
     sessionId: string,
-  ): void {
-    this.redis.del(keyOf(spaceId, userId, agentSource, sessionId)).catch(() => {});
+  ): Promise<void> {
+    await this.redis.del(keyOf(spaceId, userId, agentSource, sessionId))
+      .then(() => undefined)
+      .catch(() => undefined);
   }
 }

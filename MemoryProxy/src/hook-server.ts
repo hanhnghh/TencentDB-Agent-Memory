@@ -1,17 +1,28 @@
 import { Hono, type Context } from "hono";
 
+import { BridgeSessionAccessRegistry } from "./bridge/session-access.js";
 import { CodexHookService, type CodexHookResponse } from "./codex/hook-service.js";
 import type { CodexHookAccessResolver } from "./codex/hook-access.js";
 import type { CodexTurnStore } from "./codex/turn-store.js";
 import { RuntimeHealth, runtimeHealthStatusCode } from "./runtime/health.js";
 import type { MemoryRuntimeProvider } from "./runtime/production.js";
 import type { ProxyConfig } from "./types.js";
+import { createMemoryBridgeHandler } from "./memory/memory-bridge.js";
+import { createSkillBridgeHandler } from "./skill/skill-bridge.js";
+import { createKnowledgeBridgeHandler } from "./knowledge/knowledge-bridge.js";
+import {
+  createCodexManagementHandler,
+  type CodexManagementHandlerDeps,
+} from "./codex/management-handler.js";
 
 export interface CreateHookAppOptions {
   memoryRuntimeProvider?: MemoryRuntimeProvider;
   runtimeHealth?: RuntimeHealth;
   codexAccessResolver?: CodexHookAccessResolver;
   codexTurnStore?: CodexTurnStore;
+  bridgeFetcher?: typeof fetch;
+  bridgeSessions?: BridgeSessionAccessRegistry;
+  managementDeps?: Pick<CodexManagementHandlerDeps, "refresh" | "forceArchive">;
 }
 
 /** Build the loopback listener app. Lifecycle routes are added by hook adapters. */
@@ -28,11 +39,13 @@ export function createHookApp(
   if (!options.runtimeHealth) {
     health.markListenerReady("hooks", config.runtime.hooks.host, config.runtime.hooks.port);
   }
+  const bridgeSessions = options.bridgeSessions ?? new BridgeSessionAccessRegistry();
   const hookService = options.memoryRuntimeProvider && options.codexAccessResolver && options.codexTurnStore
     ? new CodexHookService({
         memoryRuntimeProvider: options.memoryRuntimeProvider,
         accessResolver: options.codexAccessResolver,
         turnStore: options.codexTurnStore,
+        bridgeSessions,
       })
     : undefined;
   app.get("/health", async (c) => {
@@ -49,6 +62,31 @@ export function createHookApp(
     service.stop(input)));
   app.post("/hooks/session-end", (c) => dispatchHook(c, hookService, (service, input) =>
     service.sessionEnd(input)));
+  const resolveSession = async (lookup: Parameters<typeof bridgeSessions.resolve>[0]) => (
+    bridgeSessions.resolve(lookup)
+  );
+  const memoryBridge = createMemoryBridgeHandler(config, {
+    fetcher: options.bridgeFetcher,
+    resolveSession,
+  });
+  const skillBridge = createSkillBridgeHandler(config, {
+    fetcher: options.bridgeFetcher,
+    resolveSession,
+  });
+  const knowledgeBridge = createKnowledgeBridgeHandler(config, {
+    fetcher: options.bridgeFetcher,
+    resolveSession,
+  });
+  const management = createCodexManagementHandler(config, {
+    resolveSession,
+    updateSession: (access) => bridgeSessions.register(access),
+    memoryRuntimeProvider: options.memoryRuntimeProvider,
+    ...options.managementDeps,
+  });
+  app.post("/memory-bridge/*", (c) => memoryBridge(c));
+  app.post("/skill-bridge/*", (c) => skillBridge(c));
+  app.post("/knowledge-bridge/*", (c) => knowledgeBridge(c));
+  app.post("/codex/manage/*", (c) => management(c));
   return app;
 }
 

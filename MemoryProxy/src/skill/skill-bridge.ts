@@ -20,6 +20,8 @@
 import type { Context } from "hono";
 import type { Redis } from "ioredis";
 import { createSessionNamespaceCandidates } from "../agent-sources.js";
+import type { BridgeSessionAccessResolver } from "../bridge/session-access.js";
+import { resolveHttpBridgeSession } from "../bridge/http-session-access.js";
 import { extractBearerToken } from "../opik.js";
 import { apiKeyToKeyId } from "../opik.js";
 import { getSessionStore } from "../session/store.js";
@@ -179,6 +181,7 @@ interface SessionIdFields {
   user_id: string;
   team_id: string;
   agent_id: string;
+  task_id?: string;
   /**
    * URL 路径侧的 agentSource（`claude-code` / `codebuddy` ...）—— 用于
    * Repo 三段隔离键。从 SessionStore 里存储 session 的 keyId 反解出来
@@ -336,6 +339,7 @@ export interface SkillBridgeDeps {
   fetcher?: typeof fetch;
   /** Override `Date.now` (tests). */
   now?: () => number;
+  resolveSession?: BridgeSessionAccessResolver;
   /**
    * Override the visibility whitelist lookup (tests). When omitted, the bridge
    * uses the production resolver that calls kernel /v3/meta/asset/list-accessible.
@@ -432,8 +436,29 @@ export function createSkillBridgeHandler(
       ?? config.tdai?.serviceId
       ?? config.coreSkill?.serviceId
       ?? "";
-    let ids = loadSessionIdsL1(sessionKey, explicitSource);
-    if (!ids) {
+    let ids: SessionIdFields | null = null;
+    if (deps.resolveSession) {
+      const resolved = await resolveHttpBridgeSession(c, deps.resolveSession);
+      if (!resolved.ok) {
+        return envelope(resolved.code, `${TAG} ${resolved.message}`, resolved.httpStatus);
+      }
+      const { access } = resolved;
+      if (access.capabilities.skill.enabled !== true) {
+        return envelope(40301, `${TAG} skill capability is disabled`, 403);
+      }
+      ids = {
+        user_id: access.identity.userId,
+        team_id: access.identity.teamId,
+        agent_id: access.identity.agentId,
+        task_id: access.identity.taskId,
+        agent_source: access.identity.agentSource,
+        space_id: access.identity.serviceId,
+        user_key: access.userKey,
+      };
+    } else {
+      ids = loadSessionIdsL1(sessionKey, explicitSource);
+    }
+    if (!ids && !deps.resolveSession) {
       // §6.1 修复：跨 pod L2 fallthrough
       const auth = c.req.header("authorization") ?? c.req.header("Authorization") ?? "";
       const apiKey = extractBearerToken(auth);
@@ -493,6 +518,7 @@ export function createSkillBridgeHandler(
         user_id: ids.user_id,
         team_id: ids.team_id,
         agent_id: ids.agent_id,
+        ...(ids.task_id ? { task_id: ids.task_id } : {}),
       };
       const upstreamUrl = `${config.coreSkill.endpoint.replace(/\/$/, "")}/v3/skill/files/read`;
       const headers: Record<string, string> = {
@@ -605,6 +631,7 @@ export function createSkillBridgeHandler(
         team_id: ids.team_id,
         agent_id: ids.agent_id,
         user_id: ids.user_id,
+        ...(ids.task_id ? { task_id: ids.task_id } : {}),
       };
       // For "search" subpath: stamp scope="team" so the handler skips
       // agent_id owner-filtering → team-wide search.

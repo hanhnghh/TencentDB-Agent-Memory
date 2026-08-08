@@ -13,11 +13,14 @@ import type { ProxyConfig } from "../types.js";
 import { getSessionStore } from "../session/store.js";
 import { getCoreSkillClient } from "../skill/core-client.js";
 import type { SessionInitState } from "../session/types.js";
+import { createSessionNamespace } from "../agent-sources.js";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
 export interface ForceArchiveInput {
   sessionKey: string;
+  /** Prevalidated full-tuple key used by lifecycle transports. */
+  sessionCacheKey?: string;
   agentSource: string;
   config: ProxyConfig;
   spaceId: string;
@@ -58,7 +61,7 @@ export async function forceArchiveSkill(input: ForceArchiveInput): Promise<Force
   }
 
   // 从 SessionStore 取 session 状态
-  const compositeKey = `${agentSource}:${sessionKey}`;
+  const compositeKey = input.sessionCacheKey ?? createSessionNamespace(agentSource, sessionKey);
   const store = getSessionStore();
   const state: SessionInitState | undefined = store.get(compositeKey);
 

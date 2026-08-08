@@ -22,6 +22,7 @@ import {
   MemoryCoreAuthorizationAdapter,
   MemoryRuntime,
   ProductionMemoryRuntimeAdapters,
+  SerialRuntimeContextPreparationCoordinator,
   SessionStoreBindingAdapter,
   type MemoryRuntimeContract,
   type RuntimeContextBlock,
@@ -62,6 +63,7 @@ export async function createMemoryRuntime(
     delivery,
   });
   await outbox.start({ concurrency: 2 });
+  const contextCoordinator = new SerialRuntimeContextPreparationCoordinator();
 
   const provider: MemoryRuntimeProvider = {
     health: () => outbox.health(),
@@ -88,6 +90,7 @@ export async function createMemoryRuntime(
         context: config.injection.enabled && config.injection.injectors.length > 0
           ? new HookCacheContextAdapter({
               cacheRepo: getHookCacheRepo(),
+              coordinator: contextCoordinator,
               prewarm: (input, options) => prewarmFromConfig(config, input, options),
               callerUserKeyFor: () => userKey,
               promptRecall: (request) => recallCodexPrompt(config, userKey, request),

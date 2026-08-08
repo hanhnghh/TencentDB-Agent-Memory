@@ -159,6 +159,28 @@ L0 user/assistant pair 和完整、含工具信息的 normalized skill round。�
 session/turn/source identity 保证重复 tool event、重复 `Stop` 以及 sidecar 重启后的
 replay 都是幂等的。`SessionEnd` 仅用于通知，绝不是 round 的必需 commit point。
 
+成功执行 `SessionStart` 后，prepared context 只会声明已为当前绑定资产启用的能力。
+Codex 随后可通过 loopback sidecar 执行只读 memory 检索、可见的 skill 操作，以及
+已授权的 Wiki/CodeGraph 工具。Sidecar 会解析已初始化的 Codex session，覆盖调用方
+伪造的身份字段，执行 MemoryRuntime capability 与 Team/Agent/Task ACL 判断，并且只
+转发 allowlist 内的操作。这些 bridge 路由不会落入 public proxy catch-all。
+
+Hooks 模式还提供无需模型参与的管理命令。请显式指定当前 Codex session（或导出
+`CODEX_SESSION_ID`）。Sidecar 默认地址为 `http://127.0.0.1:8097`；只能通过
+`--sidecar-url` 或 `CODEX_MEMORY_SIDECAR_URL` 改为另一个 loopback HTTP 地址。
+
+```bash
+npm run codex -- mem-help
+npm run codex -- sync --session-id "$CODEX_SESSION_ID"
+npm run codex -- refresh --session-id "$CODEX_SESSION_ID"  # sync 的别名
+npm run codex -- force-archive --session-id "$CODEX_SESSION_ID" --reason "capture workflow"
+npm run codex -- create-skill --session-id "$CODEX_SESSION_ID" \
+  --name migration-checklist --content-file ./SKILL.md
+```
+
+`create-skill` 仍受已配置的 skill 写入开关约束。`mem:*` 请求拦截仍然只属于 proxy
+模式；这些 CLI 是 hooks 模式下的显式等价操作，绝不会替换 assistant response。
+
 Codex 并不会为所有 hosted 或特殊工具暴露 `PostToolUse`。这些事件会明确缺失；集成
 不会从 `transcript_path` 推断它们，也不会对不支持的路径声称精确的 tool visibility。
 若 sidecar 在 `UserPromptSubmit`、`PostToolUse` 或 `Stop` 期间不可用，可执行程序会

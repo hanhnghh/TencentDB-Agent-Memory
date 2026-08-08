@@ -4,10 +4,20 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+const { prewarmFromConfigMock } = vi.hoisted(() => ({
+  prewarmFromConfigMock: vi.fn(),
+}));
+
+vi.mock("../../injection/index.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../injection/index.js")>();
+  return { ...actual, prewarmFromConfig: prewarmFromConfigMock };
+});
+
 import { createSessionNamespace } from "../../agent-sources.js";
 import { DEFAULT_CONFIG } from "../../config.js";
 import { __resetHookCacheRepoForTests } from "../../db/hookCacheRepo.js";
 import { __resetDbForTests } from "../../db/index.js";
+import { __resetSessionRepoForTests } from "../../db/sessionRepo.js";
 import { __resetSessionStoreForTests, getSessionStore } from "../../session/store.js";
 import { setCoreSkillClient } from "../../skill/core-client.js";
 import type { ProxyConfig } from "../../types.js";
@@ -31,7 +41,9 @@ afterEach(async () => {
   setCoreSkillClient(null);
   __resetSessionStoreForTests();
   __resetHookCacheRepoForTests();
+  __resetSessionRepoForTests();
   __resetDbForTests();
+  prewarmFromConfigMock.mockReset();
   vi.unstubAllGlobals();
   if (previousOutboxPath === undefined) delete process.env.PROXY_OUTBOX_PATH;
   else process.env.PROXY_OUTBOX_PATH = previousOutboxPath;
@@ -181,6 +193,115 @@ describe("proxy production MemoryRuntime", () => {
     expect(requests.filter((entry) => entry.url.endsWith("/v3/meta/acl/check"))).toHaveLength(2);
     expect(requests.some((entry) => entry.url.endsWith("/v3/conversation/add"))).toBe(true);
     expect(requests.some((entry) => entry.url.endsWith("/v3/skill/conversation/add"))).toBe(true);
+  });
+
+  it("serializes scoped context preparation across per-request runtimes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "shared-context-coordinator-"));
+    roots.push(root);
+    process.env.PROXY_DB_PATH = join(root, "proxy.db");
+    process.env.PROXY_OUTBOX_PATH = join(root, "outbox.db");
+
+    const config: ProxyConfig = structuredClone(DEFAULT_CONFIG);
+    config.sessionInit.enabled = true;
+    config.injection.enabled = true;
+    config.injection.injectors = ["tdai-memory"];
+    config.tdai.enabled = true;
+    config.tdai.endpoint = "http://memory.fixture";
+    config.tdai.apiKey = "service-token";
+    config.tdai.serviceId = PARITY_IDENTITY.spaceId;
+    config.tdai.memory.enabled = true;
+    config.coreSkill = {
+      endpoint: "http://core.fixture",
+      serviceToken: "core-token",
+      serviceId: PARITY_IDENTITY.spaceId,
+      timeoutMs: 1_000,
+    };
+
+    const keyId = createSessionNamespace("codex", PARITY_IDENTITY.sessionId);
+    getSessionStore().bind(keyId, {
+      spaceId: PARITY_IDENTITY.spaceId,
+      userId: PARITY_IDENTITY.userId,
+      agentSource: "codex",
+      sessionId: PARITY_IDENTITY.sessionId,
+    });
+    await getSessionStore().set(keyId, {
+      status: "initialized",
+      keyId,
+      startedAt: 1,
+      attemptCount: 0,
+      userId: PARITY_IDENTITY.userId,
+      sessionInfo: PARITY_SESSION_INFO,
+      agentDetail: PARITY_AGENT,
+      taskDetail: PARITY_TASK,
+    });
+
+    let releaseFirstPrewarm = (): void => {};
+    const firstPrewarmGate = new Promise<void>((resolve) => { releaseFirstPrewarm = resolve; });
+    let markFirstPrewarmStarted = (): void => {};
+    const firstPrewarmStarted = new Promise<void>((resolve) => {
+      markFirstPrewarmStarted = resolve;
+    });
+    prewarmFromConfigMock.mockImplementation(async () => {
+      const call = prewarmFromConfigMock.mock.calls.length;
+      if (call === 1) {
+        markFirstPrewarmStarted();
+        await firstPrewarmGate;
+      }
+      const content = call === 1 ? "initial context" : "refreshed context";
+      return {
+        cachedHookIds: ["tdai-profile-memory-injector"],
+        entries: [{
+          hookId: "tdai-profile-memory-injector",
+          blocks: [{ type: "text", content }],
+        }],
+        skipped: [],
+        durationMs: 1,
+      };
+    });
+    const fetcher = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/v3/meta/acl/check")) {
+        return response({ code: 0, data: { allowed: true } });
+      }
+      if (url.endsWith("/v3/meta/config/user/get")) {
+        return response({ code: 0, data: { items: [] } });
+      }
+      throw new Error(`unexpected fixture URL: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetcher);
+
+    const managed = await createMemoryRuntime(config);
+    const identity = {
+      serviceId: PARITY_IDENTITY.spaceId,
+      userId: PARITY_IDENTITY.userId,
+      agentSource: "codex",
+      sessionId: PARITY_IDENTITY.sessionId,
+    };
+    try {
+      const firstRuntime = managed.provider.forRequest({ userKey: "client-user-key" });
+      const refreshRuntime = managed.provider.forRequest({ userKey: "client-user-key" });
+      const first = firstRuntime.prepareContext({ identity });
+      await firstPrewarmStarted;
+      const refresh = refreshRuntime.prepareContext({ identity, refresh: true });
+      await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(4));
+      expect(prewarmFromConfigMock).toHaveBeenCalledTimes(1);
+
+      releaseFirstPrewarm();
+      await expect(first).resolves.toMatchObject({
+        blocks: [{ content: "initial context" }],
+      });
+      await expect(refresh).resolves.toMatchObject({
+        blocks: [{ content: "refreshed context" }],
+      });
+      await expect(managed.provider.forRequest({ userKey: "client-user-key" })
+        .prepareContext({ identity })).resolves.toMatchObject({
+        blocks: [{ content: "refreshed context" }],
+      });
+      expect(prewarmFromConfigMock).toHaveBeenCalledTimes(2);
+    } finally {
+      releaseFirstPrewarm();
+      await managed.shutdown();
+    }
   });
 });
 

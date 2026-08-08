@@ -36,28 +36,28 @@ describe("runtime mode route isolation", () => {
       .toBe(404);
   });
 
-  it("never forwards reserved hook lifecycle paths through the public proxy catch-all", async () => {
+  it("never forwards local sidecar paths through the public proxy catch-all", async () => {
     const config: ProxyConfig = structuredClone(DEFAULT_CONFIG);
     config.runtime.mode = "both";
     const upstream = vi.fn();
     vi.stubGlobal("fetch", upstream);
     const app = createApp(config);
 
-    const response = await app.request("/hooks/session-start", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ event: "SessionStart" }),
-    });
-
-    expect(response.status).toBe(404);
-    expect(upstream).not.toHaveBeenCalled();
-
     for (const path of [
+      "/hooks/session-start",
       "/hooks%2Fsession-start",
       "/h%6foks%2fsession-start",
+      "/knowledge-bridge/v3/tools/list",
+      "/knowledge%2dbridge%2fv3%2ftools%2flist",
+      "/codex/manage/refresh",
+      "/%2Fcodex%2Fmanage%2Frefresh",
       "/hooks%ZZsession-start",
     ]) {
-      const encodedResponse = await app.request(path, { method: "POST" });
+      const encodedResponse = await app.request(path, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ event: "SessionStart" }),
+      });
       expect([400, 404]).toContain(encodedResponse.status);
     }
     expect(upstream).not.toHaveBeenCalled();

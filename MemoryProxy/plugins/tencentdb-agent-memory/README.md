@@ -20,6 +20,13 @@ and one tool-aware skill round through the durable outbox. Duplicate events and
 restart replay are idempotent. `SessionEnd` is advisory and is not a commit
 point.
 
+After `SessionStart`, the sidecar exposes capability-gated memory, skill, and
+Wiki/CodeGraph bridges only to that initialized Codex session. It binds
+Team/Agent/Task identity on the server and accepts only allowlisted operations.
+Run `npm run codex -- mem-help` from `MemoryProxy` for explicit hooks-mode
+`sync`, `refresh`, `force-archive`, and `create-skill` commands. `mem:*`
+response interception is available only when using the public proxy transport.
+
 Some hosted or specialized tools do not emit `PostToolUse`; those calls cannot
 be captured. The plugin does not infer them from the unstable transcript
 format and does not claim tool-event parity for those paths.

@@ -206,6 +206,389 @@ describe("Codex lifecycle hook contract", () => {
     },
   );
 
+  it("exposes memory and skill bridges only for an initialized Codex session", async () => {
+    const upstream = vi.fn<typeof fetch>(async (_input, init) => new Response(JSON.stringify({
+      code: 0,
+      data: { received: JSON.parse(String(init?.body)) },
+    }), { headers: { "content-type": "application/json" } }));
+    const bridgeConfig = config();
+    bridgeConfig.coreSkill.endpoint = "https://memory.example";
+    bridgeConfig.coreSkill.serviceId = "memory-1";
+    bridgeConfig.coreSkill.serviceToken = "service-secret";
+    const app = createHookApp(bridgeConfig, {
+      memoryRuntimeProvider: provider(runtimeWithContext()),
+      codexAccessResolver: resolver(),
+      codexTurnStore: turnStore(),
+      bridgeFetcher: upstream,
+    });
+    const bridgeHeaders = {
+      "content-type": "application/json",
+      "x-agent-source": "codex",
+      "x-conversation-id": "session-1",
+      "x-tdai-service-id": "memory-1",
+    };
+
+    const beforeStart = await app.request("/memory-bridge/v3/atomic/query", {
+      method: "POST",
+      headers: bridgeHeaders,
+      body: JSON.stringify({ limit: 1 }),
+    });
+    expect(beforeStart.status).toBe(401);
+    expect(upstream).not.toHaveBeenCalled();
+
+    expect((await app.request("/hooks/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(sessionStart("startup")),
+    })).status).toBe(200);
+
+    for (const [path, body] of [
+      ["/memory-bridge/v3/atomic/query", { limit: 1, user_id: "forged-user" }],
+      ["/skill-bridge/v3/skill/get", { skill_id: "skill-1", user_id: "forged-user" }],
+    ] as const) {
+      const response = await app.request(path, {
+        method: "POST",
+        headers: bridgeHeaders,
+        body: JSON.stringify(body),
+      });
+      expect(response.status).toBe(200);
+    }
+
+    expect(upstream).toHaveBeenCalledTimes(2);
+    for (const [, init] of upstream.mock.calls) {
+      expect(JSON.parse(String(init?.body))).toMatchObject({
+        user_id: "user-1",
+        team_id: "team-1",
+        agent_id: "agent-1",
+        task_id: "task-1",
+      });
+      expect(JSON.parse(String(init?.body))).not.toMatchObject({ user_id: "forged-user" });
+    }
+
+    expect((await app.request("/hooks/session-end", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        cwd: "/workspace/project",
+        hook_event_name: "SessionEnd",
+        session_id: "session-1",
+        transcript_path: null,
+        turn_id: "turn-final",
+      }),
+    })).status).toBe(200);
+    const afterEnd = await app.request("/memory-bridge/v3/atomic/query", {
+      method: "POST",
+      headers: bridgeHeaders,
+      body: JSON.stringify({ limit: 1 }),
+    });
+    expect(afterEnd.status).toBe(401);
+    expect(upstream).toHaveBeenCalledTimes(2);
+  });
+
+  it("forwards only authorized, capability-enabled knowledge tools through the sidecar", async () => {
+    let toolCalls = 0;
+    const upstream = vi.fn<typeof fetch>(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/v3/meta/agent-fixed-asset/list-with-detail")) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: { items: [{ asset_id: "wiki-1", asset_type: "llm_wiki", status: "active" }] },
+        }), { headers: { "content-type": "application/json" } });
+      }
+      if (url.pathname.endsWith("/v3/knowledge/list")) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: {
+            items: [{
+              knowledge_id: "wiki-1",
+              type: "wiki",
+              service_url: "https://wiki.example/v3",
+              name: "Architecture Wiki",
+              summary: null,
+              team_id: "team-1",
+              user_id: "user-1",
+              created_at: "2026-08-08T00:00:00Z",
+              updated_at: "2026-08-08T00:00:00Z",
+            }],
+            total: 1,
+          },
+        }), { headers: { "content-type": "application/json" } });
+      }
+      if (url.href === "https://wiki.example/v3/tools/list") {
+        toolCalls++;
+        if (toolCalls === 2) {
+          return new Response(JSON.stringify({ code: 42901 }), {
+            status: 429,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (toolCalls === 3) return new Response("not-json");
+        if (toolCalls === 4) throw new DOMException("timed out", "TimeoutError");
+        if (toolCalls === 5) {
+          return new Response(JSON.stringify({ code: 50301 }), {
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({ code: 0, data: { tools: [] } }), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error(`unexpected request: ${url.href}`);
+    });
+    const bridgeConfig = config();
+    bridgeConfig.knowledge.endpoint = "https://memory.example";
+    bridgeConfig.knowledge.serviceId = "memory-1";
+    bridgeConfig.knowledge.serviceToken = "service-secret";
+    const app = createHookApp(bridgeConfig, {
+      memoryRuntimeProvider: provider(runtimeWithContext()),
+      codexAccessResolver: resolver(),
+      codexTurnStore: turnStore(),
+      bridgeFetcher: upstream,
+    });
+    expect((await app.request("/hooks/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(sessionStart("startup")),
+    })).status).toBe(200);
+    const headers = {
+      "content-type": "application/json",
+      "x-agent-source": "codex",
+      "x-conversation-id": "session-1",
+      "x-tdai-service-id": "memory-1",
+    };
+
+    const allowed = await app.request("/knowledge-bridge/v3/tools/list", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ knowledge_id: "wiki-1" }),
+    });
+    expect(allowed.status).toBe(200);
+    await expect(allowed.json()).resolves.toMatchObject({ code: 0 });
+
+    const throttled = await app.request("/knowledge-bridge/v3/tools/list", {
+      method: "POST", headers, body: JSON.stringify({ knowledge_id: "wiki-1" }),
+    });
+    expect(throttled.status).toBe(429);
+    await expect(throttled.json()).resolves.toMatchObject({ code: 42901 });
+
+    const malformed = await app.request("/knowledge-bridge/v3/tools/list", {
+      method: "POST", headers, body: JSON.stringify({ knowledge_id: "wiki-1" }),
+    });
+    expect(malformed.status).toBe(502);
+    await expect(malformed.json()).resolves.toMatchObject({ code: 50202 });
+
+    const timedOut = await app.request("/knowledge-bridge/v3/tools/list", {
+      method: "POST", headers, body: JSON.stringify({ knowledge_id: "wiki-1" }),
+    });
+    expect(timedOut.status).toBe(504);
+    await expect(timedOut.json()).resolves.toMatchObject({ code: 50401 });
+
+    const applicationFailure = await app.request("/knowledge-bridge/v3/tools/list", {
+      method: "POST", headers, body: JSON.stringify({ knowledge_id: "wiki-1" }),
+    });
+    expect(applicationFailure.status).toBe(502);
+    await expect(applicationFailure.json()).resolves.toMatchObject({ code: 50201 });
+
+    const denied = await app.request("/knowledge-bridge/v3/tools/list", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ knowledge_id: "wiki-private" }),
+    });
+    expect(denied.status).toBe(403);
+    expect(upstream.mock.calls.filter(([input]) => String(input).startsWith("https://wiki.example")))
+      .toHaveLength(5);
+  });
+
+  it("rejects disabled bridge capabilities without contacting dependencies", async () => {
+    const adapters = new InMemoryMemoryRuntimeAdapters({
+      binding: {
+        identity,
+        resolution: "cached",
+        agent: { id: "agent-1", name: "Memory Agent" },
+        task: { id: "task-1", name: "Hook parity" },
+      },
+      capabilities: {
+        skill: false,
+        llmWiki: false,
+        codeGraph: false,
+        chatMemory: false,
+      },
+    });
+    const upstream = vi.fn<typeof fetch>(async () => {
+      throw new Error("disabled capabilities must not reach dependencies");
+    });
+    const bridgeConfig = config();
+    bridgeConfig.coreSkill.endpoint = "https://memory.example";
+    bridgeConfig.coreSkill.serviceId = "memory-1";
+    bridgeConfig.knowledge.endpoint = "https://memory.example";
+    bridgeConfig.knowledge.serviceId = "memory-1";
+    const app = createHookApp(bridgeConfig, {
+      memoryRuntimeProvider: provider(new MemoryRuntime(adapters)),
+      codexAccessResolver: resolver(),
+      codexTurnStore: turnStore(),
+      bridgeFetcher: upstream,
+    });
+    expect((await app.request("/hooks/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(sessionStart("startup")),
+    })).status).toBe(200);
+    const headers = {
+      "content-type": "application/json",
+      "x-agent-source": "codex",
+      "x-conversation-id": "session-1",
+      "x-tdai-service-id": "memory-1",
+    };
+
+    for (const [path, body] of [
+      ["/memory-bridge/v3/atomic/query", { limit: 1 }],
+      ["/skill-bridge/v3/skill/get", { skill_id: "skill-1" }],
+      ["/knowledge-bridge/v3/tools/list", { knowledge_id: "wiki-1" }],
+    ] as const) {
+      const response = await app.request(path, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      });
+      expect(response.status).toBe(403);
+    }
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it("runs refresh and force-archive management through initialized loopback access", async () => {
+    const refresh = vi.fn(async () => ({
+      success: true,
+      refreshed: ["skill-tools-injector"],
+      skipped: [],
+      agentRefreshed: true,
+      taskRefreshed: true,
+      tookMs: 5,
+    }));
+    const forceArchive = vi.fn(async () => ({
+      success: true,
+      status: "archived" as const,
+      taskId: "task-1",
+      archiveKey: "archive-1",
+    }));
+    const runtime = runtimeWithContext();
+    const prepareContext = vi.spyOn(runtime, "prepareContext");
+    const app = createHookApp(config(), {
+      memoryRuntimeProvider: provider(runtime),
+      codexAccessResolver: resolver(),
+      codexTurnStore: turnStore(),
+      managementDeps: { refresh, forceArchive },
+    });
+    const headers = {
+      "content-type": "application/json",
+      "x-agent-source": "codex",
+      "x-conversation-id": "session-1",
+    };
+
+    expect((await app.request("/codex/manage/refresh", {
+      method: "POST", headers, body: "{}",
+    })).status).toBe(401);
+    expect((await app.request("/hooks/session-start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(sessionStart("startup")),
+    })).status).toBe(200);
+
+    const refreshed = await app.request("/codex/manage/refresh", {
+      method: "POST", headers, body: "{}",
+    });
+    const archived = await app.request("/codex/manage/force-archive", {
+      method: "POST", headers, body: JSON.stringify({ reason: "capture workflow" }),
+    });
+
+    expect(refreshed.status).toBe(200);
+    expect(archived.status).toBe(200);
+    expect(refresh).toHaveBeenCalledWith(expect.objectContaining({
+      sessionKey: "session-1",
+      agentSource: "codex",
+      spaceId: "memory-1",
+      skipContextPrewarm: true,
+    }));
+    expect(prepareContext).toHaveBeenLastCalledWith({
+      identity,
+      readOnly: false,
+      refresh: true,
+    });
+    expect(forceArchive).toHaveBeenCalledWith(expect.objectContaining({
+      sessionKey: "session-1",
+      agentSource: "codex",
+      reason: "capture workflow",
+    }));
+  });
+
+  it("updates bridge capability authorization after a context refresh", async () => {
+    let prepareCount = 0;
+    const prepareContext = vi.fn<MemoryRuntimeContract["prepareContext"]>(async () => {
+      prepareCount++;
+      return {
+        session: {
+          identity,
+          agent: { id: "agent-1", name: "Memory Agent" },
+          task: { id: "task-1", name: "Hook parity" },
+        },
+        blocks: [],
+        capabilities: {
+          memory: { enabled: true },
+          skill: { enabled: prepareCount === 1 },
+          knowledge: { wiki: { enabled: true }, codeGraph: { enabled: true } },
+        },
+        diagnostics: { binding: "cached", prewarmed: [], cacheHits: [], degraded: [] },
+      };
+    });
+    const runtime: MemoryRuntimeContract = {
+      prepareContext,
+      commitCompletedRound: vi.fn(),
+    };
+    const refresh = vi.fn(async () => ({
+      success: true,
+      refreshed: [],
+      skipped: [],
+      agentRefreshed: false,
+      taskRefreshed: false,
+      tookMs: 1,
+    }));
+    const upstream = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
+      code: 0,
+      data: {},
+    }), { headers: { "content-type": "application/json" } }));
+    const bridgeConfig = config();
+    bridgeConfig.coreSkill.endpoint = "https://memory.example";
+    bridgeConfig.coreSkill.serviceId = "memory-1";
+    const app = createHookApp(bridgeConfig, {
+      memoryRuntimeProvider: provider(runtime),
+      codexAccessResolver: resolver(),
+      codexTurnStore: turnStore(),
+      managementDeps: { refresh },
+      bridgeFetcher: upstream,
+    });
+    const hookHeaders = { "content-type": "application/json" };
+    const bridgeHeaders = {
+      ...hookHeaders,
+      "x-agent-source": "codex",
+      "x-conversation-id": "session-1",
+      "x-tdai-service-id": "memory-1",
+    };
+    expect((await app.request("/hooks/session-start", {
+      method: "POST", headers: hookHeaders, body: JSON.stringify(sessionStart("startup")),
+    })).status).toBe(200);
+    expect((await app.request("/skill-bridge/v3/skill/get", {
+      method: "POST", headers: bridgeHeaders, body: JSON.stringify({ skill_id: "skill-1" }),
+    })).status).toBe(200);
+
+    expect((await app.request("/codex/manage/refresh", {
+      method: "POST", headers: bridgeHeaders, body: "{}",
+    })).status).toBe(200);
+    expect((await app.request("/skill-bridge/v3/skill/get", {
+      method: "POST", headers: bridgeHeaders, body: JSON.stringify({ skill_id: "skill-1" }),
+    })).status).toBe(403);
+    expect(prepareContext).toHaveBeenCalledTimes(2);
+    expect(upstream).toHaveBeenCalledOnce();
+  });
+
   it("persists the exact real prompt before returning bounded prompt recall", async () => {
     const prepareContext = vi.fn<MemoryRuntimeContract["prepareContext"]>(async () => ({
       session: {

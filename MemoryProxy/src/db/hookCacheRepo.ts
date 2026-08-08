@@ -32,14 +32,22 @@ export interface HookCacheRepo {
     sessionId: string,
     hookId: string,
     blocks: ContextBlock[],
-  ): void;
+  ): Promise<void>;
   putMany(
     spaceId: string,
     userId: string,
     agentSource: string,
     sessionId: string,
     entries: HookCacheEntry[],
-  ): void;
+  ): Promise<void>;
+  /** Replace one session's complete cache set; resolves only after durable mutation. */
+  replaceSession(
+    spaceId: string,
+    userId: string,
+    agentSource: string,
+    sessionId: string,
+    entries: HookCacheEntry[],
+  ): Promise<void>;
   get(
     spaceId: string,
     userId: string,
@@ -58,7 +66,7 @@ export interface HookCacheRepo {
     userId: string,
     agentSource: string,
     sessionId: string,
-  ): void;
+  ): Promise<void>;
 }
 
 /** Sqlite 后端下用的复合 session id —— 与 SessionRepo 一致，多加一段 spaceId. */
@@ -80,11 +88,41 @@ ON CONFLICT(session_id, hook_id) DO UPDATE SET
   created_at  = excluded.created_at
 `;
 
+const RUNTIME_CONTEXT_PREFIX = "memory-runtime-context:";
+const SCOPED_HOOK_SEPARATOR = "\u001f";
+
+interface SqliteCacheAddress {
+  ownerSessionId: string;
+  hookPrefix: string | null;
+}
+
+function sqliteCacheAddress(cacheKey: string): SqliteCacheAddress {
+  if (!cacheKey.startsWith(RUNTIME_CONTEXT_PREFIX)) {
+    return { ownerSessionId: cacheKey, hookPrefix: null };
+  }
+  const remainder = cacheKey.slice(RUNTIME_CONTEXT_PREFIX.length);
+  const separator = remainder.indexOf(":");
+  if (separator <= 0) return { ownerSessionId: cacheKey, hookPrefix: null };
+  try {
+    const ownerSessionId = Buffer.from(remainder.slice(0, separator), "base64url")
+      .toString("utf8");
+    if (ownerSessionId.length === 0) return { ownerSessionId: cacheKey, hookPrefix: null };
+    return { ownerSessionId, hookPrefix: `${cacheKey}${SCOPED_HOOK_SEPARATOR}` };
+  } catch {
+    return { ownerSessionId: cacheKey, hookPrefix: null };
+  }
+}
+
+function storedHookId(address: SqliteCacheAddress, hookId: string): string {
+  return address.hookPrefix ? `${address.hookPrefix}${hookId}` : hookId;
+}
+
 class SqliteHookCacheRepo implements HookCacheRepo {
   private putStmt: Database.Statement;
   private getStmt: Database.Statement;
   private getAllStmt: Database.Statement;
   private clearStmt: Database.Statement;
+  private clearScopeStmt: Database.Statement;
 
   constructor(private db: Database.Database) {
     this.putStmt = db.prepare(UPSERT_SQL);
@@ -95,20 +133,24 @@ class SqliteHookCacheRepo implements HookCacheRepo {
       "SELECT hook_id, blocks_json FROM hook_cache WHERE session_id = ?",
     );
     this.clearStmt = db.prepare("DELETE FROM hook_cache WHERE session_id = ?");
+    this.clearScopeStmt = db.prepare(
+      "DELETE FROM hook_cache WHERE session_id = ? AND substr(hook_id, 1, length(?)) = ?",
+    );
   }
 
-  put(
+  async put(
     spaceId: string,
     userId: string,
     agentSource: string,
     sessionId: string,
     hookId: string,
     blocks: ContextBlock[],
-  ): void {
+  ): Promise<void> {
     try {
+      const address = sqliteCacheAddress(sessionId);
       this.putStmt.run(
-        compositeSid(spaceId, userId, agentSource, sessionId),
-        hookId,
+        compositeSid(spaceId, userId, agentSource, address.ownerSessionId),
+        storedHookId(address, hookId),
         JSON.stringify(blocks),
         Date.now(),
       );
@@ -120,20 +162,21 @@ class SqliteHookCacheRepo implements HookCacheRepo {
     }
   }
 
-  putMany(
+  async putMany(
     spaceId: string,
     userId: string,
     agentSource: string,
     sessionId: string,
     entries: HookCacheEntry[],
-  ): void {
+  ): Promise<void> {
     if (entries.length === 0) return;
     try {
-      const cs = compositeSid(spaceId, userId, agentSource, sessionId);
+      const address = sqliteCacheAddress(sessionId);
+      const cs = compositeSid(spaceId, userId, agentSource, address.ownerSessionId);
       const tx = this.db.transaction((items: HookCacheEntry[]) => {
         const now = Date.now();
         for (const e of items) {
-          this.putStmt.run(cs, e.hookId, JSON.stringify(e.blocks), now);
+          this.putStmt.run(cs, storedHookId(address, e.hookId), JSON.stringify(e.blocks), now);
         }
       });
       tx(entries);
@@ -145,6 +188,34 @@ class SqliteHookCacheRepo implements HookCacheRepo {
     }
   }
 
+  async replaceSession(
+    spaceId: string,
+    userId: string,
+    agentSource: string,
+    sessionId: string,
+    entries: HookCacheEntry[],
+  ): Promise<void> {
+    const address = sqliteCacheAddress(sessionId);
+    const cs = compositeSid(spaceId, userId, agentSource, address.ownerSessionId);
+    const tx = this.db.transaction((items: HookCacheEntry[]) => {
+      if (address.hookPrefix) {
+        this.clearScopeStmt.run(cs, address.hookPrefix, address.hookPrefix);
+      } else {
+        this.clearStmt.run(cs);
+      }
+      const now = Date.now();
+      for (const entry of items) {
+        this.putStmt.run(
+          cs,
+          storedHookId(address, entry.hookId),
+          JSON.stringify(entry.blocks),
+          now,
+        );
+      }
+    });
+    tx(entries);
+  }
+
   async get(
     spaceId: string,
     userId: string,
@@ -153,9 +224,10 @@ class SqliteHookCacheRepo implements HookCacheRepo {
     hookId: string,
   ): Promise<ContextBlock[] | null> {
     try {
+      const address = sqliteCacheAddress(sessionId);
       const row = this.getStmt.get(
-        compositeSid(spaceId, userId, agentSource, sessionId),
-        hookId,
+        compositeSid(spaceId, userId, agentSource, address.ownerSessionId),
+        storedHookId(address, hookId),
       ) as { blocks_json: string } | undefined;
       if (!row) return null;
       const parsed = JSON.parse(row.blocks_json) as ContextBlock[];
@@ -172,15 +244,23 @@ class SqliteHookCacheRepo implements HookCacheRepo {
     sessionId: string,
   ): Promise<HookCacheEntry[]> {
     try {
+      const address = sqliteCacheAddress(sessionId);
       const rows = this.getAllStmt.all(
-        compositeSid(spaceId, userId, agentSource, sessionId),
+        compositeSid(spaceId, userId, agentSource, address.ownerSessionId),
       ) as Array<{ hook_id: string; blocks_json: string }>;
       const out: HookCacheEntry[] = [];
       for (const r of rows) {
+        if (address.hookPrefix && !r.hook_id.startsWith(address.hookPrefix)) continue;
+        if (!address.hookPrefix && r.hook_id.includes(SCOPED_HOOK_SEPARATOR)) continue;
         try {
           const blocks = JSON.parse(r.blocks_json) as ContextBlock[];
           if (Array.isArray(blocks)) {
-            out.push({ hookId: r.hook_id, blocks });
+            out.push({
+              hookId: address.hookPrefix
+                ? r.hook_id.slice(address.hookPrefix.length)
+                : r.hook_id,
+              blocks,
+            });
           }
         } catch {
           /* skip corrupt row */
@@ -192,14 +272,20 @@ class SqliteHookCacheRepo implements HookCacheRepo {
     }
   }
 
-  clearBySession(
+  async clearBySession(
     spaceId: string,
     userId: string,
     agentSource: string,
     sessionId: string,
-  ): void {
+  ): Promise<void> {
     try {
-      this.clearStmt.run(compositeSid(spaceId, userId, agentSource, sessionId));
+      const address = sqliteCacheAddress(sessionId);
+      const cs = compositeSid(spaceId, userId, agentSource, address.ownerSessionId);
+      if (address.hookPrefix) {
+        this.clearScopeStmt.run(cs, address.hookPrefix, address.hookPrefix);
+      } else {
+        this.clearStmt.run(cs);
+      }
     } catch {
       /* ignore */
     }
@@ -207,15 +293,16 @@ class SqliteHookCacheRepo implements HookCacheRepo {
 }
 
 class NullHookCacheRepo implements HookCacheRepo {
-  put(): void {}
-  putMany(): void {}
+  async put(): Promise<void> {}
+  async putMany(): Promise<void> {}
+  async replaceSession(): Promise<void> {}
   async get(): Promise<ContextBlock[] | null> {
     return null;
   }
   async getAllForSession(): Promise<HookCacheEntry[]> {
     return [];
   }
-  clearBySession(): void {}
+  async clearBySession(): Promise<void> {}
 }
 
 let _repo: HookCacheRepo | null = null;

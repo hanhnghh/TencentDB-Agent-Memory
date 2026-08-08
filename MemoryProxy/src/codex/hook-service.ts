@@ -1,4 +1,5 @@
 import { log } from "../report/log.js";
+import type { BridgeSessionAccessRegistry } from "../bridge/session-access.js";
 import {
   MemoryRuntimeAuthorizationError,
   MemoryRuntimeBindingError,
@@ -106,6 +107,7 @@ export interface CodexHookServiceOptions {
   memoryRuntimeProvider: MemoryRuntimeProvider;
   accessResolver: CodexHookAccessResolver;
   turnStore: CodexTurnStore;
+  bridgeSessions?: BridgeSessionAccessRegistry;
 }
 
 // These are the same limits declared in plugins/tencentdb-agent-memory/hooks.json.
@@ -198,6 +200,12 @@ export class CodexHookService {
     });
     try {
       const prepared = await runtime.prepareContext({ identity: access.identity, readOnly: false });
+      this.options.bridgeSessions?.register({
+        identity: prepared.session.identity,
+        sessionCacheKey: access.bindingCacheKey,
+        userKey: access.userKey,
+        capabilities: prepared.capabilities,
+      });
       const additionalContext = renderAdditionalContext(prepared, {
         includeSession: true,
         maxBlocks: contextBlockLimit(access),
@@ -379,6 +387,7 @@ export class CodexHookService {
       sessionId: input.session_id,
       turnId: input.turn_id,
     });
+    this.options.bridgeSessions?.remove("codex", input.session_id);
     try {
       this.options.memoryRuntimeProvider.signalDrain?.();
     } catch (cause: unknown) {

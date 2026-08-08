@@ -37,12 +37,15 @@ import {
   type KnowledgeItem,
 } from "../../knowledge/core-client.js";
 import type { CoreSkillConfig } from "../../types.js";
+import { normalizeAgentSource } from "../../agent-sources.js";
 
 const TAG = "[knowledge-tools-injector]";
 
 export interface KnowledgeToolsInjectorConfig {
   /** Core kernel config (same endpoint as skill — 8420). */
   coreSkill: CoreSkillConfig;
+  /** Loopback listener used by Codex subscription sessions. */
+  codexSidecarBaseUrl?: string;
 }
 
 /**
@@ -70,8 +73,19 @@ function filterResourcesByCapabilities(
   });
 }
 
-export function renderKnowledgeToolsBlock(resources: KnowledgeItem[], serviceId: string): string | null {
+export function renderKnowledgeToolsBlock(
+  resources: KnowledgeItem[],
+  serviceId: string,
+  options: { bridgeBaseUrl?: string; sessionId?: string; agentSource?: string } = {},
+): string | null {
   if (!resources || resources.length === 0) return null;
+
+  if (options.bridgeBaseUrl && normalizeAgentSource(options.agentSource) === "codex") {
+    return renderCodexKnowledgeTools(resources, serviceId, {
+      ...options,
+      bridgeBaseUrl: options.bridgeBaseUrl,
+    });
+  }
 
   const resourceTags = resources
     .map((r) => {
@@ -178,7 +192,16 @@ export class KnowledgeToolsInjector implements InjectionHook {
   async execute(ctx: AgentContext): Promise<ContextBlock[]> {
     const ids = this.resolveSession(ctx);
     if (!ids.teamId) return [];
-    return this.fetchBlocks(ids.teamId, ids.agentId, ids.userKey, ids.spaceId, ids.assetCapabilities, "execute");
+    return this.fetchBlocks(
+      ids.teamId,
+      ids.agentId,
+      ids.userKey,
+      ids.spaceId,
+      ids.assetCapabilities,
+      "execute",
+      ctx.metadata.agentSource,
+      ctx.metadata.sessionKey,
+    );
   }
 
   async prewarm(input: PrewarmInput): Promise<ContextBlock[]> {
@@ -191,6 +214,8 @@ export class KnowledgeToolsInjector implements InjectionHook {
       input.sessionInfo.space_id ?? null,
       input.assetCapabilities,
       "prewarm",
+      input.agentSource,
+      input.sessionInfo.session_id,
     );
   }
 
@@ -218,8 +243,13 @@ export class KnowledgeToolsInjector implements InjectionHook {
     spaceId: string | null,
     assetCapabilities: AssetCapabilityFlags | undefined,
     phase: "prewarm" | "execute",
+    agentSource?: string,
+    sessionId?: string,
   ): Promise<ContextBlock[]> {
     try {
+      if (normalizeAgentSource(agentSource) === "codex" && !this.config.codexSidecarBaseUrl) {
+        return [];
+      }
       const client = this.clientOverride ?? getCoreKnowledgeClient(this.config.coreSkill);
 
       console.log(`${TAG} ${phase} team=${teamId} agent=${agentId ?? "(none)"} userKey=${userKey ? "(set)" : "(none)"} space=${spaceId ?? "(none)"}`);
@@ -245,7 +275,11 @@ export class KnowledgeToolsInjector implements InjectionHook {
       resources = filterResourcesByCapabilities(resources, assetCapabilities);
       // 注入 prompt 里给 LLM 用的 service-id 也要是 spaceId（LLM 拿它调 KS 的 tools/list|call）。
       const injectionServiceId = spaceId || this.config.coreSkill.serviceId;
-      const content = renderKnowledgeToolsBlock(resources, injectionServiceId);
+      const content = renderKnowledgeToolsBlock(resources, injectionServiceId, {
+        bridgeBaseUrl: this.config.codexSidecarBaseUrl,
+        sessionId,
+        agentSource,
+      });
       if (!content) return [];
       return [{
         type: "text",
@@ -260,4 +294,40 @@ export class KnowledgeToolsInjector implements InjectionHook {
       return [];
     }
   }
+}
+
+function renderCodexKnowledgeTools(
+  resources: KnowledgeItem[],
+  serviceId: string,
+  options: { bridgeBaseUrl: string; sessionId?: string; agentSource?: string },
+): string {
+  const base = `${options.bridgeBaseUrl.replace(/\/$/, "")}/knowledge-bridge/v3`;
+  const source = normalizeAgentSource(options.agentSource);
+  const headers = [
+    `-H 'content-type: application/json'`,
+    `-H 'x-tdai-service-id: ${serviceId}'`,
+    ...(options.sessionId ? [`-H 'x-conversation-id: ${options.sessionId}'`] : []),
+    ...(source === "unknown" ? [] : [`-H 'x-agent-source: ${source}'`]),
+  ].join(" ");
+  const ordered = [...resources].sort((left, right) => (
+    left.knowledge_id.localeCompare(right.knowledge_id)
+  ));
+  const visible = ordered.slice(0, 12);
+  return [
+    "<knowledge_tools>",
+    "Use the loopback sidecar for authorized Wiki and CodeGraph discovery; never call resource service_url directly.",
+    ...visible.map((resource) => (
+      `- ${resource.type} ${resource.knowledge_id}: ${bounded(resource.name, 80)}`
+    )),
+    ...(ordered.length > visible.length ? [`- ${ordered.length - visible.length} resource(s) omitted`] : []),
+    `- POST ${base}/tools/list ${headers} -d '{"knowledge_id":"<id>"}'`,
+    `- POST ${base}/tools/call ${headers} -d '{"knowledge_id":"<id>","tool_name":"<name>","params":{}}'`,
+    "Call tools/list once per resource, then use its exact tool names and parameters. Do not retry HTTP 4xx.",
+    "</knowledge_tools>",
+  ].join("\n");
+}
+
+function bounded(value: string, limit: number): string {
+  const compact = value.replace(/\s+/g, " ").trim();
+  return compact.length <= limit ? compact : `${compact.slice(0, limit - 1)}…`;
 }

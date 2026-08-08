@@ -44,7 +44,7 @@ export function createApp(config: ProxyConfig, options: CreateAppOptions = {}): 
   // namespace reservation and fall through to the LLM forwarding catch-all.
   app.use("*", async (c, next) => {
     const classification = classifyPublicPath(c.req.path);
-    if (classification === "hooks") {
+    if (classification === "local_sidecar") {
       return c.json({ error: "not_found" }, 404);
     }
     if (classification === "malformed") {
@@ -221,13 +221,12 @@ export function createApp(config: ProxyConfig, options: CreateAppOptions = {}): 
   return app;
 }
 
-function classifyPublicPath(path: string): "hooks" | "malformed" | "allowed" {
+function classifyPublicPath(path: string): "local_sidecar" | "malformed" | "allowed" {
   let decoded = path;
   for (let depth = 0; depth < 3; depth++) {
     const normalized = canonicalizePath(decoded).toLowerCase();
-    if (normalized === "/hooks" || normalized.startsWith("/hooks/") ||
-        normalized.startsWith("/hooks%")) {
-      return "hooks";
+    if (isLocalSidecarPath(normalized)) {
+      return "local_sidecar";
     }
     try {
       const next = decodeURIComponent(decoded);
@@ -238,6 +237,12 @@ function classifyPublicPath(path: string): "hooks" | "malformed" | "allowed" {
     }
   }
   return "malformed";
+}
+
+function isLocalSidecarPath(path: string): boolean {
+  return ["/hooks", "/knowledge-bridge", "/codex/manage"].some((namespace) =>
+    path === namespace || path.startsWith(`${namespace}/`) || path.startsWith(`${namespace}%`)
+  );
 }
 
 function canonicalizePath(path: string): string {

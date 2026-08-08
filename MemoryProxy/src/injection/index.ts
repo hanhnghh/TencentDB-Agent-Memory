@@ -205,6 +205,10 @@ function buildPipelineBundle(config: ProxyConfig): PipelineBundle {
   // Register configured injectors. Each injector reads its own kernel config
   // (`coreSkill`, `tdai`, ...); there is no shared external endpoint anymore.
   const injectors = config.injection?.injectors ?? [];
+  const codexSidecarBaseUrl = loopbackBaseUrl(
+    config.runtime.hooks.host,
+    config.runtime.hooks.port,
+  );
 
   // proxyBaseUrl 在 skill-tools-injector 和 tdai-tools-injector 之间共享。
   //
@@ -260,7 +264,11 @@ function buildPipelineBundle(config: ProxyConfig): PipelineBundle {
     // dynamic `<cloud_skills>` block. Even when there are no skills to
     // recommend, the LLM still needs to know how to create / search them.
     const allowLlmWrite = config.skillRuntime?.allowLlmWrite ?? false;
-    registry.register(new SkillToolsInjector({ proxyBaseUrl: proxyBaseUrl!, allowLlmWrite }));
+    registry.register(new SkillToolsInjector({
+      proxyBaseUrl: proxyBaseUrl!,
+      codexSidecarBaseUrl,
+      allowLlmWrite,
+    }));
   }
 
   if (injectors.includes("knowledge")) {
@@ -270,6 +278,7 @@ function buildPipelineBundle(config: ProxyConfig): PipelineBundle {
     if (shouldRegisterKnowledgeInjector(config)) {
       registry.register(new KnowledgeToolsInjector({
         coreSkill: config.knowledge,
+        codexSidecarBaseUrl,
       }));
     }
   }
@@ -303,7 +312,7 @@ function buildPipelineBundle(config: ProxyConfig): PipelineBundle {
     // <proxy>/memory-bridge/v3/* 调用只读工具。proxy 自动注入身份。
     // proxyBaseUrl 复用 skill-tools-injector 算出来的（同一 host:port）。
     if (typeof proxyBaseUrl !== "undefined") {
-      registry.register(new TdaiToolsInjector({ proxyBaseUrl }));
+      registry.register(new TdaiToolsInjector({ proxyBaseUrl, codexSidecarBaseUrl }));
     }
   }
 
@@ -383,6 +392,7 @@ function getOrBuildBundle(config: ProxyConfig): PipelineBundle {
     coreSkill: config.coreSkill,
     knowledge: config.knowledge,
     server: config.server,
+    runtime: config.runtime,
   });
   if (cachedBundle && cachedConfigHash === configHash) {
     return cachedBundle;
@@ -390,6 +400,11 @@ function getOrBuildBundle(config: ProxyConfig): PipelineBundle {
   cachedBundle = buildPipelineBundle(config);
   cachedConfigHash = configHash;
   return cachedBundle;
+}
+
+function loopbackBaseUrl(host: string, port: number): string {
+  const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  return `http://${urlHost}:${port}`;
 }
 
 /**

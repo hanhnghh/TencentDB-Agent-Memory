@@ -25,6 +25,82 @@ import {
 } from "../../__tests__/memory-parity/fixtures.js";
 
 describe("MemoryRuntime production adapters", () => {
+  it("rebuilds the scoped cache on refresh and serves fresh blocks afterward", async () => {
+    let entries: HookCacheEntry[] = [{
+      hookId: "tdai-profile-memory-injector",
+      blocks: [{ type: "text", content: "stale context" }],
+    }];
+    let releaseDeletion = (): void => {};
+    const deletionGate = new Promise<void>((resolve) => { releaseDeletion = resolve; });
+    const cacheRepo: HookCacheRepo = {
+      put: vi.fn(async () => undefined),
+      putMany: vi.fn(async (_space, _user, _source, _session, fresh) => {
+        entries = structuredClone(fresh);
+      }),
+      replaceSession: vi.fn(async (_space, _user, _source, _session, fresh) => {
+        await deletionGate;
+        entries = structuredClone(fresh);
+      }),
+      get: vi.fn(async () => null),
+      getAllForSession: vi.fn(async () => structuredClone(entries)),
+      clearBySession: vi.fn(async () => { entries = []; }),
+    };
+    const prewarm = vi.fn(async () => ({
+      cachedHookIds: ["tdai-profile-memory-injector"],
+      entries: [{
+        hookId: "tdai-profile-memory-injector",
+        blocks: [{ type: "text" as const, content: "fresh context" }],
+      }],
+      skipped: [],
+      durationMs: 1,
+    }));
+    const adapter = new HookCacheContextAdapter({ cacheRepo, prewarm });
+    const request = {
+      binding: {
+        identity: {
+          serviceId: PARITY_IDENTITY.spaceId,
+          teamId: PARITY_IDENTITY.teamId,
+          userId: PARITY_IDENTITY.userId,
+          agentId: PARITY_IDENTITY.agentId,
+          taskId: PARITY_IDENTITY.taskId,
+          agentSource: "codex",
+          sessionId: PARITY_IDENTITY.sessionId,
+        },
+        agent: PARITY_AGENT,
+        task: PARITY_TASK,
+        sessionInfo: PARITY_SESSION_INFO,
+        resolution: "cached" as const,
+      },
+      capabilities: { skill: true, llmWiki: true, codeGraph: true, chatMemory: true },
+    };
+
+    await expect(adapter.prepareContext(request)).resolves.toMatchObject({
+      blocks: [{ content: "stale context" }],
+    });
+    let refreshSettled = false;
+    const refreshPromise = adapter.prepareContext({ ...request, refresh: true }).then((result) => {
+      refreshSettled = true;
+      return result;
+    });
+    let concurrentReadSettled = false;
+    const concurrentRead = adapter.prepareContext(request).then((result) => {
+      concurrentReadSettled = true;
+      return result;
+    });
+    await Promise.resolve();
+    expect(refreshSettled).toBe(false);
+    expect(concurrentReadSettled).toBe(false);
+    releaseDeletion();
+    await expect(refreshPromise).resolves.toMatchObject({
+      blocks: [{ content: "fresh context" }],
+    });
+    await expect(concurrentRead).resolves.toMatchObject({
+      blocks: [{ content: "fresh context" }],
+    });
+    expect(cacheRepo.replaceSession).toHaveBeenCalledOnce();
+    expect(prewarm).toHaveBeenCalledOnce();
+  });
+
   it("adds prompt-specific recall through the context port and degrades read failures", async () => {
     const promptRecall = vi.fn(async () => [{
       id: "tdai-l1-recall-injector:0",
@@ -36,11 +112,12 @@ describe("MemoryRuntime production adapters", () => {
     }]);
     const adapter = new HookCacheContextAdapter({
       cacheRepo: {
-        put: vi.fn(),
-        putMany: vi.fn(),
+        put: vi.fn(async () => undefined),
+        putMany: vi.fn(async () => undefined),
+        replaceSession: vi.fn(async () => undefined),
         get: vi.fn(async () => null),
         getAllForSession: vi.fn(async () => []),
-        clearBySession: vi.fn(),
+        clearBySession: vi.fn(async () => undefined),
       },
       prewarm: vi.fn(async () => ({
         cachedHookIds: [], entries: [], skipped: [], durationMs: 0,
@@ -94,6 +171,7 @@ describe("MemoryRuntime production adapters", () => {
       cacheRepo: {
         put: vi.fn(),
         putMany,
+        replaceSession: vi.fn(async () => undefined),
         get: vi.fn(async () => null),
         getAllForSession: vi.fn(async () => []),
         clearBySession: vi.fn(),
@@ -185,15 +263,18 @@ describe("MemoryRuntime production adapters", () => {
     ];
     const cache = new Map<string, HookCacheEntry[]>();
     const cacheRepo: HookCacheRepo = {
-      put: vi.fn(),
-      putMany: vi.fn((_spaceId, _userId, _agentSource, sessionId, entries) => {
+      put: vi.fn(async () => undefined),
+      putMany: vi.fn(async (_spaceId, _userId, _agentSource, sessionId, entries) => {
+        cache.set(sessionId, structuredClone(entries));
+      }),
+      replaceSession: vi.fn(async (_spaceId, _userId, _agentSource, sessionId, entries) => {
         cache.set(sessionId, structuredClone(entries));
       }),
       get: vi.fn(async () => null),
       getAllForSession: vi.fn(async (_spaceId, _userId, _agentSource, sessionId) => (
         structuredClone(cache.get(sessionId) ?? [])
       )),
-      clearBySession: vi.fn(),
+      clearBySession: vi.fn(async () => undefined),
     };
     const prewarm = vi.fn(async () => ({
       cachedHookIds: [

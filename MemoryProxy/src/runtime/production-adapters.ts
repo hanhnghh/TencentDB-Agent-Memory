@@ -212,24 +212,62 @@ export class AssetCapabilityHttpAdapter implements RuntimeCapabilityAdapter {
 export interface HookCacheContextAdapterOptions {
   cacheRepo: HookCacheRepo;
   prewarm(input: PrewarmInput, options?: PrewarmOptions): Promise<PrewarmResult>;
+  coordinator?: RuntimeContextPreparationCoordinator;
   callerUserKeyFor?: (identity: BoundRuntimeIdentity) => string | undefined;
   classifyHook?: (hookId: string) => RuntimeContextKind | null;
   promptRecall?: (request: RuntimeContextRequest) => Promise<RuntimeContextBlock[]>;
 }
 
+export interface RuntimeContextPreparationCoordinator {
+  run<T>(key: string, execute: () => Promise<T>): Promise<T>;
+}
+
+export class SerialRuntimeContextPreparationCoordinator
+  implements RuntimeContextPreparationCoordinator {
+  private readonly queues = new Map<string, Promise<void>>();
+
+  async run<T>(key: string, execute: () => Promise<T>): Promise<T> {
+    const previous = this.queues.get(key) ?? Promise.resolve();
+    const operation = previous.catch(() => undefined).then(execute);
+    const tail = operation.then(() => undefined, () => undefined);
+    this.queues.set(key, tail);
+    try {
+      return await operation;
+    } finally {
+      if (this.queues.get(key) === tail) this.queues.delete(key);
+    }
+  }
+}
+
 export class HookCacheContextAdapter implements RuntimeContextAdapter {
-  constructor(private readonly options: HookCacheContextAdapterOptions) {}
+  private readonly coordinator: RuntimeContextPreparationCoordinator;
+
+  constructor(private readonly options: HookCacheContextAdapterOptions) {
+    this.coordinator = options.coordinator ?? new SerialRuntimeContextPreparationCoordinator();
+  }
 
   async prepareContext(request: RuntimeContextRequest): Promise<RuntimeContextPreparation> {
+    const queueKey = createRuntimeContextCacheKey(request.binding.identity, request.capabilities);
+    return this.coordinator.run(
+      queueKey,
+      () => this.prepareContextExclusive(request),
+    );
+  }
+
+  private async prepareContextExclusive(
+    request: RuntimeContextRequest,
+  ): Promise<RuntimeContextPreparation> {
     const { binding, capabilities } = request;
     const sessionInfo = binding.sessionInfo ?? sessionInfoFrom(binding.identity);
     const scopedCacheKey = createRuntimeContextCacheKey(binding.identity, capabilities);
-    let entries = await this.options.cacheRepo.getAllForSession(
-      binding.identity.serviceId,
-      binding.identity.userId,
-      binding.identity.agentSource,
-      scopedCacheKey,
-    );
+    let entries = request.refresh
+      ? []
+      : await this.options.cacheRepo.getAllForSession(
+        binding.identity.serviceId,
+        binding.identity.userId,
+        binding.identity.agentSource,
+        scopedCacheKey,
+      );
     let prewarmed: string[] = [];
     const degraded: string[] = [];
     const cacheHits = entries.map((entry) => entry.hookId);
@@ -254,13 +292,23 @@ export class HookCacheContextAdapter implements RuntimeContextAdapter {
       degraded.push(...prewarmResult.skipped.map((entry) => `prewarm:${entry.hookId}:skipped`));
       entries = prewarmResult.entries;
       if (!request.readOnly) {
-        this.options.cacheRepo.putMany(
-          binding.identity.serviceId,
-          binding.identity.userId,
-          binding.identity.agentSource,
-          scopedCacheKey,
-          entries,
-        );
+        if (request.refresh) {
+          await this.options.cacheRepo.replaceSession(
+            binding.identity.serviceId,
+            binding.identity.userId,
+            binding.identity.agentSource,
+            scopedCacheKey,
+            entries,
+          );
+        } else {
+          await this.options.cacheRepo.putMany(
+            binding.identity.serviceId,
+            binding.identity.userId,
+            binding.identity.agentSource,
+            scopedCacheKey,
+            entries,
+          );
+        }
       }
     }
     const prewarmOrder = new Map(
@@ -409,7 +457,8 @@ function createRuntimeContextCacheKey(
   identity: BoundRuntimeIdentity,
   capabilities: RuntimeCapabilityFlags,
 ): string {
-  return `memory-runtime-context:${hashTuple([
+  const ownerSessionId = Buffer.from(identity.sessionId, "utf8").toString("base64url");
+  return `memory-runtime-context:${ownerSessionId}:${hashTuple([
     identity.serviceId,
     identity.teamId,
     identity.userId,

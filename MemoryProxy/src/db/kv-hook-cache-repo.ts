@@ -39,37 +39,78 @@ function keyOf(
 }
 
 export class KvHookCacheRepo implements HookCacheRepo {
+  private readonly operationQueues = new Map<string, Promise<void>>();
+
   constructor(private readonly storage: ProxyStorage) {}
 
-  put(
+  private enqueue<T>(dir: string, execute: () => Promise<T>): Promise<T> {
+    const previous = this.operationQueues.get(dir) ?? Promise.resolve();
+    const operation = previous.catch(() => undefined).then(execute);
+    const tail = operation.then(() => undefined, () => undefined);
+    this.operationQueues.set(dir, tail);
+    void tail.then(() => {
+      if (this.operationQueues.get(dir) === tail) this.operationQueues.delete(dir);
+    });
+    return operation;
+  }
+
+  async put(
     spaceId: string,
     userId: string,
     agentSource: string,
     sessionId: string,
     hookId: string,
     blocks: ContextBlock[],
-  ): void {
-    this.storage
-      .putJSON(keyOf(spaceId, userId, agentSource, sessionId, hookId), blocks)
-      .catch(() => { /* silent */ });
+  ): Promise<void> {
+    const dir = hookDir(spaceId, userId, agentSource, sessionId);
+    await this.enqueue(dir, () => this.storage.putJSON(
+      keyOf(spaceId, userId, agentSource, sessionId, hookId),
+      blocks,
+    )).catch(() => undefined);
   }
 
-  putMany(
+  async putMany(
     spaceId: string,
     userId: string,
     agentSource: string,
     sessionId: string,
     entries: HookCacheEntry[],
-  ): void {
+  ): Promise<void> {
     if (entries.length === 0) return;
-    // 并发 PUT —— 保持 wall-clock ≈ 单次 PUT，而不是 N 倍串行
-    void Promise.all(
-      entries.map((e) =>
-        this.storage
-          .putJSON(keyOf(spaceId, userId, agentSource, sessionId, e.hookId), e.blocks)
-          .catch(() => { /* silent */ }),
-      ),
-    );
+    const dir = hookDir(spaceId, userId, agentSource, sessionId);
+    await this.enqueue(dir, () => Promise.all(entries.map((entry) => this.storage.putJSON(
+      keyOf(spaceId, userId, agentSource, sessionId, entry.hookId),
+      entry.blocks,
+    ))).then(() => undefined)).catch(() => undefined);
+  }
+
+  async replaceSession(
+    spaceId: string,
+    userId: string,
+    agentSource: string,
+    sessionId: string,
+    entries: HookCacheEntry[],
+  ): Promise<void> {
+    const dir = hookDir(spaceId, userId, agentSource, sessionId);
+    await this.enqueue(dir, async () => {
+      await this.storage.delPrefix(dir);
+      try {
+        await Promise.all(entries.map((entry) => this.storage.putJSON(
+          keyOf(spaceId, userId, agentSource, sessionId, entry.hookId),
+          entry.blocks,
+        )));
+      } catch (writeError) {
+        try {
+          await this.storage.delPrefix(dir);
+        } catch (cleanupError) {
+          throw new AggregateError(
+            [writeError, cleanupError],
+            "Hook-cache replacement and cleanup failed",
+          );
+        }
+        throw writeError;
+      }
+    });
   }
 
   async get(
@@ -79,10 +120,11 @@ export class KvHookCacheRepo implements HookCacheRepo {
     sessionId: string,
     hookId: string,
   ): Promise<ContextBlock[] | null> {
+    const dir = hookDir(spaceId, userId, agentSource, sessionId);
     try {
-      return await this.storage.getJSON<ContextBlock[]>(
+      return await this.enqueue(dir, () => this.storage.getJSON<ContextBlock[]>(
         keyOf(spaceId, userId, agentSource, sessionId, hookId),
-      );
+      ));
     } catch {
       return null;
     }
@@ -94,36 +136,38 @@ export class KvHookCacheRepo implements HookCacheRepo {
     agentSource: string,
     sessionId: string,
   ): Promise<HookCacheEntry[]> {
+    const dir = hookDir(spaceId, userId, agentSource, sessionId);
     try {
-      const dir = hookDir(spaceId, userId, agentSource, sessionId);
-      const names = await this.storage.listNames(dir);
-      const out: HookCacheEntry[] = [];
-      const settled = await Promise.all(
-        names
-          .filter((n) => n.endsWith(".json"))
-          .map(async (n) => {
-            const blocks = await this.storage
-              .getJSON<ContextBlock[]>(dir + n)
-              .catch(() => null);
-            if (!Array.isArray(blocks)) return null;
-            return { hookId: n.slice(0, -".json".length), blocks };
-          }),
-      );
-      for (const e of settled) if (e) out.push(e);
-      return out;
+      return await this.enqueue(dir, async () => {
+        const names = await this.storage.listNames(dir);
+        const out: HookCacheEntry[] = [];
+        const settled = await Promise.all(
+          names
+            .filter((n) => n.endsWith(".json"))
+            .map(async (n) => {
+              const blocks = await this.storage
+                .getJSON<ContextBlock[]>(dir + n)
+                .catch(() => null);
+              if (!Array.isArray(blocks)) return null;
+              return { hookId: n.slice(0, -".json".length), blocks };
+            }),
+        );
+        for (const entry of settled) if (entry) out.push(entry);
+        return out;
+      });
     } catch {
       return [];
     }
   }
 
-  clearBySession(
+  async clearBySession(
     spaceId: string,
     userId: string,
     agentSource: string,
     sessionId: string,
-  ): void {
-    this.storage
-      .delPrefix(hookDir(spaceId, userId, agentSource, sessionId))
-      .catch(() => { /* silent */ });
+  ): Promise<void> {
+    const dir = hookDir(spaceId, userId, agentSource, sessionId);
+    await this.enqueue(dir, () => this.storage.delPrefix(dir).then(() => undefined))
+      .catch(() => undefined);
   }
 }

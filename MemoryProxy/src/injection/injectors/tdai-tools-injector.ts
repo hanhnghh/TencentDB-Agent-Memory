@@ -51,6 +51,8 @@ export interface TdaiMemoryToolsInjectorConfig {
    * E.g. `http://127.0.0.1:8096`. Trailing slash trimmed.
    */
   proxyBaseUrl: string;
+  /** Loopback listener used by Codex subscription sessions. */
+  codexSidecarBaseUrl?: string;
 }
 
 /** 渲染整段 `<tdai_memory_tools>` 文本，纯函数便于测试。 */
@@ -71,6 +73,10 @@ export function renderTdaiMemoryToolsBlock(
     ? ""
     : ` -H 'x-agent-source: ${normalizedSource}'`;
   const authHeader = `${tenantHeader}${sessionHeader}${sourceHeader}`;
+
+  if (normalizedSource === "codex") {
+    return renderCodexMemoryTools(bridge, authHeader);
+  }
 
   const lines: string[] = [
     "<tdai_memory_tools>",
@@ -183,10 +189,16 @@ export class TdaiMemoryToolsInjector implements InjectionHook {
     spaceId?: string,
     agentSource?: string,
   ): ContextBlock[] {
+    const isCodex = normalizeAgentSource(agentSource) === "codex";
+    let baseUrl = this.cfg.proxyBaseUrl;
+    if (isCodex) {
+      if (!this.cfg.codexSidecarBaseUrl) return [];
+      baseUrl = this.cfg.codexSidecarBaseUrl;
+    }
     return [{
       type: "text",
       content: renderTdaiMemoryToolsBlock(
-        this.cfg.proxyBaseUrl,
+        baseUrl,
         sessionId,
         spaceId,
         agentSource,
@@ -198,6 +210,23 @@ export class TdaiMemoryToolsInjector implements InjectionHook {
       },
     }];
   }
+}
+
+function renderCodexMemoryTools(bridge: string, authHeader: string): string {
+  return [
+    "<tdai_memory_tools>",
+    "Use these read-only Agent Memory operations through the loopback sidecar when history, preferences, decisions, or scenarios are relevant.",
+    `Headers: -H 'content-type: application/json'${authHeader}`,
+    `- POST ${bridge}/atomic/search {query,limit?}`,
+    `- POST ${bridge}/atomic/query {type?,limit?,offset?,time_start?,time_end?}`,
+    `- POST ${bridge}/conversation/search {query,limit?,session_id?}`,
+    `- POST ${bridge}/conversation/query {session_id,limit?,offset?}`,
+    `- POST ${bridge}/scenario/ls {path_prefix?}`,
+    `- POST ${bridge}/scenario/read {path,agent_id?}`,
+    "Search operations default to authorized self and imported memory. Never supply identity fields.",
+    "Responses use {code,message,request_id,data?}; retry HTTP 5xx once, never retry 4xx.",
+    "</tdai_memory_tools>",
+  ].join("\n");
 }
 
 /** @deprecated 旧 API 兼容名 */

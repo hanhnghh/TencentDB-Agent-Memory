@@ -28,27 +28,38 @@ class InMemoryHookCacheRepo implements HookCacheRepo {
     return [spaceId, userId, agentSource, sessionId, hookId].join("/");
   }
 
-  put(
+  async put(
     spaceId: string,
     userId: string,
     agentSource: string,
     sessionId: string,
     hookId: string,
     blocks: ContextBlock[],
-  ): void {
+  ): Promise<void> {
     this.values.set(this.key(spaceId, userId, agentSource, sessionId, hookId), blocks);
   }
 
-  putMany(
+  async putMany(
     spaceId: string,
     userId: string,
     agentSource: string,
     sessionId: string,
     entries: HookCacheEntry[],
-  ): void {
+  ): Promise<void> {
     for (const entry of entries) {
       this.put(spaceId, userId, agentSource, sessionId, entry.hookId, entry.blocks);
     }
+  }
+
+  async replaceSession(
+    spaceId: string,
+    userId: string,
+    agentSource: string,
+    sessionId: string,
+    entries: HookCacheEntry[],
+  ): Promise<void> {
+    await this.clearBySession(spaceId, userId, agentSource, sessionId);
+    await this.putMany(spaceId, userId, agentSource, sessionId, entries);
   }
 
   async get(
@@ -73,12 +84,12 @@ class InMemoryHookCacheRepo implements HookCacheRepo {
       .map(([key, blocks]) => ({ hookId: key.slice(prefix.length), blocks }));
   }
 
-  clearBySession(
+  async clearBySession(
     spaceId: string,
     userId: string,
     agentSource: string,
     sessionId: string,
-  ): void {
+  ): Promise<void> {
     const prefix = [spaceId, userId, agentSource, sessionId, ""].join("/");
     for (const key of this.values.keys()) {
       if (key.startsWith(prefix)) this.values.delete(key);

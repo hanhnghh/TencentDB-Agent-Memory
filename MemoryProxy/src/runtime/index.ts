@@ -63,6 +63,8 @@ export interface PrepareContextInput {
   query?: string;
   /** Resolve fresh context without persisting cache repairs (fork/read-only requests). */
   readOnly?: boolean;
+  /** Discard session context cache and rebuild it through the same runtime seam. */
+  refresh?: boolean;
 }
 
 export interface PrepareContextResult {
@@ -90,6 +92,7 @@ export interface RuntimeContextRequest {
   capabilities: RuntimeCapabilityFlags;
   query?: string;
   readOnly?: boolean;
+  refresh?: boolean;
 }
 
 export interface RuntimeContextPreparation {
@@ -172,6 +175,9 @@ export class MemoryRuntime implements MemoryRuntimeContract {
   constructor(private readonly adapters: MemoryRuntimeAdapters) {}
 
   async prepareContext(input: PrepareContextInput): Promise<PrepareContextResult> {
+    if (input.readOnly && input.refresh) {
+      throw new TypeError("refresh context cannot be read-only");
+    }
     const identity = validateRuntimeIdentity(input.identity);
     const binding = await this.adapters.resolveBinding(identity);
     validateResolvedBinding(identity, binding);
@@ -184,6 +190,7 @@ export class MemoryRuntime implements MemoryRuntimeContract {
         capabilities,
         ...(input.query === undefined ? {} : { query: requireRuntimeText(input.query, "query") }),
         readOnly: input.readOnly,
+        refresh: input.refresh,
       });
     } catch (error: unknown) {
       if (error instanceof MemoryRuntimeContextError) throw error;
@@ -470,6 +477,7 @@ export {
   HookCacheContextAdapter,
   MemoryCoreAuthorizationAdapter,
   ProductionMemoryRuntimeAdapters,
+  SerialRuntimeContextPreparationCoordinator,
   SessionStoreBindingAdapter,
 } from "./production-adapters.js";
 export type {
@@ -480,6 +488,7 @@ export type {
   RuntimeBindingAdapter,
   RuntimeCapabilityAdapter,
   RuntimeContextAdapter,
+  RuntimeContextPreparationCoordinator,
   RuntimeExtractionAdapter,
   RuntimeOutboxAdapter,
 } from "./production-adapters.js";

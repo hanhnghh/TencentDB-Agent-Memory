@@ -13,14 +13,24 @@ import {
 import { KvBindingRepo } from "../db/kv-binding-repo.js";
 import { DEFAULT_CONFIG } from "../config.js";
 import { createMemoryBridgeHandler } from "../memory/memory-bridge.js";
-import { renderTdaiMemoryToolsBlock } from "../injection/injectors/tdai-tools-injector.js";
+import {
+  renderTdaiMemoryToolsBlock,
+  TdaiMemoryToolsInjector,
+} from "../injection/injectors/tdai-tools-injector.js";
 import {
   __resetSessionStoreForTests,
   getSessionStore,
   SessionStore,
 } from "../session/store.js";
 import { createSkillBridgeHandler } from "../skill/skill-bridge.js";
-import { renderSkillToolsBlock } from "../injection/injectors/skill-tools-injector.js";
+import {
+  renderSkillToolsBlock,
+  SkillToolsInjector,
+} from "../injection/injectors/skill-tools-injector.js";
+import {
+  KnowledgeToolsInjector,
+} from "../injection/injectors/knowledge-tools-injector.js";
+import { CoreKnowledgeClient } from "../knowledge/core-client.js";
 import { MemoryStorage } from "../storage/memory-storage.js";
 import type { ProxyConfig } from "../types.js";
 
@@ -118,6 +128,123 @@ describe("Codex agent source registry", () => {
       "memory-1",
       "codex",
     )).toContain("x-agent-source: codex");
+  });
+
+  it("prepares Codex tool instructions against the loopback sidecar", async () => {
+    const input = {
+      keyId: "codex:session-123",
+      userId: "user-codex",
+      agentSource: "codex",
+      spaceId: "memory-1",
+      sessionInfo: {
+        session_id: "session-123",
+        space_id: "memory-1",
+        user_id: "user-codex",
+        team_id: "team-codex",
+        agent_id: "agent-codex",
+        task_id: "task-codex",
+      },
+      agentDetail: { id: "agent-codex", name: "Codex Agent" },
+      taskDetail: { id: "task-codex", name: "Codex Task" },
+      callerUserKey: "user-key-secret",
+      assetCapabilities: {
+        chat_memory: true,
+        skill: true,
+        llm_wiki: true,
+        code_graph: true,
+      },
+    };
+    const sidecar = "http://127.0.0.1:8097";
+    const skill = await new SkillToolsInjector({
+      proxyBaseUrl: "https://gateway.example",
+      codexSidecarBaseUrl: sidecar,
+    }).prewarm(input);
+    const memory = new TdaiMemoryToolsInjector({
+      proxyBaseUrl: "https://gateway.example",
+      codexSidecarBaseUrl: sidecar,
+    }).prewarm(input);
+    const knowledgeClient = new CoreKnowledgeClient(bridgeConfig().coreSkill, async (request) => {
+      const path = new URL(String(request)).pathname;
+      if (path.endsWith("/v3/meta/agent-fixed-asset/list-with-detail")) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: { items: [{ asset_id: "wiki-1", asset_type: "llm_wiki", status: "active" }] },
+        }));
+      }
+      return new Response(JSON.stringify({
+        code: 0,
+        data: {
+          items: [{
+            knowledge_id: "wiki-1",
+            type: "wiki",
+            service_url: "https://wiki.example/v3",
+            name: "Wiki",
+            summary: null,
+            team_id: "team-codex",
+            user_id: "user-codex",
+            created_at: "2026-08-08T00:00:00Z",
+            updated_at: "2026-08-08T00:00:00Z",
+          }],
+          total: 1,
+        },
+      }));
+    });
+    const knowledge = await new KnowledgeToolsInjector({
+      coreSkill: bridgeConfig().coreSkill,
+      codexSidecarBaseUrl: sidecar,
+    }, knowledgeClient).prewarm(input);
+
+    for (const blocks of [skill, memory, knowledge]) {
+      expect(blocks).toHaveLength(1);
+      expect(blocks[0]?.content).toContain(sidecar);
+      expect(blocks[0]?.content).toContain("x-agent-source: codex");
+      expect(blocks[0]?.content).not.toContain("https://gateway.example");
+      expect(blocks[0]?.content).not.toContain("https://wiki.example");
+    }
+    const rendered = [...skill, ...memory, ...knowledge].map((block) => block.content);
+    expect(rendered.join("\n")).toContain("<skill_tools>");
+    expect(rendered.join("\n")).toContain("<tdai_memory_tools>");
+    expect(rendered.join("\n")).toContain("<knowledge_tools>");
+    expect(rendered.reduce((total, content) => total + content.length, 0)).toBeLessThan(5_000);
+  });
+
+  it("does not advertise Codex bridge tools without a loopback endpoint", async () => {
+    const input = {
+      keyId: "codex:session-123",
+      userId: "user-codex",
+      agentSource: "codex",
+      spaceId: "memory-1",
+      sessionInfo: {
+        session_id: "session-123",
+        space_id: "memory-1",
+        user_id: "user-codex",
+        team_id: "team-codex",
+        agent_id: "agent-codex",
+        task_id: "task-codex",
+      },
+      agentDetail: { id: "agent-codex", name: "Codex Agent" },
+      taskDetail: { id: "task-codex", name: "Codex Task" },
+      callerUserKey: "user-key-secret",
+      assetCapabilities: {
+        chat_memory: true,
+        skill: true,
+        llm_wiki: true,
+        code_graph: true,
+      },
+    };
+    const knowledgeFetcher = vi.fn<typeof fetch>();
+
+    await expect(new SkillToolsInjector({
+      proxyBaseUrl: "https://gateway.example",
+    }).prewarm(input)).resolves.toEqual([]);
+    expect(new TdaiMemoryToolsInjector({
+      proxyBaseUrl: "https://gateway.example",
+    }).prewarm(input)).toEqual([]);
+    await expect(new KnowledgeToolsInjector({
+      coreSkill: bridgeConfig().coreSkill,
+    }, new CoreKnowledgeClient(bridgeConfig().coreSkill, knowledgeFetcher)).prewarm(input))
+      .resolves.toEqual([]);
+    expect(knowledgeFetcher).not.toHaveBeenCalled();
   });
 
   it.each(["codex", "claude-code", "codebuddy", "unknown"])(

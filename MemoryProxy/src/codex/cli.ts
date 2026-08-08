@@ -1,4 +1,9 @@
 import { pathToFileURL } from "node:url";
+import {
+  executeCodexManagement,
+  type CodexManagementInput,
+  type CodexManagementResult,
+} from "./management-client.js";
 
 import {
   bindCodexProject,
@@ -24,6 +29,7 @@ export interface CodexBindingCliDependencies {
   status(input: CodexBindingPaths): Promise<CodexBindingStatus>;
   doctor(input: CodexBindingPaths): Promise<CodexBindingDiagnosis>;
   unbind(input: UnbindCodexProjectInput): Promise<UnbindCodexProjectResult>;
+  manage(input: CodexManagementInput): Promise<CodexManagementResult>;
 }
 
 const defaultDependencies: CodexBindingCliDependencies = {
@@ -31,6 +37,7 @@ const defaultDependencies: CodexBindingCliDependencies = {
   status: getCodexBindingStatus,
   doctor: doctorCodexBinding,
   unbind: unbindCodexProject,
+  manage: executeCodexManagement,
 };
 
 const defaultIo: CodexBindingCliIo = {
@@ -50,8 +57,13 @@ const VALUE_OPTIONS = new Set([
   "agent-id",
   "auth-url",
   "endpoint",
+  "content-file",
+  "name",
   "project",
+  "reason",
   "service-id",
+  "session-id",
+  "sidecar-url",
   "task-id",
   "team-id",
   "user-config-dir",
@@ -128,6 +140,11 @@ function usage(): string {
     "  status          Show local binding status",
     "  binding-status  Alias for status",
     "  doctor          Diagnose local binding and credential permissions",
+    "  mem-help        Show hooks-mode management commands",
+    "  sync            Refresh session context through the local sidecar",
+    "  refresh         Alias for sync",
+    "  force-archive   Archive the current session for skill extraction",
+    "  create-skill    Create a skill from a local SKILL.md file",
     "",
     "Bind options:",
     "  --service-id --team-id --agent-id --task-id",
@@ -139,6 +156,23 @@ function usage(): string {
     "Common options:",
     "  --project <path>  Project root (defaults to current directory)",
     "  --user-config-dir <path>  Protected credential root (must be outside the project)",
+    "",
+    "Management options:",
+    "  --session-id <id>  Active Codex session (or CODEX_SESSION_ID)",
+    "  --sidecar-url <url>  Loopback sidecar (default http://127.0.0.1:8097)",
+    "  --reason <text>  Optional force-archive reason",
+    "  --name <name> --content-file <path>  Required by create-skill",
+  ].join("\n");
+}
+
+function managementHelp(): string {
+  return [
+    "Codex hooks-mode management:",
+    "  sync | refresh --session-id <id>",
+    "  force-archive --session-id <id> [--reason <text>]",
+    "  create-skill --session-id <id> --name <name> --content-file <SKILL.md>",
+    "",
+    "mem:* request interception is proxy-only. These CLI commands are the hooks-mode equivalents; they do not replace an assistant response.",
   ].join("\n");
 }
 
@@ -172,6 +206,11 @@ export async function runCodexBindingCli(
   if (!command || command === "help" || options.flags.has("help")) {
     io.stdout(usage());
     return command ? 0 : 2;
+  }
+
+  if (command === "mem-help") {
+    io.stdout(managementHelp());
+    return 0;
   }
 
   try {
@@ -218,6 +257,32 @@ export async function runCodexBindingCli(
       });
       io.stdout(result.removed ? "Codex project binding removed." : "Codex project was not bound.");
       if (result.credentialRemoved) io.stdout("User credential removed from the protected store.");
+      return 0;
+    }
+
+    if (["sync", "refresh", "force-archive", "create-skill"].includes(command)) {
+      const common = {
+        sessionId: requiredOption(options, "session-id", env, "CODEX_SESSION_ID"),
+        sidecarUrl: options.values.get("sidecar-url") ?? env.CODEX_MEMORY_SIDECAR_URL ??
+          "http://127.0.0.1:8097",
+      };
+      let input: CodexManagementInput;
+      if (command === "sync" || command === "refresh") {
+        input = { ...common, operation: "refresh" };
+      } else if (command === "force-archive") {
+        const reason = options.values.get("reason");
+        input = { ...common, operation: "force-archive", ...(reason ? { reason } : {}) };
+      } else {
+        input = {
+          ...common,
+          operation: "create-skill",
+          name: requiredOption(options, "name", env),
+          contentFile: requiredOption(options, "content-file", env),
+        };
+      }
+      const result = await dependencies.manage(input);
+      io.stdout(result.message);
+      if (result.data) io.stdout(JSON.stringify(result.data, null, 2));
       return 0;
     }
 

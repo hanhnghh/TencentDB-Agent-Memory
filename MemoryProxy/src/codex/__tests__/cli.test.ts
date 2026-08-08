@@ -35,6 +35,10 @@ function harness(overrides: Partial<CodexBindingCliDependencies> = {}) {
     })),
     doctor: vi.fn(async () => ({ ok: true, checks: [] })),
     unbind: vi.fn(async () => ({ removed: true, credentialRemoved: false })),
+    manage: vi.fn(async (input) => ({
+      message: `${input.operation} completed`,
+      data: { operation: input.operation },
+    })),
     ...overrides,
   };
   return {
@@ -130,6 +134,58 @@ describe("Codex binding CLI", () => {
     expect(h.dependencies.status).toHaveBeenCalledTimes(1);
     expect(h.dependencies.doctor).toHaveBeenCalledTimes(1);
     expect(h.dependencies.unbind).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { command: "sync", operation: "refresh" },
+    { command: "refresh", operation: "refresh" },
+    { command: "force-archive", operation: "force-archive" },
+  ])("runs $command through the local sidecar", async ({ command, operation }) => {
+    const h = harness();
+
+    const code = await runCodexBindingCli([
+      command,
+      "--session-id", "session-1",
+      "--sidecar-url", "http://127.0.0.1:8097",
+      ...(command === "force-archive" ? ["--reason", "capture migration workflow"] : []),
+    ], h.io, {}, h.dependencies);
+
+    expect(code).toBe(0);
+    expect(h.dependencies.manage).toHaveBeenCalledWith(expect.objectContaining({
+      operation,
+      sessionId: "session-1",
+      sidecarUrl: "http://127.0.0.1:8097",
+    }));
+    expect(h.output.join("\n")).toContain(`${operation} completed`);
+  });
+
+  it("creates a skill through the local sidecar without model interception", async () => {
+    const h = harness();
+
+    const code = await runCodexBindingCli([
+      "create-skill",
+      "--session-id", "session-1",
+      "--name", "migration-checklist",
+      "--content-file", "/project/SKILL.md",
+    ], h.io, {}, h.dependencies);
+
+    expect(code).toBe(0);
+    expect(h.dependencies.manage).toHaveBeenCalledWith(expect.objectContaining({
+      operation: "create-skill",
+      name: "migration-checklist",
+      contentFile: "/project/SKILL.md",
+    }));
+  });
+
+  it("documents proxy-only mem interception and the hooks-mode equivalents", async () => {
+    const h = harness();
+
+    expect(await runCodexBindingCli(["mem-help"], h.io, {}, h.dependencies)).toBe(0);
+    expect(h.output.join("\n")).toContain("mem:* request interception is proxy-only");
+    expect(h.output.join("\n")).toContain("sync");
+    expect(h.output.join("\n")).toContain("force-archive");
+    expect(h.output.join("\n")).toContain("create-skill");
+    expect(h.dependencies.manage).not.toHaveBeenCalled();
   });
 
   it.each([
