@@ -81,6 +81,64 @@ Skill 与 Knowledge 沿用同样的思路：
 
 ## 快速开始
 
+### 安装、信任并诊断 Codex 集成
+
+在 `MemoryProxy` 目录安装依赖，然后注册已打包的本地 marketplace/plugin：
+
+```bash
+npm install
+export MEMORY_CORE_ENDPOINT=http://127.0.0.1:8420
+export MEMORY_CORE_SERVICE_TOKEN=service-token-from-deployment-config
+npm run codex -- install --config config.yaml
+```
+
+安装命令使用参数数组，因此仓库或安装包路径可以包含空格。它会在
+`$XDG_CONFIG_HOME/tencentdb-agent-memory/codex/plugin-data/data`（或
+`~/.config/tencentdb-agent-memory/codex/plugin-data/data`）创建受保护的 sidecar 可写状态，
+绝不会把运行时状态写入不可变的 plugin 包。安装会输出 `hooks.json` 的准确
+SHA-256，并明确显示 hooks 为 **NOT TRUSTED**，同时启动受管理的 hooks-only
+sidecar。Service token 仅从环境继承，不会写入项目、安装状态、进程参数或诊断输出。
+
+打开 Codex，用 `/hooks` 审查已安装的定义，然后记录安装命令输出的准确摘要：
+
+```bash
+npm run codex -- trust --hooks-sha <reviewed-sha256>
+```
+
+Install 与 upgrade 会管理 sidecar 生命周期。如需前台调试，请先停止受管理的安装，
+再手动运行下列命令；它会强制使用 `hooks` 模式，并把 proxy 数据库与 durable
+outbox 都放到受保护的数据目录：
+
+```bash
+npm run codex -- sidecar --config config.yaml
+```
+
+按下文绑定项目后，运行完整诊断：
+
+```bash
+npm run codex -- doctor
+```
+
+Doctor 会分别报告 `plugin_installed`、`plugin_enabled`、`hooks_trusted`、
+`sidecar_reachable`、`project_binding`、`binding_valid`、`memory_core_reachable` 与
+`outbox_healthy`，且不会打印已保存的 key 或 service token。升级必须显式执行；
+若 `hooks.json` 已变化，摘要会失配，trust 会重新失败，直到用户审查新定义：
+
+```bash
+npm run codex -- upgrade
+```
+
+Uninstall 会先排空并停止受管理的 sidecar，再移除 Codex plugin，从而停止新的 lifecycle hook 投递。Durable sidecar
+数据默认保留，并会打印保留路径。只有确定要删除该数据库时才使用
+`--purge-data`；项目 binding 与受保护凭据会继续保留，直到运行 `unbind`（可选
+`unbind --forget-credential`）。
+
+```bash
+npm run codex -- uninstall
+# 或永久删除本地 durable 数据库：
+npm run codex -- uninstall --purge-data
+```
+
 ### Codex 项目绑定
 
 Codex 使用项目本地、且不含密钥的 Team/Agent/Task 绑定。`bind` 命令会先验证
@@ -110,7 +168,8 @@ npm run codex -- unbind
 `0600`。如果凭据目录位于已绑定项目内，命令会拒绝使用。密钥只通过环境变量
 接收，不接受命令行参数，避免泄露到 shell 历史或进程参数。使用
 `unbind --forget-credential` 还会删除该 Memory 服务对应的用户密钥。
-`binding-status`、`doctor` 和 `unbind` 都是本地操作，不会调用模型。
+`binding-status` 与 `unbind` 是本地操作；`doctor` 会向 MemoryCore 重新验证已保存
+的 ID，但不会调用模型。
 
 这些凭据的用途彼此独立：`MEMORY_HUB_USER_KEY` 用于授权用户绑定，
 `MEMORY_CORE_SERVICE_TOKEN` 用于本地集成向 MemoryCore 鉴权。两者都不是代理
@@ -184,8 +243,9 @@ npm run codex -- create-skill --session-id "$CODEX_SESSION_ID" \
 Codex 并不会为所有 hosted 或特殊工具暴露 `PostToolUse`。这些事件会明确缺失；集成
 不会从 `transcript_path` 推断它们，也不会对不支持的路径声称精确的 tool visibility。
 若 sidecar 在 `UserPromptSubmit`、`PostToolUse` 或 `Stop` 期间不可用，可执行程序会
-失败退出，而不会确认尚未持久化的写入。插件安装与 trust 自动化属于后续独立
-packaging workflow；使用前仍需审查 hook 定义。
+失败退出，而不会确认尚未持久化的写入。上述安装流程绝不会把“plugin 已安装”
+当作“hook 已信任”；依赖 lifecycle capture 前，必须用 `/hooks` 审查生效定义并记录
+其准确摘要。
 
 ### 1. 安装依赖
 

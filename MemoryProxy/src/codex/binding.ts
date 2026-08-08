@@ -10,7 +10,6 @@ import {
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { setTimeout as delay } from "node:timers/promises";
 import {
   basename,
   dirname,
@@ -23,6 +22,7 @@ import {
 
 import { verifyUserKeyWithConfig } from "../auth.js";
 import { MetadataClient } from "../meta/client.js";
+import { withProcessLock } from "./process-lock.js";
 
 export const PROJECT_BINDING_RELATIVE_PATH = join(".codex", "memory-binding.json");
 const CREDENTIAL_FILE_NAME = "credentials.json";
@@ -124,6 +124,14 @@ export interface CodexBindingStatus {
 export interface CodexRuntimeCredential {
   binding: CodexProjectBinding;
   userKey: string;
+}
+
+export interface VerifyCodexBindingInput extends CodexBindingPaths {
+  endpoint: string;
+  authUrl?: string;
+  serviceToken: string;
+  timeoutMs?: number;
+  fetcher?: typeof fetch;
 }
 
 export interface BindingDoctorCheck {
@@ -279,86 +287,20 @@ async function atomicWriteJson(path: string, value: unknown, mode: number): Prom
   }
 }
 
-interface CredentialLockOwner {
-  pid: number;
-  token: string;
-}
-
-function processIsRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return errorCode(error) !== "ESRCH";
-  }
-}
-
-async function lockCanBeRemoved(lockPath: string): Promise<boolean> {
-  try {
-    const [text, lockStat] = await Promise.all([
-      readFile(lockPath, "utf8"),
-      stat(lockPath),
-    ]);
-    const parsed: unknown = JSON.parse(text);
-    if (isRecord(parsed) && Number.isSafeInteger(parsed.pid) && Number(parsed.pid) > 0) {
-      return !processIsRunning(Number(parsed.pid));
-    }
-    return Date.now() - lockStat.mtimeMs >= MALFORMED_LOCK_STALE_MS;
-  } catch (error) {
-    if (errorCode(error) === "ENOENT") return true;
-    return false;
-  }
-}
-
 async function withCredentialStoreLock<T>(
   credentialPath: string,
   action: () => Promise<T>,
 ): Promise<T> {
-  const lockPath = `${credentialPath}.lock`;
-  await mkdir(dirname(lockPath), { recursive: true, mode: 0o700 });
-  const deadline = Date.now() + CREDENTIAL_LOCK_TIMEOUT_MS;
-  const owner: CredentialLockOwner = { pid: process.pid, token: randomUUID() };
-  let handle: Awaited<ReturnType<typeof open>> | null = null;
-
-  while (!handle) {
-    try {
-      handle = await open(lockPath, "wx", 0o600);
-      await handle.writeFile(`${JSON.stringify(owner)}\n`, "utf8");
-      await handle.sync();
-    } catch (error) {
-      if (handle) {
-        await handle.close().catch(() => undefined);
-        handle = null;
-        await unlink(lockPath).catch(() => undefined);
-      }
-      if (errorCode(error) !== "EEXIST") throw error;
-      if (await lockCanBeRemoved(lockPath)) {
-        await unlink(lockPath).catch((unlinkError: NodeJS.ErrnoException) => {
-          if (unlinkError.code !== "ENOENT") throw unlinkError;
-        });
-        continue;
-      }
-      if (Date.now() >= deadline) {
-        throw new CodexBindingError(
-          "credential_store_busy",
-          "Protected credential store is busy; retry the local operation",
-        );
-      }
-      await delay(CREDENTIAL_LOCK_RETRY_MS);
-    }
-  }
-
-  try {
-    return await action();
-  } finally {
-    await handle.close().catch(() => undefined);
-    try {
-      const current: unknown = JSON.parse(await readFile(lockPath, "utf8"));
-      if (isRecord(current) && current.token === owner.token) await unlink(lockPath);
-    } catch (error) {
-      if (errorCode(error) !== "ENOENT") throw error;
-    }
-  }
+  return withProcessLock({
+    lockDir: `${credentialPath}.lock`,
+    retryMs: CREDENTIAL_LOCK_RETRY_MS,
+    timeoutMs: CREDENTIAL_LOCK_TIMEOUT_MS,
+    malformedStaleMs: MALFORMED_LOCK_STALE_MS,
+    busyError: () => new CodexBindingError(
+      "credential_store_busy",
+      "Protected credential store is busy; retry the local operation",
+    ),
+  }, action);
 }
 
 async function readCredentialFile(path: string): Promise<CredentialFile> {
@@ -626,62 +568,6 @@ export async function bindCodexProject(
 
   await assertCredentialOutsideProject(input.projectDir, credentialPath);
 
-  const verified = await verifyUserKeyWithConfig(
-    { url: authUrl, timeoutMs, serviceToken },
-    userKey,
-    serviceId,
-    fetcher,
-  );
-  if (verified.rejected || !verified.userId) {
-    throw wrapAuthenticationError(verified.rejectReason);
-  }
-
-  const metadata = new MetadataClient(
-    { endpoint, serviceToken, timeoutMs },
-    serviceId,
-    userKey,
-    fetcher,
-  );
-
-  let teams;
-  try {
-    teams = await metadata.listTeams(verified.userId);
-  } catch (error) {
-    throw wrapValidationError("Team", error);
-  }
-  assertMetadataEntities("Team", teams, ["team_id"]);
-  if (!teams.some((team) => team.team_id === teamId)) {
-    throw new CodexBindingError(
-      "invalid_team",
-      `Team '${teamId}' is missing or unauthorized for the verified user`,
-    );
-  }
-
-  let agents;
-  let tasks;
-  try {
-    [agents, tasks] = await Promise.all([
-      metadata.listAgents(teamId, verified.userId),
-      metadata.listTasks(teamId),
-    ]);
-  } catch (error) {
-    throw wrapValidationError("Agent/Task scope", error);
-  }
-  assertMetadataEntities("Agent", agents, ["agent_id", "team_id"]);
-  assertMetadataEntities("Task", tasks, ["task_id", "team_id"]);
-  if (!agents.some((agent) => agent.agent_id === agentId && agent.team_id === teamId)) {
-    throw new CodexBindingError(
-      "invalid_agent",
-      `Agent '${agentId}' is missing or unauthorized for Team '${teamId}'`,
-    );
-  }
-  if (!tasks.some((task) => task.task_id === taskId && task.team_id === teamId)) {
-    throw new CodexBindingError(
-      "invalid_task",
-      `Task '${taskId}' is missing or unauthorized for Team '${teamId}'`,
-    );
-  }
-
   const binding: CodexProjectBinding = {
     version: CONFIG_VERSION,
     source: "codex",
@@ -693,6 +579,15 @@ export async function bindCodexProject(
       ? { preferences }
       : {}),
   };
+  const userId = await validateCodexBindingScope({
+    binding,
+    userKey,
+    endpoint,
+    authUrl,
+    serviceToken,
+    timeoutMs,
+    fetcher,
+  });
   const projectConfigPath = resolveProjectBindingPath(input.projectDir);
   await withCredentialStoreLock(credentialPath, async () => {
     const credentials = await readCredentialFile(credentialPath);
@@ -708,8 +603,104 @@ export async function bindCodexProject(
     binding,
     projectConfigPath,
     credentialPath,
-    userId: verified.userId,
+    userId,
   };
+}
+
+/** Revalidate the stored Team/Agent/Task scope against MemoryCore without mutating local state. */
+export async function verifyCodexProjectBinding(
+  input: VerifyCodexBindingInput,
+): Promise<{ binding: CodexProjectBinding; userId: string }> {
+  const runtime = await resolveCodexRuntimeCredential(input);
+  if (!runtime) {
+    throw new CodexBindingError(
+      "missing_runtime_credential",
+      "Project binding or its protected user credential is missing",
+    );
+  }
+  const endpoint = validatedUrl("MemoryCore endpoint", input.endpoint);
+  const userId = await validateCodexBindingScope({
+    binding: runtime.binding,
+    userKey: runtime.userKey,
+    endpoint,
+    authUrl: validatedUrl("Auth URL", input.authUrl ?? endpoint),
+    serviceToken: required("Service token", input.serviceToken),
+    timeoutMs: validatedTimeout(input.timeoutMs),
+    fetcher: input.fetcher ?? globalThis.fetch.bind(globalThis),
+  });
+  return { binding: runtime.binding, userId };
+}
+
+async function validateCodexBindingScope(input: {
+  binding: CodexProjectBinding;
+  userKey: string;
+  endpoint: string;
+  authUrl: string;
+  serviceToken: string;
+  timeoutMs: number;
+  fetcher: typeof fetch;
+}): Promise<string> {
+  const verified = await verifyUserKeyWithConfig(
+    { url: input.authUrl, timeoutMs: input.timeoutMs, serviceToken: input.serviceToken },
+    input.userKey,
+    input.binding.service_id,
+    input.fetcher,
+  );
+  if (verified.rejected || !verified.userId) {
+    throw wrapAuthenticationError(verified.rejectReason);
+  }
+  const metadata = new MetadataClient(
+    {
+      endpoint: input.endpoint,
+      serviceToken: input.serviceToken,
+      timeoutMs: input.timeoutMs,
+    },
+    input.binding.service_id,
+    input.userKey,
+    input.fetcher,
+  );
+  let teams;
+  try {
+    teams = await metadata.listTeams(verified.userId);
+  } catch (error) {
+    throw wrapValidationError("Team", error);
+  }
+  assertMetadataEntities("Team", teams, ["team_id"]);
+  if (!teams.some((team) => team.team_id === input.binding.team_id)) {
+    throw new CodexBindingError(
+      "invalid_team",
+      `Team '${input.binding.team_id}' is missing or unauthorized for the verified user`,
+    );
+  }
+  let agents;
+  let tasks;
+  try {
+    [agents, tasks] = await Promise.all([
+      metadata.listAgents(input.binding.team_id, verified.userId),
+      metadata.listTasks(input.binding.team_id),
+    ]);
+  } catch (error) {
+    throw wrapValidationError("Agent/Task scope", error);
+  }
+  assertMetadataEntities("Agent", agents, ["agent_id", "team_id"]);
+  assertMetadataEntities("Task", tasks, ["task_id", "team_id"]);
+  if (!agents.some((agent) => (
+    agent.agent_id === input.binding.agent_id && agent.team_id === input.binding.team_id
+  ))) {
+    throw new CodexBindingError(
+      "invalid_agent",
+      `Agent '${input.binding.agent_id}' is missing or unauthorized for Team '${input.binding.team_id}'`,
+    );
+  }
+  if (!tasks.some((task) => (
+    task.task_id === input.binding.task_id && task.team_id === input.binding.team_id
+  ))) {
+    throw new CodexBindingError(
+      "invalid_task",
+      `Task '${input.binding.task_id}' is missing or unauthorized for Team '${input.binding.team_id}'`,
+    );
+  }
+  return verified.userId;
 }
 
 /** Used by doctor checks without ever exposing the stored credential. */

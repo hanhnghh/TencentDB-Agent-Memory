@@ -1,5 +1,19 @@
 # TencentDB Agent Memory for Codex
 
+Install this plugin from the package marketplace with
+`tdai-codex-memory install` (or `npm run codex -- install` from the source
+package). Installation prints the SHA-256 of these hook definitions but does
+not claim they are trusted. Install starts a managed hooks-only sidecar using
+`MEMORY_CORE_SERVICE_TOKEN` from the environment. Review the hooks in Codex
+with `/hooks`, then run `tdai-codex-memory trust --hooks-sha <reviewed-sha256>`
+and verify all lifecycle, live binding, MemoryCore, and outbox checks with
+`tdai-codex-memory doctor`.
+
+Writable SQLite/outbox state lives in the protected user-level plugin data
+directory, never in this plugin root. Uninstall stops the managed sidecar and
+retains that durable data by
+default and prints its location; `uninstall --purge-data` deletes it explicitly.
+
 This plugin sends documented `SessionStart`, `UserPromptSubmit`, `PostToolUse`,
 `Stop`, and `SessionEnd` events to the loopback Agent Memory sidecar. Codex
 continues to use its own subscription transport; lifecycle hooks only prepare

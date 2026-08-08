@@ -1,14 +1,18 @@
-import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:http";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 
 import { CODEX_HOOK_CONTEXT_LIMITS } from "../hook-service.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = join(here, "../../../plugins/tencentdb-agent-memory");
+const marketplaceRoot = join(pluginRoot, "../..");
+const execFileAsync = promisify(execFile);
 
 describe("Codex plugin hook package", () => {
   it("declares the completed-round lifecycle through one thin executable", async () => {
@@ -21,6 +25,9 @@ describe("Codex plugin hook package", () => {
     expect(manifest).toMatchObject({
       name: "tencentdb-agent-memory",
       version: "0.1.0",
+      interface: {
+        defaultPrompt: ["Use Agent Memory context for this project."],
+      },
     });
     expect(manifest).not.toHaveProperty("hooks");
     expect(hooks).toMatchObject({
@@ -41,6 +48,53 @@ describe("Codex plugin hook package", () => {
     const serialized = JSON.stringify(hooks);
     expect(serialized.match(/memory-hook\.mjs/g)).toHaveLength(5);
     expect(serialized).toContain("PLUGIN_ROOT");
+  });
+
+  it("is available from a valid local marketplace package", async () => {
+    const marketplace: unknown = JSON.parse(await readFile(
+      join(marketplaceRoot, ".agents", "plugins", "marketplace.json"),
+      "utf8",
+    ));
+
+    expect(marketplace).toEqual({
+      name: "tencentdb-agent-memory",
+      interface: { displayName: "TencentDB Agent Memory" },
+      plugins: [{
+        name: "tencentdb-agent-memory",
+        source: { source: "local", path: "./plugins/tencentdb-agent-memory" },
+        policy: { installation: "AVAILABLE", authentication: "ON_INSTALL" },
+        category: "Productivity",
+      }],
+    });
+  });
+
+  it("packs the marketplace, plugin, and executable without local secrets or runtime state", async () => {
+    const cacheDir = await mkdtemp(join(tmpdir(), "codex-package-cache-"));
+    try {
+      const { stdout } = await execFileAsync("npm", [
+        "pack",
+        "--dry-run",
+        "--json",
+        "--cache",
+        cacheDir,
+      ], { cwd: marketplaceRoot });
+      const report: unknown = JSON.parse(stdout);
+      expect(report).toEqual(expect.arrayContaining([expect.objectContaining({
+        files: expect.arrayContaining([
+          expect.objectContaining({ path: ".agents/plugins/marketplace.json" }),
+          expect.objectContaining({
+            path: "plugins/tencentdb-agent-memory/.codex-plugin/plugin.json",
+          }),
+          expect.objectContaining({
+            path: "plugins/tencentdb-agent-memory/hooks.json",
+          }),
+          expect.objectContaining({ path: "scripts/tdai-codex-memory.mjs", mode: 0o755 }),
+        ]),
+      })]));
+      expect(stdout).not.toMatch(/(?:credentials\.json|config\.yaml|\.db(?:-wal|-shm)?|\.env)/);
+    } finally {
+      await rm(cacheDir, { recursive: true, force: true });
+    }
   });
 
   it.each([

@@ -35,6 +35,37 @@ function harness(overrides: Partial<CodexBindingCliDependencies> = {}) {
     })),
     doctor: vi.fn(async () => ({ ok: true, checks: [] })),
     unbind: vi.fn(async () => ({ removed: true, credentialRemoved: false })),
+    install: vi.fn(async () => ({
+      installed: true as const,
+      enabled: true,
+      trusted: false,
+      version: "0.2.0",
+      dataPath: "/user/data",
+      sidecarRunning: true,
+      review: {
+        hooksSha256: "a".repeat(64),
+        instruction: "Review with /hooks",
+      },
+    })),
+    upgrade: vi.fn(async () => ({
+      installed: true as const,
+      enabled: true,
+      trusted: false,
+      version: "0.2.0",
+      dataPath: "/user/data",
+      sidecarRunning: true,
+      review: {
+        hooksSha256: "b".repeat(64),
+        instruction: "Review with /hooks",
+      },
+    })),
+    trust: vi.fn(async (input) => ({ trusted: true as const, hooksSha256: input.hooksSha256 })),
+    uninstallIntegration: vi.fn(async () => ({
+      removed: true,
+      dataDisposition: "retained" as const,
+      dataPath: "/user/data",
+    })),
+    sidecar: vi.fn(async () => undefined),
     manage: vi.fn(async (input) => ({
       message: `${input.operation} completed`,
       data: { operation: input.operation },
@@ -134,6 +165,85 @@ describe("Codex binding CLI", () => {
     expect(h.dependencies.status).toHaveBeenCalledTimes(1);
     expect(h.dependencies.doctor).toHaveBeenCalledTimes(1);
     expect(h.dependencies.unbind).toHaveBeenCalledTimes(1);
+  });
+
+  it("installs and upgrades without claiming hooks are trusted", async () => {
+    const h = harness();
+
+    expect(await runCodexBindingCli([
+      "install",
+      "--marketplace-root", "/package path with spaces",
+      "--user-config-dir", "/user state",
+    ], h.io, {}, h.dependencies)).toBe(0);
+    expect(await runCodexBindingCli([
+      "upgrade",
+      "--marketplace-root", "/package path with spaces",
+      "--user-config-dir", "/user state",
+    ], h.io, {}, h.dependencies)).toBe(0);
+
+    expect(h.dependencies.install).toHaveBeenCalledWith({
+      marketplaceRoot: "/package path with spaces",
+      userConfigDir: "/user state",
+    });
+    expect(h.output.join("\n")).toContain("NOT TRUSTED");
+    expect(h.output.join("\n")).toContain("/hooks");
+  });
+
+  it("records only the exact reviewed hook digest", async () => {
+    const h = harness();
+    const digest = "c".repeat(64);
+
+    expect(await runCodexBindingCli([
+      "trust",
+      "--hooks-sha", digest,
+      "--user-config-dir", "/user state",
+    ], h.io, {}, h.dependencies)).toBe(0);
+
+    expect(h.dependencies.trust).toHaveBeenCalledWith({
+      hooksSha256: digest,
+      userConfigDir: "/user state",
+    });
+    expect(h.output.join("\n")).toContain(digest);
+  });
+
+  it("states whether uninstall retained or purged durable user data", async () => {
+    const retained = harness();
+    expect(await runCodexBindingCli([
+      "uninstall", "--user-config-dir", "/user state",
+    ], retained.io, {}, retained.dependencies)).toBe(0);
+    expect(retained.output.join("\n")).toContain("retained");
+    expect(retained.output.join("\n")).toContain("/user/data");
+
+    const purged = harness({
+      uninstallIntegration: vi.fn(async () => ({
+        removed: true,
+        dataDisposition: "purged" as const,
+        dataPath: "/user/data",
+      })),
+    });
+    expect(await runCodexBindingCli([
+      "uninstall", "--user-config-dir", "/user state", "--purge-data",
+    ], purged.io, {}, purged.dependencies)).toBe(0);
+    expect(purged.dependencies.uninstallIntegration).toHaveBeenCalledWith({
+      purgeData: true,
+      userConfigDir: "/user state",
+    });
+    expect(purged.output.join("\n")).toContain("purged");
+  });
+
+  it("starts the installed sidecar with protected state and hooks-only configuration", async () => {
+    const h = harness();
+
+    expect(await runCodexBindingCli([
+      "sidecar",
+      "--config", "/config path/config.yaml",
+      "--user-config-dir", "/user state",
+    ], h.io, {}, h.dependencies)).toBe(0);
+
+    expect(h.dependencies.sidecar).toHaveBeenCalledWith({
+      configFile: "/config path/config.yaml",
+      userConfigDir: "/user state",
+    });
   });
 
   it.each([

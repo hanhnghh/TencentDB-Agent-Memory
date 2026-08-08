@@ -12,6 +12,8 @@
     "developerName": "TencentDB Agent Memory contributors",
     "category": "Productivity",
     "capabilities": ["Session memory", "Prompt recall"],
-    "defaultPrompt": "Use Agent Memory context for this project."
+    "defaultPrompt": [
+      "Use Agent Memory context for this project."
+    ]
   }
 }

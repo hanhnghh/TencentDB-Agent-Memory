@@ -7,7 +7,6 @@ import {
 
 import {
   bindCodexProject,
-  doctorCodexBinding,
   getCodexBindingStatus,
   unbindCodexProject,
   type BindCodexProjectInput,
@@ -18,6 +17,23 @@ import {
   type UnbindCodexProjectInput,
   type UnbindCodexProjectResult,
 } from "./binding.js";
+import {
+  doctorCodexIntegration,
+  installCodexIntegration,
+  recordCodexHookTrust,
+  uninstallCodexIntegration,
+  upgradeCodexIntegration,
+  type CodexInstallInput,
+  type CodexInstallResult,
+  type DoctorCodexIntegrationInput,
+  type RecordCodexHookTrustInput,
+  type UninstallCodexIntegrationInput,
+  type UninstallCodexIntegrationResult,
+} from "./installation.js";
+import {
+  runInstalledCodexSidecar,
+  type StartInstalledCodexSidecarInput,
+} from "./sidecar.js";
 
 export interface CodexBindingCliIo {
   stdout(line: string): void;
@@ -27,16 +43,28 @@ export interface CodexBindingCliIo {
 export interface CodexBindingCliDependencies {
   bind(input: BindCodexProjectInput): Promise<BindCodexProjectResult>;
   status(input: CodexBindingPaths): Promise<CodexBindingStatus>;
-  doctor(input: CodexBindingPaths): Promise<CodexBindingDiagnosis>;
+  doctor(input: DoctorCodexIntegrationInput): Promise<CodexBindingDiagnosis>;
   unbind(input: UnbindCodexProjectInput): Promise<UnbindCodexProjectResult>;
+  install(input: CodexInstallInput): Promise<CodexInstallResult>;
+  upgrade(input: CodexInstallInput): Promise<CodexInstallResult>;
+  trust(input: RecordCodexHookTrustInput): Promise<{ trusted: true; hooksSha256: string }>;
+  uninstallIntegration(
+    input: UninstallCodexIntegrationInput,
+  ): Promise<UninstallCodexIntegrationResult>;
+  sidecar(input: StartInstalledCodexSidecarInput): Promise<void>;
   manage(input: CodexManagementInput): Promise<CodexManagementResult>;
 }
 
 const defaultDependencies: CodexBindingCliDependencies = {
   bind: bindCodexProject,
   status: getCodexBindingStatus,
-  doctor: doctorCodexBinding,
+  doctor: doctorCodexIntegration,
   unbind: unbindCodexProject,
+  install: installCodexIntegration,
+  upgrade: upgradeCodexIntegration,
+  trust: recordCodexHookTrust,
+  uninstallIntegration: uninstallCodexIntegration,
+  sidecar: runInstalledCodexSidecar,
   manage: executeCodexManagement,
 };
 
@@ -52,12 +80,15 @@ interface ParsedOptions {
   flags: Set<string>;
 }
 
-const BOOLEAN_FLAGS = new Set(["forget-credential", "help"]);
+const BOOLEAN_FLAGS = new Set(["forget-credential", "help", "purge-data"]);
 const VALUE_OPTIONS = new Set([
   "agent-id",
   "auth-url",
   "endpoint",
+  "hooks-sha",
+  "marketplace-root",
   "content-file",
+  "config",
   "name",
   "project",
   "reason",
@@ -135,6 +166,11 @@ function usage(): string {
     "Usage: npm run codex -- <command> [options]",
     "",
     "Commands:",
+    "  install         Install the plugin and prepare protected sidecar state",
+    "  upgrade         Reinstall the package and re-check hook trust",
+    "  trust           Record the exact hook SHA-256 reviewed with /hooks",
+    "  uninstall       Remove lifecycle hooks; retain durable data by default",
+    "  sidecar         Run the hooks-only sidecar with protected writable state",
     "  bind            Validate and store a Codex project binding",
     "  unbind          Remove the project binding",
     "  status          Show local binding status",
@@ -156,6 +192,10 @@ function usage(): string {
     "Common options:",
     "  --project <path>  Project root (defaults to current directory)",
     "  --user-config-dir <path>  Protected credential root (must be outside the project)",
+    "  --marketplace-root <path>  Package marketplace root (install/upgrade)",
+    "  --hooks-sha <sha256>  Exact digest shown after reviewing /hooks",
+    "  --purge-data  Delete durable sidecar data during uninstall",
+    "  --config <path>  Sidecar YAML config (defaults to config.yaml)",
     "",
     "Management options:",
     "  --session-id <id>  Active Codex session (or CODEX_SESSION_ID)",
@@ -214,6 +254,79 @@ export async function runCodexBindingCli(
   }
 
   try {
+    if (command === "install" || command === "upgrade") {
+      const marketplaceRoot = options.values.get("marketplace-root");
+      const projectDir = options.values.get("project");
+      const userConfigDir = options.values.get("user-config-dir");
+      const configFile = options.values.get("config");
+      const input: CodexInstallInput = {
+        ...(marketplaceRoot ? { marketplaceRoot } : {}),
+        ...(projectDir ? { projectDir } : {}),
+        ...(userConfigDir ? { userConfigDir } : {}),
+        ...(configFile ? { configFile } : {}),
+      };
+      const result = command === "install"
+        ? await dependencies.install(input)
+        : await dependencies.upgrade(input);
+      io.stdout(
+        `${command === "install" ? "Installed" : "Upgraded"} Agent Memory ${result.version}; ` +
+        `plugin is ${result.enabled ? "enabled" : "disabled"} and hooks are ` +
+        `${result.trusted ? "TRUSTED" : "NOT TRUSTED"}.`,
+      );
+      io.stdout(`Hook SHA-256: ${result.review.hooksSha256}`);
+      io.stdout(result.review.instruction);
+      io.stdout(`Protected sidecar data: ${result.dataPath}`);
+      io.stdout("Managed sidecar is running.");
+      return 0;
+    }
+
+    if (command === "trust") {
+      const result = await dependencies.trust({
+        hooksSha256: requiredOption(options, "hooks-sha", env),
+        ...(options.values.get("project")
+          ? { projectDir: options.values.get("project") }
+          : {}),
+        ...(options.values.get("user-config-dir")
+          ? { userConfigDir: options.values.get("user-config-dir") }
+          : {}),
+      });
+      io.stdout(`Recorded reviewed hook SHA-256 ${result.hooksSha256}.`);
+      return 0;
+    }
+
+    if (command === "uninstall") {
+      const result = await dependencies.uninstallIntegration({
+        ...(options.values.get("project")
+          ? { projectDir: options.values.get("project") }
+          : {}),
+        ...(options.values.get("user-config-dir")
+          ? { userConfigDir: options.values.get("user-config-dir") }
+          : {}),
+        ...(options.flags.has("purge-data") ? { purgeData: true } : {}),
+      });
+      io.stdout(result.removed
+        ? "Codex lifecycle integration removed."
+        : "Codex lifecycle integration was not installed.");
+      io.stdout(
+        result.dataDisposition === "purged"
+          ? `Durable sidecar data purged from ${result.dataPath}.`
+          : `Durable sidecar data retained at ${result.dataPath}.`,
+      );
+      return 0;
+    }
+
+    if (command === "sidecar") {
+      const configFile = options.values.get("config");
+      const projectDir = options.values.get("project");
+      const userConfigDir = options.values.get("user-config-dir");
+      await dependencies.sidecar({
+        ...(configFile ? { configFile } : {}),
+        ...(projectDir ? { projectDir } : {}),
+        ...(userConfigDir ? { userConfigDir } : {}),
+      });
+      return 0;
+    }
+
     if (command === "bind") {
       const endpoint = requiredOption(options, "endpoint", env, "MEMORY_CORE_ENDPOINT");
       const result = await dependencies.bind({
@@ -243,7 +356,13 @@ export async function runCodexBindingCli(
     }
 
     if (command === "doctor") {
-      const diagnosis = await dependencies.doctor(paths(options));
+      const diagnosis = await dependencies.doctor({
+        ...paths(options),
+        env,
+        ...(options.values.get("sidecar-url")
+          ? { sidecarUrl: options.values.get("sidecar-url") }
+          : {}),
+      });
       for (const check of diagnosis.checks) {
         io.stdout(`${check.status.toUpperCase()} ${check.name}: ${check.message}`);
       }

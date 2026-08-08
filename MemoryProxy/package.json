@@ -3,6 +3,20 @@
   "version": "0.1.0",
   "description": "Lightweight LLM request forwarding proxy with JSONL logging and Opik tracing",
   "type": "module",
+  "bin": {
+    "tdai-codex-memory": "scripts/tdai-codex-memory.mjs"
+  },
+  "files": [
+    "config.example.yaml",
+    ".agents/plugins/marketplace.json",
+    "plugins/tencentdb-agent-memory",
+    "README.md",
+    "README_CN.md",
+    "scripts/tdai-codex-memory.mjs",
+    "src",
+    "!src/**/__tests__/**",
+    "!src/**/*.test.ts"
+  ],
   "scripts": {
     "start": "node --import tsx/esm src/index.ts",
     "start:config": "node --import tsx/esm src/index.ts --config config.yaml",
@@ -27,13 +41,13 @@
     "hono": "^4.7.10",
     "ioredis": "^5.11.1",
     "js-yaml": "^4.1.0",
-    "node-pty": "^1.1.0"
+    "node-pty": "^1.1.0",
+    "tsx": "^4.19.4"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.15.29",
-    "tsx": "^4.19.4",
     "typescript": "^5.8.3",
     "vitest": "^3.2.2"
   }

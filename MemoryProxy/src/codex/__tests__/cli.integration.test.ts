@@ -43,6 +43,20 @@ async function runCli(
   );
 }
 
+async function runCliAllowFailure(
+  args: string[],
+  env: NodeJS.ProcessEnv = {},
+): Promise<{ stdout: string; stderr: string; failed: boolean }> {
+  try {
+    return { ...(await runCli(args, env)), failed: false };
+  } catch (error: unknown) {
+    if (!error || typeof error !== "object") throw error;
+    const stdout = "stdout" in error && typeof error.stdout === "string" ? error.stdout : "";
+    const stderr = "stderr" in error && typeof error.stderr === "string" ? error.stderr : "";
+    return { stdout, stderr, failed: true };
+  }
+}
+
 async function seedLocalBinding(projectDir: string, userConfigDir: string): Promise<void> {
   const projectPath = join(projectDir, PROJECT_BINDING_RELATIVE_PATH);
   const credentialPath = resolveCredentialPath(userConfigDir);
@@ -159,18 +173,33 @@ describe("Codex binding executable CLI", () => {
     expect(output.stdout).not.toContain("stored-user-key-secret");
   });
 
-  it("runs doctor locally without model or network interaction", async () => {
+  it("runs the complete doctor without a model and reports inactive lifecycle components", async () => {
     const dirs = await setup();
     await seedLocalBinding(dirs.projectDir, dirs.userConfigDir);
 
-    const output = await runCli([
+    const output = await runCliAllowFailure([
       "doctor",
       "--project", dirs.projectDir,
       "--user-config-dir", dirs.userConfigDir,
     ], { MEMORY_CORE_ENDPOINT: "http://127.0.0.1:1" });
 
+    expect(output.failed).toBe(true);
     expect(output.stdout).toContain("PASS project_binding");
+    expect(output.stdout).toContain("FAIL plugin_installed");
+    expect(output.stdout).toContain("FAIL sidecar_reachable");
     expect(output.stdout).not.toContain("stored-user-key-secret");
+  });
+
+  it("ships an executable package entrypoint for lifecycle commands", async () => {
+    const output = await execFileAsync(process.execPath, [
+      "scripts/tdai-codex-memory.mjs",
+      "help",
+    ], { cwd: packageRoot, env: process.env });
+
+    expect(output.stdout).toContain("install");
+    expect(output.stdout).toContain("sidecar");
+    expect(output.stdout).toContain("trust");
+    expect(output.stdout).toContain("uninstall");
   });
 
   it("runs unbind locally without model or network interaction", async () => {

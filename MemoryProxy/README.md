@@ -81,6 +81,72 @@ Skills and Knowledge follow the same idea:
 
 ## Quick start
 
+### Install, trust, and diagnose the Codex integration
+
+From `MemoryProxy`, install dependencies and register the packaged local
+marketplace/plugin:
+
+```bash
+npm install
+export MEMORY_CORE_ENDPOINT=http://127.0.0.1:8420
+export MEMORY_CORE_SERVICE_TOKEN=service-token-from-deployment-config
+npm run codex -- install --config config.yaml
+```
+
+The install command uses argument arrays, so repository and package paths may
+contain spaces. It creates protected writable sidecar state under
+`$XDG_CONFIG_HOME/tencentdb-agent-memory/codex/plugin-data/data` (or
+`~/.config/tencentdb-agent-memory/codex/plugin-data/data`) and never writes runtime state
+into the immutable plugin package. Installation reports the exact SHA-256 of
+`hooks.json`, deliberately reports the hooks as **NOT TRUSTED**, and starts a
+managed hooks-only sidecar. The service token is inherited from the environment
+and is never copied into project files, installation state, process arguments,
+or diagnostic output.
+
+Open Codex, use `/hooks` to review the installed definitions, then record the
+exact digest printed by install:
+
+```bash
+npm run codex -- trust --hooks-sha <reviewed-sha256>
+```
+
+Install and upgrade manage the sidecar lifecycle. For foreground debugging,
+stop the managed installation first and run this command manually; it forces
+`hooks` mode and places both the proxy database and durable outbox in the
+protected data directory:
+
+```bash
+npm run codex -- sidecar --config config.yaml
+```
+
+After binding the project as shown below, run the complete diagnostic:
+
+```bash
+npm run codex -- doctor
+```
+
+Doctor reports `plugin_installed`, `plugin_enabled`, `hooks_trusted`,
+`sidecar_reachable`, `project_binding`, `binding_valid`, `memory_core_reachable`, and
+`outbox_healthy` independently. It prints no stored key or service token. A
+package upgrade is explicit; if `hooks.json` changed, its digest no longer
+matches and trust returns to failed until the new definitions are reviewed:
+
+```bash
+npm run codex -- upgrade
+```
+
+Uninstall first drains/stops the managed sidecar, then removes the Codex plugin
+and stops new lifecycle hook delivery. Durable sidecar data is retained and its path is printed. Use
+`--purge-data` only when that database should be deleted; project binding and
+protected credentials remain until `unbind` (optionally
+`unbind --forget-credential`) is run.
+
+```bash
+npm run codex -- uninstall
+# or, to permanently delete the local durable database:
+npm run codex -- uninstall --purge-data
+```
+
 ### Codex project binding
 
 Codex uses a project-local, non-secret Team/Agent/Task binding. The bind command
@@ -111,8 +177,9 @@ configuration directory (`$XDG_CONFIG_HOME/tencentdb-agent-memory/codex`, or
 mode `0600`; a credential directory inside the bound project is rejected.
 Credentials are accepted from environment variables rather than command-line
 options so they are not exposed in shell history or process arguments. `unbind
---forget-credential` also removes the key for that Memory service. Status,
-doctor, and unbind are local operations and never invoke a model.
+--forget-credential` also removes the key for that Memory service. Status and
+unbind are local operations; doctor revalidates the stored IDs with MemoryCore
+but never invokes a model.
 
 These credentials have separate roles: `MEMORY_HUB_USER_KEY` authorizes the
 user binding and `MEMORY_CORE_SERVICE_TOKEN` authenticates the local integration
@@ -198,9 +265,10 @@ Codex does not expose every hosted or specialized tool through `PostToolUse`.
 Those events are intentionally omitted; the integration does not infer them
 from `transcript_path` or claim exact tool visibility on unsupported paths. If
 the sidecar is unavailable during `UserPromptSubmit`, `PostToolUse`, or `Stop`,
-the executable exits unsuccessfully instead of acknowledging an unpersisted write. Plugin
-installation/trust automation is delivered by the separate packaging workflow;
-hook definitions must be reviewed before use.
+the executable exits unsuccessfully instead of acknowledging an unpersisted
+write. The install flow above never treats plugin installation as hook trust;
+review the active definitions with `/hooks` and record their exact digest before
+relying on lifecycle capture.
 
 ### 1. Install dependencies
 

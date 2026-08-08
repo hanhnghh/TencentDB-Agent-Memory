@@ -1,0 +1,7 @@
+src/**/__tests__/
+src/**/*.test.ts
+config.yaml
+*.db
+*.db-shm
+*.db-wal
+*.log

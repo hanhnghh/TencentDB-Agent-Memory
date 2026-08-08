@@ -463,8 +463,9 @@ describe("validated Codex project binding", () => {
       mkdir(projectDir),
       mkdir(userConfigDir, { mode: 0o700 }),
     ]);
+    await mkdir(`${credentialPath}.lock`, { mode: 0o700 });
     await writeFile(
-      `${credentialPath}.lock`,
+      join(`${credentialPath}.lock`, "owner.json"),
       `${JSON.stringify({ pid: 2_147_483_647, token: "abandoned" })}\n`,
       { mode: 0o600 },
     );
