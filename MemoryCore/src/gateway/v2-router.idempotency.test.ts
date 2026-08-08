@@ -1,7 +1,8 @@
+import type http from "node:http";
 import { describe, expect, it, vi } from "vitest";
 
 import type { IMemoryStore, L0IngestionInput, L0IngestionReceipt } from "../core/store/types.js";
-import { handleConversationAdd, type V2RouterDeps } from "./v2-router.js";
+import { handleConversationAdd, handleV2Route, type V2RouterDeps } from "./v2-router.js";
 import { conversationAddDataSchema } from "./v2-schemas.js";
 
 const auth = { serviceId: "memory-1" };
@@ -275,6 +276,45 @@ describe("conversation/add ingestion receipts", () => {
     }, auth, "req-receipt-storage-failure", deps);
 
     expect(response).toMatchObject({ code: 503, data: { retryable: true } });
+    expect(notifyPipeline).not.toHaveBeenCalled();
+  });
+
+  it("returns an error response when durable receipt lookup throws", async () => {
+    const notifyPipeline = vi.fn(async () => undefined);
+    const deps = makeDeps({
+      upsertL0: vi.fn(() => true),
+      getL0IngestionReceipt: vi.fn(async () => {
+        throw new Error("storage credentials leaked only to server logs");
+      }),
+      commitL0Ingestion: vi.fn(async () => ({ status: "failed" })),
+    } as Partial<IMemoryStore>);
+    deps.notifyPipeline = notifyPipeline;
+    const request = {
+      headers: {
+        authorization: "Bearer test-key",
+        "x-tdai-service-id": "memory-1",
+      },
+    } as http.IncomingMessage;
+    const response = {} as http.ServerResponse;
+    const sendJson = vi.fn();
+
+    const handled = await handleV2Route(
+      request,
+      response,
+      "/v2/conversation/add",
+      "POST",
+      async () => ({
+        session_id: "session-1",
+        source_event_id: "event-storage-throw",
+        messages: [{ role: "user", content: "must not be accepted" }],
+      }),
+      sendJson,
+      deps,
+    );
+
+    expect(handled).toBe(true);
+    expect(sendJson).toHaveBeenCalledWith(response, 500, expect.objectContaining({ code: 500 }));
+    expect(JSON.stringify(sendJson.mock.calls[0][2])).not.toContain("storage credentials");
     expect(notifyPipeline).not.toHaveBeenCalled();
   });
 });
