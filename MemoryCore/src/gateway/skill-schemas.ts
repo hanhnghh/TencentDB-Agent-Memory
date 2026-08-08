@@ -213,13 +213,16 @@ export const extractRequestSchema = z.object({
  * 强约束（对齐 `docs/design/2026-07-15-skill-trigger-in-core-design.md` §11.1 & §13）：
  *   - session_id / user_id / team_id / agent_id 必填
  *   - 上述 4 个 ID 字段都不能包含 `|`（跟 Redis 队列元素分隔符冲突）
- *   - `space_id` 可选：跟其他 skill 接口对齐, 从 `x-tdai-service-id` header 得到
- *     (`auth.serviceId`); body 里传了也接受, handler 优先 body、缺省回落 auth
+ *   - `space_id` 可选：缺省使用 `x-tdai-service-id` 对应的 `auth.serviceId`；
+ *     显式提供时必须与认证实例一致，避免存储与 session lock 使用不同 scope
  *   - messages 非空; 每条 role 合法; tool_call/tool_result 必须带 tool_name + tool_call_id
+ *   - source_event_id / content_hash 可选；用于 exactly-once receipt/replay
  *   - 单次 messages 数量最多 500（防单请求过大, 上层还有字节兜底）
  */
 export const conversationAddRequestSchema = z.object({
   session_id: z.string().min(1).refine((v) => !v.includes("|"), "session_id must not contain '|'"),
+  source_event_id: z.string().min(1).max(256).optional(),
+  content_hash: z.string().min(1).max(256).optional(),
   space_id: z.string().min(1)
     .refine((v) => !v.includes("|"), "space_id must not contain '|'")
     .optional(),

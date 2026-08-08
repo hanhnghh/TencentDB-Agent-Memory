@@ -1293,6 +1293,7 @@ export async function handleChatCompletions(
       assistantMessage,
       protocol: "openai",
       assetCapabilities,
+      turnSequence: lf.turnSeq,
     });
   } else {
     logExtractionSkipped(config, "skill", sessionKey);
@@ -1660,6 +1661,7 @@ function createUsageTapTransform(ctx: TapContext): TransformStream<Uint8Array, U
         protocol: "openai",
         assetCapabilities: ctx.assetCapabilities,
         toolCallCountOverride: toolCallAccumulators.size,
+        turnSequence: ctx.lf.turnSeq,
       });
     } else {
       logExtractionSkipped(ctx.config, "skill", ctx.sessionKeyForSkill);

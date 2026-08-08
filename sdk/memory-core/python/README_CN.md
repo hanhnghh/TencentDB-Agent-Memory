@@ -128,6 +128,35 @@ asyncio.run(main())
 | Offload | `offload_compact()` | `POST /v3/offload/compact` |
 | Offload | `offload_query_mmd()` | `POST /v3/offload/query-mmd` |
 
+## Skill 对话的幂等写入
+
+`SkillClient.conversation_add()` 及其异步版本支持可选的
+`source_event_id` 和 `content_hash`。重试同一个已完成轮次时应复用稳定的事件
+ID。内容完全相同的重放会返回原来的持久化 `receipt`；同一事件 ID 携带不同
+内容时会抛出 `TDAMError`，其中 `kind == "conflict"`、
+`retryable is False`。网络错误、超时、限流和服务端错误会以可重试的类型化
+错误暴露给调用方。
+
+```python
+from tencentdb_agent_memory.v3 import SkillClient
+
+skills = SkillClient(
+    endpoint="http://127.0.0.1:8420",
+    api_key="your-user-key",
+    service_id="your-memory-instance-id",
+)
+result = skills.conversation_add(
+    session_id="sess-1",
+    source_event_id="stop:sess-1:turn-7",
+    content_hash="sha256:...",
+    user_id="usr-1",
+    team_id="team-1",
+    agent_id="agent-1",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(result["receipt"]["receipt_id"])
+```
+
 ### v2（兼容）
 
 > v2 的 L0/L1 不强制 `session_id`，隔离仅基于 `(team_id, user_id, agent_id)` 三元组。

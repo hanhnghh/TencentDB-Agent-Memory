@@ -81,6 +81,35 @@ v3 数据面差异要点：
 | L3 | `writeCore()` | `POST /v3/core/write` |
 | L3 | `countCore()` | `POST /v3/core/count` |
 
+## Duplicate-safe skill conversation ingestion
+
+`SkillClient.conversationAdd()` accepts optional `source_event_id` and
+`content_hash` fields. Reuse a stable event ID when retrying one completed
+round. An exact replay returns the original durable `receipt`; the same event
+ID with changed content raises `TDAMError` with `kind === "conflict"` and
+`retryable === false`. Network failures, timeouts, throttling, and server
+failures are exposed as typed retryable errors.
+
+```typescript
+import { SkillClient } from "@tencentdb-agent-memory/memory-sdk-ts-v2";
+
+const skills = new SkillClient({
+  endpoint: "http://127.0.0.1:8420",
+  apiKey: "your-user-key",
+  serviceId: "your-memory-instance-id",
+});
+const result = await skills.conversationAdd({
+  session_id: "sess-1",
+  source_event_id: "stop:sess-1:turn-7",
+  content_hash: "sha256:...",
+  user_id: "usr-1",
+  team_id: "team-1",
+  agent_id: "agent-1",
+  messages: [{ role: "user", content: "Hello" }],
+});
+console.log(result.receipt.receipt_id);
+```
+
 ## MetadataClient (v3 management plane)
 
 `MetadataClient` wraps the gateway's v3 metadata management endpoints

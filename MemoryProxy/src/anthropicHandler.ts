@@ -1446,6 +1446,7 @@ export async function handleAnthropicMessages(
       assistantMessage,
       protocol: "anthropic",
       assetCapabilities,
+      turnSequence: lf.turnSeq,
     });
   } else if (isMainDialog) {
     logExtractionSkipped(config, "skill", sessionKey);
@@ -1807,6 +1808,7 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
           protocol: "anthropic",
           assetCapabilities: ctx.assetCapabilities,
           toolCallCountOverride: toolUseCount,
+          turnSequence: ctx.lf.turnSeq,
         });
       } else if (isMainDialog) {
         logExtractionSkipped(ctx.config, "skill", ctx.sessionKeyForSkill);

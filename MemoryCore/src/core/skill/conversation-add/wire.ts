@@ -16,6 +16,7 @@ import type { StorageAdapter } from "../../storage/adapter.js";
 import type { ISkillExtractor, ExtractorLogger } from "../queue/types.js";
 
 import { SkillBufferStorage } from "./buffer-storage.js";
+import type { SessionKey } from "./buffer-storage.js";
 import {
   LocalSkillAgentTaskQueue,
   RedisSkillAgentTaskQueue,
@@ -66,6 +67,8 @@ export interface WireConversationAddDeps {
   workerId?: string;
   extractLockTtlMs?: number;
   brpopBlockMs?: number;
+  sessionLockTtlMs?: number;
+  sessionLockWaitDeadlineMs?: number;
 
   /** COS 子路径（默认 "skill_buffer"） */
   bufferSubPath?: string;
@@ -86,6 +89,10 @@ export interface WiredConversationAdd {
   sink: SkillCandidatesSink;
   queue: ISkillAgentTaskQueue;
   buffer: SkillBufferStorage;
+  serializeSession<T>(
+    session: SessionKey,
+    fn: (assertOwned: () => Promise<void>) => Promise<T>,
+  ): Promise<T>;
   /** 结束时调 —— 关 worker */
   stop(): Promise<void>;
 }
@@ -115,12 +122,24 @@ export function wireConversationAdd(deps: WireConversationAddDeps): WiredConvers
   // [obs] SkillTriggerService / SkillConversationAddHandler 内部走 obsLogger 底座，
   // 不再需要注入 logger —— obsLogger 自带 FileLogger + 后端 + try/catch 降级。
   const trigger = new SkillTriggerService({ buffer, queue });
+  const serializeSession = <T>(
+    session: SessionKey,
+    fn: (assertOwned: () => Promise<void>) => Promise<T>,
+  ) => queue.withSessionMutex(
+    session,
+    {
+      lockTtlMs: deps.sessionLockTtlMs ?? 120_000,
+      waitDeadlineMs: deps.sessionLockWaitDeadlineMs ?? 120_000,
+    },
+    (lease) => fn(lease.assertOwned),
+  );
   const handler = new SkillConversationAddHandler({
     buffer,
     trigger,
     thresholds: deps.thresholds,
     compressOptions: deps.compressOptions,
     oversizeOptions: deps.oversizeOptions,
+    serialize: serializeSession,
   });
 
   const sink = new SkillCoreSink({
@@ -150,6 +169,7 @@ export function wireConversationAdd(deps: WireConversationAddDeps): WiredConvers
     sink,
     queue,
     buffer,
+    serializeSession,
     stop: async () => {
       if (worker) await worker.stop();
     },

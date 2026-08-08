@@ -25,22 +25,19 @@
  *   docs/design/2026-07-17-conversation-normalize.md。
  */
 
+import { createHash } from "node:crypto";
+
 import type { ProxyConfig } from "../types.js";
 import type { AssetCapabilityFlags } from "../injection/types.js";
+import { countHumanTurns } from "../turnSeq.js";
 import { getCoreSkillClient } from "./core-client.js";
 import {
   countToolCalls,
   findLastFinalAssistant,
   isFinalAnswer,
   normalizeConversation,
+  type RawMessage,
 } from "./normalize-conversation.js";
-
-/** loose message shape 供本模块内部用 */
-interface IncomingMsg {
-  role?: string;
-  content?: unknown;
-  tool_calls?: unknown[];
-}
 
 export interface TriggerInput {
   config: ProxyConfig;
@@ -65,6 +62,8 @@ export interface TriggerInput {
   assetCapabilities?: AssetCapabilityFlags;
   /** Optional override (e.g. SSE accumulators contain the truth in streaming mode). */
   toolCallCountOverride?: number;
+  /** Monotonic transport turn identity; survives visible-history compaction. */
+  turnSequence?: number;
 }
 
 export async function triggerSkillExtractIfReady(input: TriggerInput): Promise<void> {
@@ -73,14 +72,14 @@ export async function triggerSkillExtractIfReady(input: TriggerInput): Promise<v
     if (input.assetCapabilities?.skill === false) return;
     if (!sessionKey || !sessionInfo) return;
 
-    const userId = sessionInfo.user_id as string | undefined;
-    const teamId = sessionInfo.team_id as string | undefined;
-    const agentId = sessionInfo.agent_id as string | undefined;
+    const userId = readOptionalString(sessionInfo.user_id);
+    const teamId = readOptionalString(sessionInfo.team_id);
+    const agentId = readOptionalString(sessionInfo.agent_id);
     if (!userId || !teamId || !agentId) return;
 
     if (!config.coreSkill?.endpoint || !config.coreSkill?.serviceToken) return;
 
-    const spaceId = sessionInfo.space_id as string | undefined;
+    const spaceId = readOptionalString(sessionInfo.space_id);
     if (!spaceId) {
       console.warn(
         `[skill-conversation-add] skipped: no space_id on sessionInfo session=${sessionKey}`,
@@ -88,12 +87,11 @@ export async function triggerSkillExtractIfReady(input: TriggerInput): Promise<v
       return;
     }
 
-    const msgs: IncomingMsg[] = Array.isArray(inputMessages)
-      ? (inputMessages as IncomingMsg[])
+    const rawMsgs: RawMessage[] = Array.isArray(inputMessages)
+      ? inputMessages.filter(isRawMessage)
       : [];
-    const rawAsst = (assistantMessage as Record<string, unknown>) ?? {};
+    const rawAsst = assistantMessage ?? {};
     const hasAsst = Boolean(rawAsst && (rawAsst.role || rawAsst.content || rawAsst.tool_calls));
-    const rawMsgs = msgs as unknown[] as Array<Record<string, unknown>>;
 
     // ── round-level 触发 gate ──
     // 只有 final answer 才继续；含 tool_use / tool_calls 的中间态直接返回。
@@ -120,6 +118,24 @@ export async function triggerSkillExtractIfReady(input: TriggerInput): Promise<v
     );
     if (turnMessages.length === 0) return;
 
+    // Keep identity independent from content: an exact retry returns Core's
+    // original receipt, while changed content for the same turn conflicts.
+    const turnSequence = input.turnSequence !== undefined && input.turnSequence > 0
+      ? input.turnSequence
+      : countHumanTurns(rawMsgs, input.protocol);
+    const sourceEventId = `proxy:${sha256(JSON.stringify({
+      agent_source: input.agentSource,
+      protocol: input.protocol,
+      space_id: spaceId,
+      user_id: userId,
+      team_id: teamId,
+      agent_id: agentId,
+      task_id: readOptionalString(sessionInfo.task_id),
+      session_id: sessionKey,
+      turn_sequence: turnSequence,
+    }))}`;
+    const contentHash = `sha256:${sha256(JSON.stringify(turnMessages))}`;
+
     try {
       const client = getCoreSkillClient(config.coreSkill);
       const t0 = Date.now();
@@ -130,7 +146,9 @@ export async function triggerSkillExtractIfReady(input: TriggerInput): Promise<v
           user_id: userId,
           team_id: teamId,
           agent_id: agentId,
-          task_id: sessionInfo.task_id as string | undefined,
+          task_id: readOptionalString(sessionInfo.task_id),
+          source_event_id: sourceEventId,
+          content_hash: contentHash,
           messages: turnMessages,
         },
         // core Shark 走 x-tdai-service-id = 真实内核实例 ID
@@ -169,3 +187,15 @@ export async function triggerSkillExtractIfReady(input: TriggerInput): Promise<v
 
 // 兼容: 部分老代码从 handler-glue 里 import countToolCalls
 export { countToolCalls };
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function readOptionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function isRawMessage(value: unknown): value is RawMessage {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}

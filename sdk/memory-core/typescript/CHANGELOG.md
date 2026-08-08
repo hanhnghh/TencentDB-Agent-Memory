@@ -1,5 +1,13 @@
 # Changelog — @tencentdb-agent-memory/memory-sdk-ts
 
+## Unreleased — 2026-08-08
+
+### Added
+
+- `SkillClient.conversationAdd()` accepts optional `source_event_id` and
+  `content_hash`, returns a durable receipt, and exposes typed retry/conflict
+  classification through `TDAMError`.
+
 ## Unreleased — 2026-07-31
 
 ### Added

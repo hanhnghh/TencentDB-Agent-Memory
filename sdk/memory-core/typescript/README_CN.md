@@ -124,6 +124,34 @@ await client.addConversation({
 | L3 | `writeCore()` | `POST /v3/core/write` |
 | L3 | `countCore()` | `POST /v3/core/count` |
 
+## Skill 对话的幂等写入
+
+`SkillClient.conversationAdd()` 支持可选的 `source_event_id` 和
+`content_hash`。重试同一个已完成轮次时应复用稳定的事件 ID。内容完全相同的
+重放会返回原来的持久化 `receipt`；同一事件 ID 携带不同内容时会抛出
+`TDAMError`，其中 `kind === "conflict"`、`retryable === false`。网络错误、
+超时、限流和服务端错误会以可重试的类型化错误暴露给调用方。
+
+```typescript
+import { SkillClient } from "@tencentdb-agent-memory/memory-sdk-ts-v2";
+
+const skills = new SkillClient({
+  endpoint: "http://127.0.0.1:8420",
+  apiKey: "your-user-key",
+  serviceId: "your-memory-instance-id",
+});
+const result = await skills.conversationAdd({
+  session_id: "sess-1",
+  source_event_id: "stop:sess-1:turn-7",
+  content_hash: "sha256:...",
+  user_id: "usr-1",
+  team_id: "team-1",
+  agent_id: "agent-1",
+  messages: [{ role: "user", content: "Hello" }],
+});
+console.log(result.receipt.receipt_id);
+```
+
 ### v2 兼容数据面
 
 | 层级 | 方法 | 接口 |

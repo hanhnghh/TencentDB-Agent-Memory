@@ -21,7 +21,7 @@
  * locally without merging in defaults.
  */
 
-import { ParamError } from "../errors.js";
+import { ParamError, TDAMError } from "../errors.js";
 import { V3HttpTransport } from "./http.js";
 import type { Transport } from "../client.js";
 import type {
@@ -61,6 +61,38 @@ const V3 = "/v3/skill";
 
 function stripUndefined(obj: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isConversationAddData(value: unknown): value is SkillConversationAddData {
+  if (!isRecord(value) || (value.status !== "ok" && value.status !== "archived")) return false;
+  if (!isRecord(value.receipt)) return false;
+  if (typeof value.receipt.receipt_id !== "string" || value.receipt.receipt_id.length === 0) return false;
+  if (typeof value.receipt.content_hash !== "string" || value.receipt.content_hash.length === 0) return false;
+  if (typeof value.receipt.accepted_at_ms !== "number" || !Number.isFinite(value.receipt.accepted_at_ms)) {
+    return false;
+  }
+  if (value.receipt.source_event_id !== undefined && typeof value.receipt.source_event_id !== "string") {
+    return false;
+  }
+  if (value.status === "archived") {
+    if (!isRecord(value.archived)) return false;
+    if (typeof value.archived.task_id !== "string" || value.archived.task_id.length === 0) return false;
+    if (typeof value.archived.archive_key !== "string" || value.archived.archive_key.length === 0) return false;
+    if (typeof value.archived.archived_at_ms !== "number" || !Number.isFinite(value.archived.archived_at_ms)) {
+      return false;
+    }
+    if (typeof value.archived.reason !== "string" ||
+      !["tool_calls", "bytes", "compressed", "oversize"].includes(value.archived.reason)) {
+      return false;
+    }
+  } else if (value.archived !== undefined) {
+    return false;
+  }
+  return true;
 }
 
 function validateRequiredStrings(body: Record<string, unknown>, fields: string[], operation: string): void {
@@ -365,15 +397,18 @@ export class SkillClient {
    * merge in isolation defaults from the constructor (defaults are opt-in
    * per-call — callers pass ids explicitly). `space_id` follows the same
    * convention as `/extract`: optional, falls back to the transport's
-   * `x-tdai-service-id` header server-side.
+   * `x-tdai-service-id` header server-side. When provided it must match
+   * that authenticated service instance.
    *
    * Response `status` is `"ok"` for plain buffer-append or `"archived"`
    * when this call tripped a threshold and produced a skill-extract task.
    * See `docs/design/2026-07-15-skill-trigger-in-core-design.md` §11.1.
    */
-  conversationAdd(params: SkillConversationAddRequest): Promise<SkillConversationAddData> {
+  async conversationAdd(params: SkillConversationAddRequest): Promise<SkillConversationAddData> {
     const body = stripUndefined({
       session_id: params.session_id,
+      source_event_id: params.source_event_id,
+      content_hash: params.content_hash,
       space_id: params.space_id,
       user_id: params.user_id,
       team_id: params.team_id,
@@ -383,7 +418,17 @@ export class SkillClient {
     });
     validateRequiredStrings(body, ["session_id", "user_id", "team_id", "agent_id"], "conversationAdd");
     validateMessages(params.messages, "conversationAdd");
-    return this.http.post(`${V3}/conversation/add`, body);
+    const result: unknown = await this.http.post<unknown>(`${V3}/conversation/add`, body);
+    if (!isConversationAddData(result)) {
+      throw new TDAMError(
+        -1,
+        "conversationAdd returned an invalid success payload",
+        "",
+        undefined,
+        { kind: "invalid_response", retryable: false },
+      );
+    }
+    return result;
   }
 
   /**

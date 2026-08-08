@@ -30,7 +30,7 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 
 from .._http import Stub
 from .._v3_http import AsyncHttpStub, HttpStub
-from ..errors import ParamError
+from ..errors import ParamError, TDAMError
 
 _V3 = "/v3/skill"
 
@@ -41,6 +41,7 @@ SKILL_ERROR_CODE: Dict[str, int] = {
     "TEAM_MISMATCH": 40302,
     "NOT_FOUND": 40401,
     "VERSION_STALE": 40901,
+    "SOURCE_EVENT_CONFLICT": 40902,
     "VERSION_EXPIRED": 41002,
     "RESOURCE_TOO_LARGE": 41301,
     "QUOTA_EXCEEDED": 4291,
@@ -67,6 +68,46 @@ def _validate_extract(messages: List[Dict[str, Any]], isolation: Dict[str, Any])
     ]
     if missing:
         raise ParamError(f"extract requires non-empty {', '.join(missing)}")
+
+
+def _validate_conversation_add_result(result: Any) -> Dict[str, Any]:
+    valid = isinstance(result, dict) and result.get("status") in ("ok", "archived")
+    receipt = result.get("receipt") if isinstance(result, dict) else None
+    valid = valid and isinstance(receipt, dict)
+    if valid:
+        valid = (
+            isinstance(receipt.get("receipt_id"), str)
+            and bool(receipt["receipt_id"])
+            and isinstance(receipt.get("content_hash"), str)
+            and bool(receipt["content_hash"])
+            and isinstance(receipt.get("accepted_at_ms"), (int, float))
+            and not isinstance(receipt.get("accepted_at_ms"), bool)
+            and (
+                receipt.get("source_event_id") is None
+                or isinstance(receipt.get("source_event_id"), str)
+            )
+        )
+    if valid and result.get("status") == "archived":
+        archived = result.get("archived")
+        valid = (
+            isinstance(archived, dict)
+            and isinstance(archived.get("task_id"), str)
+            and bool(archived["task_id"])
+            and isinstance(archived.get("archive_key"), str)
+            and bool(archived["archive_key"])
+            and isinstance(archived.get("archived_at_ms"), (int, float))
+            and not isinstance(archived.get("archived_at_ms"), bool)
+            and archived.get("reason")
+            in ("tool_calls", "bytes", "compressed", "oversize")
+        )
+    if not valid:
+        raise TDAMError(
+            -1,
+            "conversation_add returned an invalid success payload",
+            kind="invalid_response",
+            retryable=False,
+        )
+    return result
 
 
 class _SkillDefaults:
@@ -494,6 +535,8 @@ class SkillClient:
         team_id: str,
         agent_id: str,
         messages: List[Dict[str, Any]],
+        source_event_id: Optional[str] = None,
+        content_hash: Optional[str] = None,
         space_id: Optional[str] = None,
         task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -506,19 +549,26 @@ class SkillClient:
         callers must pass isolation ids explicitly. Any ``|`` character
         in an id is rejected server-side (Redis queue separator).
 
-        ``space_id`` follows the same convention as :meth:`extract`:
-        optional, server falls back to ``auth.serviceId``. ``task_id``
-        is forwarded to ``archive.task.task_ref_id`` when this call
-        happens to trip an archive threshold.
+        ``space_id`` is optional and falls back to ``auth.serviceId``.
+        When provided it must match that authenticated service instance.
+        ``task_id`` is forwarded to ``archive.task.task_ref_id`` when this
+        call happens to trip an archive threshold.
+
+        ``source_event_id`` enables duplicate-safe retries. The optional
+        ``content_hash`` is echoed in the durable ``receipt``; replaying the
+        same event and content returns the original receipt, while changed
+        content raises :class:`TDAMError` with code ``40902``.
 
         Returns ``{status: "ok"|"archived", archived?: {task_id,
-        archived_at_ms, archive_key, reason}}``. ``reason`` ∈
+        archived_at_ms, archive_key, reason}, receipt: {...}}``. ``reason`` ∈
         ``{tool_calls, bytes, compressed, oversize}``. See
         ``docs/design/2026-07-15-skill-trigger-in-core-design.md`` §11.1
         for the trigger semantics.
         """
         body = _strip_none({
             "session_id": session_id,
+            "source_event_id": source_event_id,
+            "content_hash": content_hash,
             "space_id": space_id,
             "user_id": user_id,
             "team_id": team_id,
@@ -526,7 +576,8 @@ class SkillClient:
             "task_id": task_id,
             "messages": messages,
         })
-        return self._stub.post(f"{_V3}/conversation/add", body)
+        result = self._stub.post(f"{_V3}/conversation/add", body)
+        return _validate_conversation_add_result(result)
 
     def conversation_force_archive(
         self,
@@ -906,12 +957,16 @@ class AsyncSkillClient:
         team_id: str,
         agent_id: str,
         messages: List[Dict[str, Any]],
+        source_event_id: Optional[str] = None,
+        content_hash: Optional[str] = None,
         space_id: Optional[str] = None,
         task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """See :meth:`SkillClient.conversation_add` for the contract."""
         body = _strip_none({
             "session_id": session_id,
+            "source_event_id": source_event_id,
+            "content_hash": content_hash,
             "space_id": space_id,
             "user_id": user_id,
             "team_id": team_id,
@@ -919,7 +974,8 @@ class AsyncSkillClient:
             "task_id": task_id,
             "messages": messages,
         })
-        return await self._stub.post(f"{_V3}/conversation/add", body)
+        result = await self._stub.post(f"{_V3}/conversation/add", body)
+        return _validate_conversation_add_result(result)
 
     async def conversation_force_archive(
         self,

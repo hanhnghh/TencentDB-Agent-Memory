@@ -2,7 +2,19 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional
+from typing import Any, Literal, Mapping, Optional
+
+
+TDAMFailureKind = Literal[
+    "network",
+    "timeout",
+    "rate_limit",
+    "conflict",
+    "client",
+    "server",
+    "envelope",
+    "invalid_response",
+]
 
 
 class TDAMError(Exception):
@@ -12,6 +24,9 @@ class TDAMError(Exception):
     error — used by /v3/skill/* endpoints to hand back ``current_version``
     (40901 SKILL_VERSION_STALE) or ``latest_version`` (41002
     SKILL_VERSION_EXPIRED) so the caller can retry / upgrade cleanly.
+
+    ``kind`` and ``retryable`` provide stable retry-layer classification;
+    ``http_status`` preserves the transport status when one was received.
     """
 
     def __init__(
@@ -20,12 +35,19 @@ class TDAMError(Exception):
         message: str,
         request_id: str = "",
         details: Optional[Mapping[str, Any]] = None,
+        *,
+        kind: TDAMFailureKind = "envelope",
+        retryable: bool = False,
+        http_status: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.code = code
         self.message = message
         self.request_id = request_id
         self.details = dict(details) if details else None
+        self.kind = kind
+        self.retryable = retryable
+        self.http_status = http_status
 
     def __str__(self) -> str:
         if self.request_id:

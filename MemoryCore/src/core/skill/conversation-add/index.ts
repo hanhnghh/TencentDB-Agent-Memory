@@ -30,6 +30,10 @@ export {
   type SkillTaskEntry,
   type AgentTasksDoc,
   type BufferedMessages,
+  type ConversationReceipt,
+  type ConversationSessionState,
+  type StoredConversationAddResult,
+  type StoredConversationEvent,
 } from "./buffer-storage.js";
 
 export {
@@ -40,12 +44,14 @@ export {
   type ISkillAgentTaskQueue,
   type RedisLike as SkillAgentTaskQueueRedisLike,
   type ExtractLockHandle,
+  type SessionMutexLease,
 } from "./agent-task-queue.js";
 
 export {
   SkillTriggerService,
   type SkillTriggerServiceOptions,
   type TriggerArchiveInput,
+  type TriggerArchivePlan,
   type TriggerArchiveResult,
 } from "./trigger-service.js";
 

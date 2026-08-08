@@ -58,7 +58,7 @@ export interface NormalizedMessage {
 }
 
 /** raw message shape - loose 因为两种协议的原始形态都要能塞进来。 */
-interface RawMessage {
+export interface RawMessage {
   role?: string;
   content?: unknown;
   tool_calls?: unknown[];
