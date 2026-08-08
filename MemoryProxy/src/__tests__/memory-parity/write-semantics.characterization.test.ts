@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { DEFAULT_CONFIG } from "../../config.js";
+import { createApp } from "../../server.js";
+import {
+  __resetSessionStoreForTests,
+  getSessionStore,
+} from "../../session/store.js";
 import type { ProxyConfig } from "../../types.js";
 import { CoreSkillClient, setCoreSkillClient } from "../../skill/core-client.js";
 import { triggerSkillExtractIfReady } from "../../skill/handler-glue.js";
@@ -10,7 +16,10 @@ import {
   COMPLETED_ROUND_GOLDEN,
   FINAL_ASSISTANT,
   INTERMEDIATE_ASSISTANT,
+  PARITY_AGENT,
   PARITY_IDENTITY,
+  PARITY_SESSION_INFO,
+  PARITY_TASK,
   PROXY_ROUND_INPUTS,
   USER_PROMPT,
 } from "./fixtures.js";
@@ -25,9 +34,153 @@ const tdaiIdentity: TdaiIdentity = {
 
 afterEach(() => {
   setCoreSkillClient(null);
+  __resetSessionStoreForTests();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("memory parity: observed legacy intermediate L0 behavior", () => {
+  it("keeps the proxy route's intermediate L0 write separate from completed-round skill ingestion", async () => {
+    const config = structuredClone(DEFAULT_CONFIG);
+    config.upstream = {
+      url: "http://upstream.fixture/v1/messages",
+      apiKey: "",
+      agents: {},
+    };
+    config.rateLimit = { tpm: 0, qpm: 0 };
+    config.creditReport.url = "http://credit.fixture/report";
+    config.sessionInit.enabled = true;
+    config.tdai = {
+      enabled: true,
+      endpoint: "http://memory.fixture",
+      apiKey: "service-token",
+      serviceId: "configured-space",
+      memory: {
+        enabled: true,
+        inject: false,
+        writeL0: true,
+        recallL1: false,
+        injectL2L3: false,
+        l1Limit: 5,
+        l2Limit: 3,
+        timeoutMs: 1_000,
+      },
+    };
+    config.coreSkill = {
+      endpoint: "http://core.fixture",
+      serviceToken: "fixture-token",
+      serviceId: "fixture-service",
+      timeoutMs: 1_000,
+    };
+
+    await getSessionStore().set(
+      `${PARITY_IDENTITY.agentSource}:${PARITY_IDENTITY.sessionId}`,
+      {
+        status: "initialized",
+        keyId: `${PARITY_IDENTITY.agentSource}:${PARITY_IDENTITY.sessionId}`,
+        startedAt: 1,
+        attemptCount: 0,
+        userId: PARITY_IDENTITY.userId,
+        sessionInfo: PARITY_SESSION_INFO,
+        agentDetail: PARITY_AGENT,
+        taskDetail: PARITY_TASK,
+      },
+    );
+
+    const l0Requests: Array<Record<string, unknown>> = [];
+    const skillRequests: Array<Record<string, unknown>> = [];
+    const intermediateBody = {
+      id: "message-intermediate",
+      type: "message",
+      role: "assistant",
+      content: [
+        { type: "text", text: INTERMEDIATE_ASSISTANT },
+        {
+          type: "tool_use",
+          id: "tool-1",
+          name: "shell",
+          input: { cmd: "printf 'xin chào'" },
+        },
+      ],
+      model: "fixture-model",
+      stop_reason: "tool_use",
+      stop_sequence: null,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url === config.upstream.url) {
+        return new Response(JSON.stringify(intermediateBody), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url === config.creditReport.url) {
+        return new Response(JSON.stringify({ code: 0 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.endsWith("/v3/meta/config/user/get")) {
+        return new Response(JSON.stringify({ code: 0, data: { items: [] } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.endsWith("/v3/skill/conversation/add")) {
+        skillRequests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return new Response(JSON.stringify({ code: 0, data: { status: "ok" } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.endsWith("/v3/conversation/add")) {
+        l0Requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return new Response(JSON.stringify({ code: 0, data: {} }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error(`unexpected fixture URL: ${url}`);
+    }));
+
+    const app = createApp(config);
+    const response = await app.request(
+      `/claude-code/${PARITY_IDENTITY.spaceId}/v1/messages`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "client-key",
+          "x-conversation-id": PARITY_IDENTITY.sessionId,
+          "x-user-id": PARITY_IDENTITY.userId,
+        },
+        body: JSON.stringify({
+          model: "fixture-model",
+          max_tokens: 128,
+          stream: false,
+          messages: [PROXY_ROUND_INPUTS[0].messages[1]],
+        }),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual(intermediateBody);
+    await vi.waitFor(() => expect(l0Requests).toHaveLength(1));
+    expect(l0Requests[0]).toMatchObject({
+      team_id: PARITY_IDENTITY.teamId,
+      user_id: PARITY_IDENTITY.userId,
+      agent_id: PARITY_IDENTITY.agentId,
+      session_id: PARITY_IDENTITY.sessionId,
+      task_id: PARITY_IDENTITY.taskId,
+      messages: [
+        { role: "user", content: USER_PROMPT },
+        { role: "assistant", content: INTERMEDIATE_ASSISTANT },
+      ],
+    });
+    expect(skillRequests).toHaveLength(0);
+  });
+
   it("records each proxy HTTP response independently, including an intermediate tool-loop response", async () => {
     const writes: Array<{ identity: TdaiIdentity; messages: TdaiMessage[] }> = [];
     const client = {

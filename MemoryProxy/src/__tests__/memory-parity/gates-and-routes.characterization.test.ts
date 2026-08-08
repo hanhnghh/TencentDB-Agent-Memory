@@ -111,6 +111,17 @@ describe("memory parity: existing proxy and bridge routes", () => {
   }
 
   it("keeps health and both proxy protocols available with client-key passthrough", async () => {
+    const openAiRequest = {
+      model: "fixture-model",
+      stream: false,
+      messages: [{ role: "user", content: "hello" }],
+    };
+    const anthropicRequest = {
+      model: "fixture-model",
+      max_tokens: 128,
+      stream: false,
+      messages: [{ role: "user", content: "hello" }],
+    };
     const openAiBody = {
       id: "response-1",
       object: "chat.completion",
@@ -148,11 +159,7 @@ describe("memory parity: existing proxy and bridge routes", () => {
         authorization: "Bearer client-key",
         "content-type": "application/json",
       },
-      body: JSON.stringify({
-        model: "fixture-model",
-        stream: false,
-        messages: [{ role: "user", content: "hello" }],
-      }),
+      body: JSON.stringify(openAiRequest),
     });
 
     expect(response.status).toBe(200);
@@ -164,12 +171,7 @@ describe("memory parity: existing proxy and bridge routes", () => {
         "x-api-key": "client-key",
         "content-type": "application/json",
       },
-      body: JSON.stringify({
-        model: "fixture-model",
-        max_tokens: 128,
-        stream: false,
-        messages: [{ role: "user", content: "hello" }],
-      }),
+      body: JSON.stringify(anthropicRequest),
     });
 
     expect(anthropicResponse.status).toBe(200);
@@ -182,14 +184,8 @@ describe("memory parity: existing proxy and bridge routes", () => {
     const [, anthropicInit] = upstreamCalls[1];
     expect(new Headers(openAiInit?.headers).get("authorization")).toBe("Bearer client-key");
     expect(new Headers(anthropicInit?.headers).get("x-api-key")).toBe("client-key");
-    expect(JSON.parse(String(openAiInit?.body))).toMatchObject({
-      model: "fixture-model",
-      messages: [{ role: "user", content: "hello" }],
-    });
-    expect(JSON.parse(String(anthropicInit?.body))).toMatchObject({
-      model: "fixture-model",
-      messages: [{ role: "user", content: "hello" }],
-    });
+    expect(JSON.parse(String(openAiInit?.body))).toEqual(openAiRequest);
+    expect(JSON.parse(String(anthropicInit?.body))).toEqual(anthropicRequest);
   });
 
   it("keeps bridge capability allowlists ahead of the proxy catch-all", async () => {
