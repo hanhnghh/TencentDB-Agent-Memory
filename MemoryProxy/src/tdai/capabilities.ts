@@ -19,6 +19,8 @@ interface FetchAssetCapabilitiesInput {
    * 多租户部署下，调用方应传从请求路径解析出的 spaceId。
    */
   serviceIdOverride?: string | null;
+  /** Injectable transport for deterministic adapters and tests. */
+  fetcher?: typeof fetch;
 }
 
 interface ConfigUserGetEnvelope {
@@ -61,7 +63,7 @@ export async function fetchAssetCapabilities(input: FetchAssetCapabilitiesInput)
     };
     if (input.userKey) headers["x-tdai-user-key"] = input.userKey;
 
-    const resp = await fetch(`${input.endpoint.replace(/\/+$/, "")}/v3/meta/config/user/get`, {
+    const resp = await (input.fetcher ?? fetch)(`${input.endpoint.replace(/\/+$/, "")}/v3/meta/config/user/get`, {
       method: "POST",
       headers,
       body: JSON.stringify({ user_id: userId, module: "asset_type" }),

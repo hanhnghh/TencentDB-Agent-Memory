@@ -14,7 +14,7 @@
  * successfully cached hookIds for diagnostics/tests.
  */
 
-import type { HookCacheRepo } from "../db/hookCacheRepo.js";
+import type { HookCacheEntry, HookCacheRepo } from "../db/hookCacheRepo.js";
 import type {
   ContextBlock,
   HookRegistry,
@@ -25,10 +25,13 @@ import type {
 export interface PrewarmOptions {
   /** Total timeout for the whole prewarm pass, in ms. Defaults to 20000. */
   totalTimeoutMs?: number;
+  /** Return fresh entries without persisting the legacy session-only cache key. */
+  persist?: boolean;
 }
 
 export interface PrewarmResult {
   cachedHookIds: string[];
+  entries: HookCacheEntry[];
   skipped: Array<{ hookId: string; reason: string }>;
   durationMs: number;
 }
@@ -81,6 +84,7 @@ export async function prewarmAll(
   const sessionId = input.sessionInfo.session_id;
   const totalBudget = opts.totalTimeoutMs ?? DEFAULT_TOTAL_TIMEOUT_MS;
   const cachedHookIds: string[] = [];
+  const entries: HookCacheEntry[] = [];
   const skipped: Array<{ hookId: string; reason: string }> = [];
 
   const all = registry.getAll();
@@ -90,7 +94,7 @@ export async function prewarmAll(
     console.log(
       `[hook-cache] prewarm session=${sessionId}: no hooks declared cacheStrategy, skipping`,
     );
-    return { cachedHookIds, skipped, durationMs: Date.now() - startedAt };
+    return { cachedHookIds, entries, skipped, durationMs: Date.now() - startedAt };
   }
 
   // Per-hook budget: shared total, but each individual call also caps at
@@ -133,10 +137,9 @@ export async function prewarmAll(
     console.warn(
       `[hook-cache] prewarm session=${sessionId}: global timeout ${totalBudget}ms exceeded`,
     );
-    return { cachedHookIds, skipped, durationMs: Date.now() - startedAt };
+    return { cachedHookIds, entries, skipped, durationMs: Date.now() - startedAt };
   }
 
-  const okEntries: Array<{ hookId: string; blocks: ContextBlock[] }> = [];
   for (const s of settled) {
     if (s.status !== "fulfilled") {
       // allSettled wrapped each task's catch already; this branch is unreachable
@@ -149,15 +152,15 @@ export async function prewarmAll(
       | { hookId: string; status: "skipped"; reason: string }
       | { hookId: string; status: "error"; reason: string };
     if (r.status === "ok") {
-      okEntries.push({ hookId: r.hookId, blocks: r.blocks });
+      entries.push({ hookId: r.hookId, blocks: r.blocks });
       cachedHookIds.push(r.hookId);
     } else {
       skipped.push({ hookId: r.hookId, reason: r.reason });
     }
   }
 
-  if (okEntries.length > 0) {
-    repo.putMany(input.spaceId ?? "", input.userId, input.agentSource, sessionId, okEntries);
+  if (opts.persist !== false && entries.length > 0) {
+    repo.putMany(input.spaceId ?? "", input.userId, input.agentSource, sessionId, entries);
   }
 
   const durationMs = Date.now() - startedAt;
@@ -170,5 +173,5 @@ export async function prewarmAll(
     }
   }
 
-  return { cachedHookIds, skipped, durationMs };
+  return { cachedHookIds, entries, skipped, durationMs };
 }

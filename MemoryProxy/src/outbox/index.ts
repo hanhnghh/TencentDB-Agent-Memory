@@ -32,6 +32,8 @@ export interface CompletedRound {
   identity: CompletedRoundIdentity;
   l0: { messages: TdaiMessage[] };
   skill: { messages: ConversationTurnMessage[] };
+  /** Omitted by legacy callers, which means both delivery channels are enabled. */
+  channels?: { l0: boolean; skill: boolean };
 }
 
 export interface L0RoundDelivery {
@@ -254,6 +256,7 @@ export class DurableRoundOutbox {
       identity: normalizedRound.identity,
       l0: normalizedRound.l0,
       skill: normalizedRound.skill,
+      channels: normalizedRound.channels,
     }));
     const logicalRoundKey = roundKey(normalizedRound.identity);
     const l0 = l0Delivery(normalizedRound);
@@ -466,13 +469,13 @@ export class DurableRoundOutbox {
   private async deliver(row: OutboxRow): Promise<"committed" | "retried" | "dead"> {
     try {
       const round = parseCompletedRound(row.payload_json);
-      if (row.l0_receipt_json === null) {
+      if (round.channels?.l0 !== false && row.l0_receipt_json === null) {
         const input = l0Delivery(round, row.l0_source_event_id, row.l0_content_hash);
         const receipt = await this.delivery.deliverL0(input);
         validateReceipt(receipt, input);
         this.saveReceipt(row.source_event_id, "l0_receipt_json", receipt);
       }
-      if (row.skill_receipt_json === null) {
+      if (round.channels?.skill !== false && row.skill_receipt_json === null) {
         const input = skillDelivery(round, row.skill_source_event_id, row.skill_content_hash);
         const receipt = await this.delivery.deliverSkill(input);
         validateReceipt(receipt, input);
@@ -656,6 +659,9 @@ function parseCompletedRound(value: unknown): CompletedRound {
       !Array.isArray(parsed.skill.messages) || parsed.skill.messages.length === 0) {
     throw new TypeError("Completed round deliveries must contain non-empty message arrays");
   }
+  const channels = parsed.channels === undefined
+    ? { l0: true, skill: true }
+    : parseDeliveryChannels(parsed.channels);
 
   const l0Messages: TdaiMessage[] = [];
   for (const message of parsed.l0.messages) {
@@ -673,8 +679,9 @@ function parseCompletedRound(value: unknown): CompletedRound {
         (message.tool_call_id !== undefined && typeof message.tool_call_id !== "string") ||
         (message.timestamp !== undefined && typeof message.timestamp !== "string" &&
           (typeof message.timestamp !== "number" || !Number.isFinite(message.timestamp))) ||
-        ((message.role === "tool_call" || message.role === "tool_result") &&
-          (!isNonEmptyString(message.tool_name) || !isNonEmptyString(message.tool_call_id)))) {
+        (message.role === "tool_call" &&
+          (!isNonEmptyString(message.tool_name) || !isNonEmptyString(message.tool_call_id))) ||
+        (message.role === "tool_result" && !isNonEmptyString(message.tool_call_id))) {
       throw new TypeError("Completed round contains an invalid skill message");
     }
     const normalized: ConversationTurnMessage = { role: message.role, content: message.content };
@@ -699,7 +706,18 @@ function parseCompletedRound(value: unknown): CompletedRound {
     identity: normalizedIdentity,
     l0: { messages: l0Messages },
     skill: { messages: skillMessages },
+    channels,
   };
+}
+
+function parseDeliveryChannels(value: unknown): { l0: boolean; skill: boolean } {
+  if (!isRecord(value) || typeof value.l0 !== "boolean" || typeof value.skill !== "boolean") {
+    throw new TypeError("Completed round delivery channels must be booleans");
+  }
+  if (!value.l0 && !value.skill) {
+    throw new TypeError("Completed round must enable at least one delivery channel");
+  }
+  return { l0: value.l0, skill: value.skill };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -99,6 +99,33 @@ function cachedHook(id: string, priority: number, content: string): InjectionHoo
 }
 
 describe("memory parity: prewarm, cache, and context order", () => {
+  it("can return fresh entries without persisting the legacy session-only cache key", async () => {
+    const registry = new HookRegistryImpl();
+    registry.register(cachedHook("memory", 100, "scoped-runtime-context"));
+    const cache = new InMemoryHookCacheRepo();
+
+    const result = await prewarmAll(registry, cache, {
+      keyId: `${PARITY_IDENTITY.agentSource}:${PARITY_IDENTITY.sessionId}`,
+      spaceId: PARITY_IDENTITY.spaceId,
+      userId: PARITY_IDENTITY.userId,
+      agentSource: PARITY_IDENTITY.agentSource,
+      sessionInfo: PARITY_SESSION_INFO,
+      agentDetail: PARITY_AGENT,
+      taskDetail: PARITY_TASK,
+    }, { persist: false });
+
+    expect(result.entries).toEqual([{
+      hookId: "memory",
+      blocks: [{ type: "text", content: "scoped-runtime-context" }],
+    }]);
+    await expect(cache.getAllForSession(
+      PARITY_IDENTITY.spaceId,
+      PARITY_IDENTITY.userId,
+      PARITY_IDENTITY.agentSource,
+      PARITY_IDENTITY.sessionId,
+    )).resolves.toEqual([]);
+  });
+
   it("prewarms by the persisted cache tuple and reuses blocks in deterministic order", async () => {
     const registry = new HookRegistryImpl();
     const memoryHook = cachedHook("memory", 100, "memory-context");

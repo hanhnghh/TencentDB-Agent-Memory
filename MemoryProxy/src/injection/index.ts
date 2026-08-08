@@ -415,7 +415,7 @@ export async function prewarmFromConfig(
   const bundle = getOrBuildBundle(config);
   // No persistence layer or no hooks declaring strategy → noop with empty result.
   if (!bundle.hookCacheRepo) {
-    return { cachedHookIds: [], skipped: [], durationMs: 0 };
+    return { cachedHookIds: [], entries: [], skipped: [], durationMs: 0 };
   }
   try {
     return await prewarmAll(bundle.registry, bundle.hookCacheRepo, input, opts);
@@ -424,7 +424,7 @@ export async function prewarmFromConfig(
       "[hook-cache] prewarmFromConfig swallowed error:",
       err instanceof Error ? err.message : String(err),
     );
-    return { cachedHookIds: [], skipped: [], durationMs: 0 };
+    return { cachedHookIds: [], entries: [], skipped: [], durationMs: 0 };
   }
 }
 

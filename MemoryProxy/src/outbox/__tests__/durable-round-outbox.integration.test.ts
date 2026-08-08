@@ -111,6 +111,9 @@ describe("durable completed-round outbox", () => {
     await expect(outbox.enqueue(round({
       l0: { messages: [{ role: "user", content: "different content" }] },
     }))).rejects.toBeInstanceOf(OutboxConflictError);
+    await expect(outbox.enqueue(round({
+      channels: { l0: true, skill: false },
+    }))).rejects.toBeInstanceOf(OutboxConflictError);
     expect((await outbox.health()).pendingCount).toBe(1);
     outbox.close();
   });
@@ -164,6 +167,32 @@ describe("durable completed-round outbox", () => {
     expect(new Set(l0Calls.map((input) => input.sourceEventId)).size).toBe(3);
     expect(skillCalls.every((input) => /^codex:outbox:[a-f0-9]{64}:skill$/.test(input.sourceEventId))).toBe(true);
     expect([...l0Calls, ...skillCalls].every((input) => /^sha256:[a-f0-9]{64}$/.test(input.contentHash))).toBe(true);
+    outbox.close();
+  });
+
+  it("delivers only the extraction channels selected by the runtime", async () => {
+    const dbPath = await outboxPath();
+    const port: RoundDeliveryPort = {
+      deliverL0: vi.fn(async (input) => receipt(input.sourceEventId, input.contentHash)),
+      deliverSkill: vi.fn(async (input) => receipt(input.sourceEventId, input.contentHash)),
+    };
+    const outbox = openDurableRoundOutbox({ dbPath, delivery: port });
+    await outbox.enqueue(round({ channels: { l0: true, skill: false } }));
+    await outbox.enqueue(round({
+      sourceEventId: "codex:session-2:turn-1",
+      identity: { ...round().identity, sessionId: "session-2" },
+      channels: { l0: false, skill: true },
+    }));
+
+    await expect(outbox.drainReady({ concurrency: 2 })).resolves.toEqual({
+      committed: 2,
+      retried: 0,
+      dead: 0,
+    });
+    expect(port.deliverL0).toHaveBeenCalledTimes(1);
+    expect(port.deliverSkill).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(port.deliverL0).mock.calls[0][0].identity.sessionId).toBe("session-1");
+    expect(vi.mocked(port.deliverSkill).mock.calls[0][0].identity.sessionId).toBe("session-2");
     outbox.close();
   });
 
