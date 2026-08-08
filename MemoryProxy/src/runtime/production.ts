@@ -39,6 +39,8 @@ export interface MemoryRuntimeAccess {
 export interface MemoryRuntimeProvider {
   forRequest(access: MemoryRuntimeAccess): MemoryRuntimeContract;
   health?(): Promise<OutboxHealth>;
+  /** Wake the durable worker without waiting for network delivery. */
+  signalDrain?(): void;
 }
 
 export interface ManagedMemoryRuntime {
@@ -63,6 +65,7 @@ export async function createMemoryRuntime(
 
   const provider: MemoryRuntimeProvider = {
     health: () => outbox.health(),
+    signalDrain: () => outbox.signal(),
     forRequest: ({ userKey, bindingCacheKey }) => {
       const configuredExtraction = new ConfigExtractionAdapter(config);
       const runtime = new MemoryRuntime(new ProductionMemoryRuntimeAdapters({

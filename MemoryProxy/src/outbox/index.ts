@@ -396,6 +396,14 @@ export class DurableRoundOutbox {
     this.pollTimer.unref?.();
   }
 
+  /** Wake the tracked worker for advisory lifecycle events without blocking the caller. */
+  signal(): void {
+    this.assertOpen();
+    void this.runWorker(2).catch((error: unknown) => {
+      this.workerErrorKind = safeErrorKind(error);
+    });
+  }
+
   async stop(): Promise<void> {
     if (this.pollTimer) {
       clearInterval(this.pollTimer);

@@ -1,6 +1,6 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 
-import { CodexHookService } from "./codex/hook-service.js";
+import { CodexHookService, type CodexHookResponse } from "./codex/hook-service.js";
 import type { CodexHookAccessResolver } from "./codex/hook-access.js";
 import type { CodexTurnStore } from "./codex/turn-store.js";
 import { RuntimeHealth, runtimeHealthStatusCode } from "./runtime/health.js";
@@ -39,29 +39,33 @@ export function createHookApp(
     const body = await health.snapshot();
     return c.json(body, runtimeHealthStatusCode(body));
   });
-  app.post("/hooks/session-start", async (c) => {
-    if (!hookService) return jsonResponse(503, { error: "hook_runtime_unavailable" });
-    let input: unknown;
-    try {
-      input = await c.req.json();
-    } catch {
-      return jsonResponse(400, { error: "invalid_json" });
-    }
-    const result = await hookService.sessionStart(input);
-    return jsonResponse(result.status, result.body);
-  });
-  app.post("/hooks/user-prompt-submit", async (c) => {
-    if (!hookService) return jsonResponse(503, { error: "hook_runtime_unavailable" });
-    let input: unknown;
-    try {
-      input = await c.req.json();
-    } catch {
-      return jsonResponse(400, { error: "invalid_json" });
-    }
-    const result = await hookService.userPromptSubmit(input);
-    return jsonResponse(result.status, result.body);
-  });
+  app.post("/hooks/session-start", (c) => dispatchHook(c, hookService, (service, input) =>
+    service.sessionStart(input)));
+  app.post("/hooks/user-prompt-submit", (c) => dispatchHook(c, hookService, (service, input) =>
+    service.userPromptSubmit(input)));
+  app.post("/hooks/post-tool-use", (c) => dispatchHook(c, hookService, (service, input) =>
+    service.postToolUse(input)));
+  app.post("/hooks/stop", (c) => dispatchHook(c, hookService, (service, input) =>
+    service.stop(input)));
+  app.post("/hooks/session-end", (c) => dispatchHook(c, hookService, (service, input) =>
+    service.sessionEnd(input)));
   return app;
+}
+
+async function dispatchHook(
+  context: Context,
+  service: CodexHookService | undefined,
+  handle: (service: CodexHookService, input: unknown) => Promise<CodexHookResponse>,
+): Promise<Response> {
+  if (!service) return jsonResponse(503, { error: "hook_runtime_unavailable" });
+  let input: unknown;
+  try {
+    input = await context.req.json();
+  } catch {
+    return jsonResponse(400, { error: "invalid_json" });
+  }
+  const result = await handle(service, input);
+  return jsonResponse(result.status, result.body);
 }
 
 function jsonResponse(status: number, body: unknown): Response {

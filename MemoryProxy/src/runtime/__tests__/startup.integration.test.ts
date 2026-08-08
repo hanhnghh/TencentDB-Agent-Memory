@@ -241,6 +241,18 @@ describe("mode-aware runtime startup", () => {
         },
         turnStore: {
           beginTurn: async () => ({ status: "persisted" }),
+          appendToolEvent: async () => ({ status: "persisted" }),
+          recordStop: async (input) => ({
+            status: "persisted",
+            committed: false,
+            round: {
+              identity: input.identity,
+              prompt: "prompt",
+              tools: [],
+              finalResponse: input.finalResponse,
+            },
+          }),
+          markCommitted: async () => ({ status: "committed" }),
           close: resourceClose,
         },
         close: resourceClose,

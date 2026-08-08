@@ -11,7 +11,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = join(here, "../../../plugins/tencentdb-agent-memory");
 
 describe("Codex plugin hook package", () => {
-  it("declares SessionStart and UserPromptSubmit through one thin executable", async () => {
+  it("declares the completed-round lifecycle through one thin executable", async () => {
     const manifest: unknown = JSON.parse(await readFile(
       join(pluginRoot, ".codex-plugin/plugin.json"),
       "utf8",
@@ -33,23 +33,74 @@ describe("Codex plugin hook package", () => {
           type: "command",
           additionalContextLimit: CODEX_HOOK_CONTEXT_LIMITS.UserPromptSubmit,
         }] }],
+        PostToolUse: [{ hooks: [{ type: "command" }] }],
+        Stop: [{ hooks: [{ type: "command" }] }],
+        SessionEnd: [{ hooks: [{ type: "command" }] }],
       },
     });
     const serialized = JSON.stringify(hooks);
-    expect(serialized.match(/memory-hook\.mjs/g)).toHaveLength(2);
+    expect(serialized.match(/memory-hook\.mjs/g)).toHaveLength(5);
     expect(serialized).toContain("PLUGIN_ROOT");
+  });
+
+  it.each([
+    ["PostToolUse", "/hooks/post-tool-use", {
+      model: "gpt-5",
+      permission_mode: "default",
+      tool_input: { cmd: "printf ok" },
+      tool_name: "exec_command",
+      tool_response: "ok",
+      tool_use_id: "call-1",
+    }],
+    ["Stop", "/hooks/stop", {
+      last_assistant_message: "done",
+      model: "gpt-5",
+      permission_mode: "default",
+      stop_hook_active: false,
+    }],
+    ["SessionEnd", "/hooks/session-end", {}],
+  ] as const)("forwards %s to its documented sidecar route", async (eventName, expectedPath, fields) => {
+    let requestPath = "";
+    const server = createServer((request, response) => {
+      requestPath = request.url ?? "";
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ suppressOutput: true }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server did not bind TCP");
+    try {
+      const result = await runExecutable(JSON.stringify({
+        cwd: "/workspace/project",
+        hook_event_name: eventName,
+        session_id: "session-1",
+        transcript_path: null,
+        turn_id: "turn-1",
+        ...fields,
+      }), `http://127.0.0.1:${address.port}`);
+
+      expect(result.code).toBe(0);
+      expect(requestPath).toBe(expectedPath);
+      expect(JSON.parse(result.stdout)).toEqual({ suppressOutput: true });
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => error ? reject(error) : resolve());
+      });
+    }
   });
 
   it("continues safely with valid empty hook output when the sidecar is unavailable", async () => {
     const input = JSON.stringify({
       cwd: "/workspace/project",
-      hook_event_name: "UserPromptSubmit",
+      hook_event_name: "SessionStart",
       model: "gpt-5",
       permission_mode: "default",
-      prompt: "private prompt must not reach diagnostics",
       session_id: "session-1",
+      source: "startup",
       transcript_path: null,
-      turn_id: "turn-1",
     });
     const result = await runExecutable(input);
 
@@ -59,6 +110,35 @@ describe("Codex plugin hook package", () => {
       systemMessage: "Agent Memory sidecar is unavailable; continuing without injected context.",
     });
     expect(result.stderr).not.toContain("private prompt");
+  });
+
+  it.each([
+    ["UserPromptSubmit", { prompt: "private prompt" }],
+    ["PostToolUse", {
+      tool_input: { cmd: "false" },
+      tool_name: "exec_command",
+      tool_response: "Process exited with code 1",
+      tool_use_id: "call-1",
+    }],
+    ["Stop", {
+      last_assistant_message: "private final response",
+      stop_hook_active: false,
+    }],
+  ] as const)("does not acknowledge unavailable durable %s delivery", async (eventName, fields) => {
+    const result = await runExecutable(JSON.stringify({
+      cwd: "/workspace/project",
+      hook_event_name: eventName,
+      model: "gpt-5",
+      permission_mode: "default",
+      session_id: "session-1",
+      transcript_path: null,
+      turn_id: "turn-1",
+      ...fields,
+    }));
+
+    expect(result.code).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).not.toContain("private");
   });
 
   it("rejects malformed success output from the sidecar before it reaches Codex", async () => {
@@ -82,13 +162,12 @@ describe("Codex plugin hook package", () => {
     try {
       const result = await runExecutable(JSON.stringify({
         cwd: "/workspace/project",
-        hook_event_name: "UserPromptSubmit",
+        hook_event_name: "SessionStart",
         model: "gpt-5",
         permission_mode: "default",
-        prompt: "private prompt",
         session_id: "session-1",
+        source: "startup",
         transcript_path: null,
-        turn_id: "turn-1",
       }), `http://127.0.0.1:${address.port}`);
 
       expect(JSON.parse(result.stdout)).toEqual({

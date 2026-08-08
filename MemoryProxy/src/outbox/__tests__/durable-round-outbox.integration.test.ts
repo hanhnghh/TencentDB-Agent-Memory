@@ -118,6 +118,26 @@ describe("durable completed-round outbox", () => {
     outbox.close();
   });
 
+  it("tracks an advisory drain signal so shutdown waits for its delivery", async () => {
+    const dbPath = await outboxPath();
+    const port: RoundDeliveryPort = {
+      deliverL0: vi.fn(async (input) => receipt(input.sourceEventId, input.contentHash)),
+      deliverSkill: vi.fn(async (input) => receipt(input.sourceEventId, input.contentHash)),
+    };
+    const outbox = openDurableRoundOutbox({ dbPath, delivery: port });
+    await outbox.enqueue(round());
+
+    outbox.signal();
+    await outbox.stop();
+
+    await expect(outbox.get("codex:session-1:turn-1")).resolves.toMatchObject({
+      state: "committed",
+    });
+    expect(port.deliverL0).toHaveBeenCalledOnce();
+    expect(port.deliverSkill).toHaveBeenCalledOnce();
+    outbox.close();
+  });
+
   it("delivers L0 then skill with stable receipts while preserving per-session order", async () => {
     const dbPath = await outboxPath();
     const firstSessionGate = deferred();

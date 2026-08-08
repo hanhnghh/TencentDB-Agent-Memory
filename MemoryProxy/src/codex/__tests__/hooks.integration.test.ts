@@ -1,3 +1,7 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it, vi } from "vitest";
 
 import { DEFAULT_CONFIG } from "../../config.js";
@@ -15,7 +19,7 @@ import {
   type CodexHookAccess,
   type CodexHookAccessResolver,
 } from "../hook-access.js";
-import type { CodexTurnStore } from "../turn-store.js";
+import { openDurableCodexTurnStore, type CodexTurnStore } from "../turn-store.js";
 
 const identity = {
   serviceId: "memory-1",
@@ -48,6 +52,18 @@ function resolver(result: CodexHookAccess = access): CodexHookAccessResolver {
 function turnStore(): CodexTurnStore {
   return {
     beginTurn: vi.fn(async () => ({ status: "persisted" as const })),
+    appendToolEvent: vi.fn(async () => ({ status: "persisted" as const })),
+    recordStop: vi.fn(async (input) => ({
+      status: "persisted" as const,
+      committed: false,
+      round: {
+        identity: input.identity,
+        prompt: "real prompt",
+        tools: [],
+        finalResponse: input.finalResponse,
+      },
+    })),
+    markCommitted: vi.fn(async () => ({ status: "committed" as const })),
     close: vi.fn(),
   };
 }
@@ -440,6 +456,470 @@ describe("Codex lifecycle hook contract", () => {
 
     expect(response.status).toBe(503);
     await expect(response.json()).resolves.toMatchObject({ error: "prompt_persistence_failed" });
+  });
+
+  it.each([
+    {
+      label: "failed local shell",
+      tool_name: "exec_command",
+      tool_use_id: "call-shell",
+      tool_input: { cmd: "false" },
+      tool_response: "Process exited with code 1\nFinal output:\n",
+      output: "Process exited with code 1\nFinal output:\n",
+      failed: true,
+    },
+    {
+      label: "apply patch",
+      tool_name: "apply_patch",
+      tool_use_id: "call-patch",
+      tool_input: { command: "*** Begin Patch\n*** End Patch" },
+      tool_response: "Done!",
+      output: "Done!",
+      failed: false,
+    },
+    {
+      label: "MCP tool",
+      tool_name: "mcp__filesystem__read_file",
+      tool_use_id: "call-mcp",
+      tool_input: { path: "/tmp/notes.txt" },
+      tool_response: {
+        content: [{ type: "text", text: "notes" }],
+        structuredContent: { bytes: 5 },
+      },
+      output: "{\"content\":[{\"text\":\"notes\",\"type\":\"text\"}],\"structuredContent\":{\"bytes\":5}}",
+      failed: false,
+    },
+  ])("durably records $label PostToolUse before acknowledgement", async (fixture) => {
+    const store = turnStore();
+    const app = createHookApp(config(), {
+      memoryRuntimeProvider: provider(runtimeWithContext()),
+      codexAccessResolver: resolver(),
+      codexTurnStore: store,
+    });
+
+    const response = await app.request("/hooks/post-tool-use", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        cwd: "/workspace/project",
+        hook_event_name: "PostToolUse",
+        model: "gpt-5",
+        permission_mode: "default",
+        session_id: "session-1",
+        transcript_path: null,
+        turn_id: "turn-7",
+        tool_name: fixture.tool_name,
+        tool_use_id: fixture.tool_use_id,
+        tool_input: fixture.tool_input,
+        tool_response: fixture.tool_response,
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(store.appendToolEvent).toHaveBeenCalledWith({
+      identity: { ...identity, turnId: "turn-7" },
+      toolUseId: fixture.tool_use_id,
+      toolName: fixture.tool_name,
+      input: fixture.tool_input,
+      output: fixture.output,
+      failed: fixture.failed,
+    });
+  });
+
+  it("sanitizes private tool input before durable persistence", async () => {
+    const store = turnStore();
+    const app = createHookApp(config(), {
+      memoryRuntimeProvider: provider(runtimeWithContext()),
+      codexAccessResolver: resolver(),
+      codexTurnStore: store,
+    });
+
+    const response = await app.request("/hooks/post-tool-use", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        cwd: "/workspace/project",
+        hook_event_name: "PostToolUse",
+        model: "gpt-5",
+        permission_mode: "default",
+        session_id: "session-1",
+        transcript_path: null,
+        turn_id: "turn-7",
+        tool_name: "mcp__example__search",
+        tool_use_id: "call-private-input",
+        tool_input: {
+          query: "visible user code",
+          context: [
+            { type: "text", text: "visible input evidence" },
+            { type: "image", data: "base64-private-image" },
+            { type: "thinking", thinking: "hidden reasoning" },
+            { role: "system", content: "hidden system instruction" },
+            {
+              type: "text",
+              text: '<agent_memory_context capture="exclude">private memory</agent_memory_context>',
+            },
+          ],
+        },
+        tool_response: "visible response",
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(store.appendToolEvent).toHaveBeenCalledWith({
+      identity: { ...identity, turnId: "turn-7" },
+      toolUseId: "call-private-input",
+      toolName: "mcp__example__search",
+      input: {
+        context: [{ text: "visible input evidence", type: "text" }],
+        query: "visible user code",
+      },
+      output: "visible response",
+      failed: false,
+    });
+  });
+
+  it("does not acknowledge PostToolUse when durable tool persistence fails", async () => {
+    const store = turnStore();
+    vi.mocked(store.appendToolEvent).mockRejectedValueOnce(new Error("disk full"));
+    const app = createHookApp(config(), {
+      memoryRuntimeProvider: provider(runtimeWithContext()),
+      codexAccessResolver: resolver(),
+      codexTurnStore: store,
+    });
+
+    const response = await app.request("/hooks/post-tool-use", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        cwd: "/workspace/project",
+        hook_event_name: "PostToolUse",
+        model: "gpt-5",
+        permission_mode: "default",
+        session_id: "session-1",
+        transcript_path: null,
+        turn_id: "turn-7",
+        tool_name: "exec_command",
+        tool_use_id: "call-1",
+        tool_input: { cmd: "pwd" },
+        tool_response: "/workspace",
+      }),
+    });
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({ error: "tool_persistence_failed" });
+  });
+
+  it.each([
+    ["agent_id", 42],
+    ["agent_type", false],
+  ] as const)("rejects malformed optional PostToolUse field %s", async (field, value) => {
+    const store = turnStore();
+    const app = createHookApp(config(), {
+      memoryRuntimeProvider: provider(runtimeWithContext()),
+      codexAccessResolver: resolver(),
+      codexTurnStore: store,
+    });
+
+    const response = await app.request("/hooks/post-tool-use", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        cwd: "/workspace/project",
+        hook_event_name: "PostToolUse",
+        model: "gpt-5",
+        permission_mode: "default",
+        session_id: "session-1",
+        transcript_path: null,
+        turn_id: "turn-7",
+        tool_name: "exec_command",
+        tool_use_id: "call-1",
+        tool_input: { cmd: "pwd" },
+        tool_response: "/workspace",
+        [field]: value,
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(store.appendToolEvent).not.toHaveBeenCalled();
+  });
+
+  it("commits one canonical completed round on Stop and suppresses repeated Stop", async () => {
+    const commitCompletedRound = vi.fn<MemoryRuntimeContract["commitCompletedRound"]>(async () => ({
+      status: "skipped",
+      sourceEventId: "codex:stop:test",
+      reason: "test",
+    }));
+    const runtime: MemoryRuntimeContract = {
+      prepareContext: vi.fn(),
+      commitCompletedRound,
+    };
+    const store = turnStore();
+    vi.mocked(store.recordStop).mockResolvedValue({
+      status: "persisted",
+      committed: false,
+      round: {
+        identity: { ...identity, turnId: "turn-7" },
+        prompt: "Giữ Unicode 🧠 và code:\n```ts\nconst café = true;\n```",
+        tools: [{
+          toolUseId: "call-shell",
+          toolName: "exec_command",
+          input: { cmd: "printf ok" },
+          output: "Chunk ID: 1\nProcess exited with code 0\nFinal output:\nok",
+          failed: false,
+        }],
+        finalResponse: "Đã hoàn thành.",
+      },
+    });
+    const app = createHookApp(config(), {
+      memoryRuntimeProvider: provider(runtime),
+      codexAccessResolver: resolver(),
+      codexTurnStore: store,
+    });
+    const body = {
+      cwd: "/workspace/project",
+      hook_event_name: "Stop",
+      last_assistant_message: "Đã hoàn thành.",
+      model: "gpt-5",
+      permission_mode: "default",
+      session_id: "session-1",
+      stop_hook_active: false,
+      transcript_path: "/private/transcript.jsonl",
+      turn_id: "turn-7",
+    };
+
+    expect((await app.request("/hooks/stop", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    })).status).toBe(200);
+    expect(commitCompletedRound).toHaveBeenCalledWith({
+      sourceEventId: expect.stringMatching(/^codex:stop:sha256:[a-f0-9]{64}$/),
+      identity: { ...identity, turnId: "turn-7" },
+      realPrompt: "Giữ Unicode 🧠 và code:\n```ts\nconst café = true;\n```",
+      events: [
+        {
+          type: "tool_call",
+          toolCallId: "call-shell",
+          toolName: "exec_command",
+          input: { cmd: "printf ok" },
+        },
+        {
+          type: "tool_result",
+          toolCallId: "call-shell",
+          content: "Chunk ID: 1\nProcess exited with code 0\nFinal output:\nok",
+          failed: false,
+        },
+      ],
+      finalResponse: "Đã hoàn thành.",
+    });
+    expect(store.markCommitted).toHaveBeenCalledWith({ ...identity, turnId: "turn-7" });
+
+    vi.mocked(store.recordStop).mockResolvedValueOnce({
+      status: "duplicate",
+      committed: true,
+      round: {
+        identity: { ...identity, turnId: "turn-7" },
+        prompt: "same",
+        tools: [],
+        finalResponse: "Đã hoàn thành.",
+      },
+    });
+    expect((await app.request("/hooks/stop", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    })).status).toBe(200);
+    expect(commitCompletedRound).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not acknowledge Stop when durable enqueue fails and retries on redelivery", async () => {
+    const commitCompletedRound = vi.fn<MemoryRuntimeContract["commitCompletedRound"]>()
+      .mockRejectedValueOnce(new Error("outbox unavailable"))
+      .mockResolvedValueOnce({
+        status: "skipped",
+        sourceEventId: "codex:stop:test",
+        reason: "test",
+      });
+    const store = turnStore();
+    const app = createHookApp(config(), {
+      memoryRuntimeProvider: provider({ prepareContext: vi.fn(), commitCompletedRound }),
+      codexAccessResolver: resolver(),
+      codexTurnStore: store,
+    });
+    const request = () => app.request("/hooks/stop", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        cwd: "/workspace/project",
+        hook_event_name: "Stop",
+        last_assistant_message: "final response",
+        model: "gpt-5",
+        permission_mode: "default",
+        session_id: "session-1",
+        stop_hook_active: false,
+        transcript_path: null,
+        turn_id: "turn-7",
+      }),
+    });
+
+    const failed = await request();
+    expect(failed.status).toBe(503);
+    expect(store.markCommitted).not.toHaveBeenCalled();
+    const retried = await request();
+    expect(retried.status).toBe(200);
+    expect(commitCompletedRound).toHaveBeenCalledTimes(2);
+    expect(store.markCommitted).toHaveBeenCalledTimes(1);
+  });
+
+  it("replays an incomplete prompt and tool loop after a sidecar restart", async () => {
+    const root = await mkdtemp(join(tmpdir(), "codex-hook-restart-"));
+    const dbPath = join(root, "turns.db");
+    const eventBase = {
+      cwd: "/workspace/project",
+      model: "gpt-5",
+      permission_mode: "default",
+      session_id: "session-1",
+      transcript_path: null,
+      turn_id: "turn-replay",
+    } as const;
+    try {
+      const beforeCrash = openDurableCodexTurnStore({ dbPath });
+      const firstApp = createHookApp(config(), {
+        memoryRuntimeProvider: provider(runtimeWithContext()),
+        codexAccessResolver: resolver(),
+        codexTurnStore: beforeCrash,
+      });
+      expect((await firstApp.request("/hooks/user-prompt-submit", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ...eventBase,
+          hook_event_name: "UserPromptSubmit",
+          prompt: "Preserve replay 🧠",
+        }),
+      })).status).toBe(200);
+      expect((await firstApp.request("/hooks/post-tool-use", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ...eventBase,
+          hook_event_name: "PostToolUse",
+          tool_name: "exec_command",
+          tool_use_id: "call-replay",
+          tool_input: { cmd: "printf replay" },
+          tool_response: "replay",
+        }),
+      })).status).toBe(200);
+      beforeCrash.close();
+
+      const commitCompletedRound = vi.fn<MemoryRuntimeContract["commitCompletedRound"]>(async () => ({
+        status: "skipped",
+        sourceEventId: "codex:stop:replay",
+        reason: "test",
+      }));
+      const afterRestart = openDurableCodexTurnStore({ dbPath });
+      const restartedApp = createHookApp(config(), {
+        memoryRuntimeProvider: provider({ prepareContext: vi.fn(), commitCompletedRound }),
+        codexAccessResolver: resolver(),
+        codexTurnStore: afterRestart,
+      });
+      expect((await restartedApp.request("/hooks/stop", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ...eventBase,
+          hook_event_name: "Stop",
+          last_assistant_message: "Replay completed.",
+          stop_hook_active: false,
+        }),
+      })).status).toBe(200);
+      expect(commitCompletedRound).toHaveBeenCalledWith(expect.objectContaining({
+        realPrompt: "Preserve replay 🧠",
+        events: [
+          {
+            type: "tool_call",
+            toolCallId: "call-replay",
+            toolName: "exec_command",
+            input: { cmd: "printf replay" },
+          },
+          {
+            type: "tool_result",
+            toolCallId: "call-replay",
+            content: "replay",
+            failed: false,
+          },
+        ],
+        finalResponse: "Replay completed.",
+      }));
+      afterRestart.close();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("treats SessionEnd as advisory and never uses it as a commit point", async () => {
+    const runtime: MemoryRuntimeContract = {
+      prepareContext: vi.fn(),
+      commitCompletedRound: vi.fn(),
+    };
+    const store = turnStore();
+    const signalDrain = vi.fn();
+    const memoryRuntimeProvider = { ...provider(runtime), signalDrain };
+    const app = createHookApp(config(), {
+      memoryRuntimeProvider,
+      codexAccessResolver: resolver(),
+      codexTurnStore: store,
+    });
+
+    const response = await app.request("/hooks/session-end", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        cwd: "/workspace/project",
+        hook_event_name: "SessionEnd",
+        session_id: "session-1",
+        transcript_path: "/private/transcript.jsonl",
+        turn_id: "turn-after-session",
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(signalDrain).toHaveBeenCalledOnce();
+    expect(runtime.commitCompletedRound).not.toHaveBeenCalled();
+    expect(store.recordStop).not.toHaveBeenCalled();
+  });
+
+  it("acknowledges a documented Stop without an assistant message without closing the round", async () => {
+    const runtime: MemoryRuntimeContract = {
+      prepareContext: vi.fn(),
+      commitCompletedRound: vi.fn(),
+    };
+    const store = turnStore();
+    const app = createHookApp(config(), {
+      memoryRuntimeProvider: provider(runtime),
+      codexAccessResolver: resolver(),
+      codexTurnStore: store,
+    });
+
+    const response = await app.request("/hooks/stop", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        cwd: "/workspace/project",
+        hook_event_name: "Stop",
+        last_assistant_message: null,
+        model: "gpt-5",
+        permission_mode: "default",
+        session_id: "session-1",
+        stop_hook_active: false,
+        transcript_path: null,
+        turn_id: "turn-empty",
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(store.recordStop).not.toHaveBeenCalled();
+    expect(runtime.commitCompletedRound).not.toHaveBeenCalled();
   });
 
   it("fails closed without leaking context when runtime ACL denies the read", async () => {

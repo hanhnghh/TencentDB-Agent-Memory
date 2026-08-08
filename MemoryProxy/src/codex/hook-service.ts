@@ -14,8 +14,15 @@ import {
 } from "./hook-access.js";
 import {
   CodexTurnConflictError,
+  type RecordCodexStopResult,
+  type CodexTurnIdentity,
   type CodexTurnStore,
 } from "./turn-store.js";
+import {
+  buildCodexCompletedRound,
+  normalizeCodexToolInput,
+  normalizeCodexToolResponse,
+} from "./round-normalizer.js";
 
 type SessionStartSource = "startup" | "resume" | "clear" | "compact";
 type PermissionMode = "default" | "acceptEdits" | "plan" | "dontAsk" | "bypassPermissions";
@@ -41,6 +48,42 @@ interface UserPromptSubmitHookInput {
   prompt: string;
   agent_id?: string;
   agent_type?: string;
+}
+
+interface PostToolUseHookInput {
+  cwd: string;
+  hook_event_name: "PostToolUse";
+  model: string;
+  permission_mode: PermissionMode;
+  session_id: string;
+  transcript_path: string | null;
+  turn_id: string;
+  tool_name: string;
+  tool_use_id: string;
+  tool_input: unknown;
+  tool_response: unknown;
+  agent_id?: string;
+  agent_type?: string;
+}
+
+interface StopHookInput {
+  cwd: string;
+  hook_event_name: "Stop";
+  last_assistant_message: string | null;
+  model: string;
+  permission_mode: PermissionMode;
+  session_id: string;
+  stop_hook_active: boolean;
+  transcript_path: string | null;
+  turn_id: string;
+}
+
+interface SessionEndHookInput {
+  cwd: string;
+  hook_event_name: "SessionEnd";
+  session_id: string;
+  transcript_path: string | null;
+  turn_id: string;
 }
 
 interface HookSpecificOutput {
@@ -91,6 +134,39 @@ const USER_PROMPT_SUBMIT_FIELDS = new Set([
   "model",
   "permission_mode",
   "prompt",
+  "session_id",
+  "transcript_path",
+  "turn_id",
+]);
+const POST_TOOL_USE_FIELDS = new Set([
+  "agent_id",
+  "agent_type",
+  "cwd",
+  "hook_event_name",
+  "model",
+  "permission_mode",
+  "session_id",
+  "tool_input",
+  "tool_name",
+  "tool_response",
+  "tool_use_id",
+  "transcript_path",
+  "turn_id",
+]);
+const STOP_FIELDS = new Set([
+  "cwd",
+  "hook_event_name",
+  "last_assistant_message",
+  "model",
+  "permission_mode",
+  "session_id",
+  "stop_hook_active",
+  "transcript_path",
+  "turn_id",
+]);
+const SESSION_END_FIELDS = new Set([
+  "cwd",
+  "hook_event_name",
   "session_id",
   "transcript_path",
   "turn_id",
@@ -207,6 +283,112 @@ export class CodexHookService {
       return runtimeFailure(cause, "UserPromptSubmit");
     }
   }
+
+  async postToolUse(raw: unknown): Promise<CodexHookResponse> {
+    let input: PostToolUseHookInput;
+    try {
+      input = parsePostToolUse(raw);
+    } catch {
+      return error(400, "invalid_post_tool_use");
+    }
+    // Thread-spawned subagents have their own turns and no root UserPromptSubmit.
+    // They are outside the completed human-round contract.
+    if (input.agent_id !== undefined || input.agent_type !== undefined) return acknowledged();
+    let access: CodexHookAccess;
+    try {
+      access = await this.options.accessResolver.resolve({
+        cwd: input.cwd,
+        sessionId: input.session_id,
+      });
+    } catch (cause: unknown) {
+      return bindingFailure(cause);
+    }
+    const result = normalizeCodexToolResponse(input.tool_response);
+    try {
+      await this.options.turnStore.appendToolEvent({
+        identity: turnIdentity(access, input.turn_id),
+        toolUseId: input.tool_use_id,
+        toolName: input.tool_name,
+        input: normalizeCodexToolInput(input.tool_input),
+        output: result.output,
+        failed: result.failed,
+      });
+      return acknowledged();
+    } catch (cause: unknown) {
+      return persistenceFailure(cause, "tool_persistence_failed");
+    }
+  }
+
+  async stop(raw: unknown): Promise<CodexHookResponse> {
+    let input: StopHookInput;
+    try {
+      input = parseStop(raw);
+    } catch {
+      return error(400, "invalid_stop");
+    }
+    let access: CodexHookAccess;
+    try {
+      access = await this.options.accessResolver.resolve({
+        cwd: input.cwd,
+        sessionId: input.session_id,
+      });
+    } catch (cause: unknown) {
+      return bindingFailure(cause);
+    }
+    if (input.last_assistant_message === null) return acknowledged();
+    const identity = turnIdentity(access, input.turn_id);
+    let stopped: RecordCodexStopResult;
+    try {
+      stopped = await this.options.turnStore.recordStop({
+        identity,
+        finalResponse: input.last_assistant_message,
+      });
+    } catch (cause: unknown) {
+      return persistenceFailure(cause, "stop_persistence_failed");
+    }
+    if (stopped.committed) return acknowledged();
+
+    const runtime = this.options.memoryRuntimeProvider.forRequest({
+      userKey: access.userKey,
+      bindingCacheKey: access.bindingCacheKey,
+    });
+    try {
+      const completedRound = buildCodexCompletedRound(stopped.round);
+      await runtime.commitCompletedRound(completedRound);
+      await this.options.turnStore.markCommitted(identity);
+      log.info("codex_hook.round_committed", {
+        sessionId: input.session_id,
+        turnId: input.turn_id,
+        sourceEventId: completedRound.sourceEventId,
+        toolCount: stopped.round.tools.length,
+      });
+      return acknowledged();
+    } catch (cause: unknown) {
+      return commitFailure(cause);
+    }
+  }
+
+  async sessionEnd(raw: unknown): Promise<CodexHookResponse> {
+    let input: SessionEndHookInput;
+    try {
+      input = parseSessionEnd(raw);
+    } catch {
+      return error(400, "invalid_session_end");
+    }
+    log.info("codex_hook.session_end", {
+      sessionId: input.session_id,
+      turnId: input.turn_id,
+    });
+    try {
+      this.options.memoryRuntimeProvider.signalDrain?.();
+    } catch (cause: unknown) {
+      log.warn("codex_hook.session_end_signal_failed", {
+        sessionId: input.session_id,
+        errorType: cause instanceof Error ? cause.name : "unknown",
+      });
+    }
+    return acknowledged();
+  }
 }
 
 function success(
@@ -225,6 +407,10 @@ function success(
   };
 }
 
+function acknowledged(): CodexHookResponse {
+  return { status: 200, body: { suppressOutput: true } };
+}
+
 function error(status: number, code: string): CodexHookResponse {
   return { status, body: { error: code } };
 }
@@ -241,6 +427,17 @@ function bindingFailure(cause: unknown): CodexHookResponse {
   default:
     return error(403, "binding_denied");
   }
+}
+
+function persistenceFailure(cause: unknown, code: string): CodexHookResponse {
+  return error(cause instanceof CodexTurnConflictError ? 409 : 503, code);
+}
+
+function commitFailure(cause: unknown): CodexHookResponse {
+  if (cause instanceof MemoryRuntimeAuthorizationError || cause instanceof MemoryRuntimeBindingError) {
+    return error(403, "memory_access_denied");
+  }
+  return error(503, "round_commit_failed");
 }
 
 function runtimeFailure(
@@ -295,9 +492,76 @@ function parseUserPromptSubmit(value: unknown): UserPromptSubmitHookInput {
     transcript_path: nullableText(input.transcript_path),
     turn_id: text(input.turn_id),
     prompt: text(input.prompt),
-    ...(typeof input.agent_id === "string" ? { agent_id: input.agent_id } : {}),
-    ...(typeof input.agent_type === "string" ? { agent_type: input.agent_type } : {}),
+    ...optionalAgentFields(input),
   };
+}
+
+function parsePostToolUse(value: unknown): PostToolUseHookInput {
+  const input = record(value);
+  assertAllowedFields(input, POST_TOOL_USE_FIELDS);
+  if (input.hook_event_name !== "PostToolUse") throw new TypeError("invalid event");
+  if (!("tool_input" in input) || !("tool_response" in input)) {
+    throw new TypeError("tool input and response required");
+  }
+  return {
+    cwd: text(input.cwd),
+    hook_event_name: "PostToolUse",
+    model: text(input.model),
+    permission_mode: permissionMode(input.permission_mode),
+    session_id: text(input.session_id),
+    transcript_path: nullableText(input.transcript_path),
+    turn_id: text(input.turn_id),
+    tool_name: text(input.tool_name),
+    tool_use_id: text(input.tool_use_id),
+    tool_input: input.tool_input,
+    tool_response: input.tool_response,
+    ...optionalAgentFields(input),
+  };
+}
+
+function parseStop(value: unknown): StopHookInput {
+  const input = record(value);
+  assertAllowedFields(input, STOP_FIELDS);
+  if (input.hook_event_name !== "Stop") throw new TypeError("invalid event");
+  if (typeof input.stop_hook_active !== "boolean") throw new TypeError("invalid active state");
+  return {
+    cwd: text(input.cwd),
+    hook_event_name: "Stop",
+    last_assistant_message: nullableText(input.last_assistant_message),
+    model: text(input.model),
+    permission_mode: permissionMode(input.permission_mode),
+    session_id: text(input.session_id),
+    stop_hook_active: input.stop_hook_active,
+    transcript_path: nullableText(input.transcript_path),
+    turn_id: text(input.turn_id),
+  };
+}
+
+function parseSessionEnd(value: unknown): SessionEndHookInput {
+  const input = record(value);
+  assertAllowedFields(input, SESSION_END_FIELDS);
+  if (input.hook_event_name !== "SessionEnd") throw new TypeError("invalid event");
+  return {
+    cwd: text(input.cwd),
+    hook_event_name: "SessionEnd",
+    session_id: text(input.session_id),
+    transcript_path: nullableText(input.transcript_path),
+    turn_id: text(input.turn_id),
+  };
+}
+
+function turnIdentity(access: CodexHookAccess, turnId: string): CodexTurnIdentity {
+  return { ...access.identity, agentSource: "codex", turnId };
+}
+
+function optionalAgentFields(input: Record<string, unknown>): {
+  agent_id?: string;
+  agent_type?: string;
+} {
+  const fields: { agent_id?: string; agent_type?: string } = {};
+  if ("agent_id" in input) fields.agent_id = text(input.agent_id);
+  if ("agent_type" in input) fields.agent_type = text(input.agent_type);
+  return fields;
 }
 
 function renderAdditionalContext(

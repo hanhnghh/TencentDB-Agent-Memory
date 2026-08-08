@@ -14,7 +14,11 @@ const UNAVAILABLE_OUTPUT = {
 const ROUTES = {
   SessionStart: "/hooks/session-start",
   UserPromptSubmit: "/hooks/user-prompt-submit",
+  PostToolUse: "/hooks/post-tool-use",
+  Stop: "/hooks/stop",
+  SessionEnd: "/hooks/session-end",
 };
+const DURABLE_WRITE_EVENTS = new Set(["UserPromptSubmit", "PostToolUse", "Stop"]);
 
 export async function runMemoryHook({
   input = process.stdin,
@@ -23,9 +27,11 @@ export async function runMemoryHook({
   env = process.env,
   fetcher = globalThis.fetch.bind(globalThis),
 } = {}) {
+  let eventName;
   try {
     const raw = await readBounded(input, MAX_INPUT_BYTES);
     const event = parseEvent(raw);
+    eventName = event.hook_event_name;
     const route = ROUTES[event.hook_event_name];
     if (!route) throw new Error("unsupported hook event");
     const endpoint = sidecarEndpoint(env.TDAI_MEMORY_SIDECAR_URL, route);
@@ -39,9 +45,12 @@ export async function runMemoryHook({
     const responseText = await readResponseBounded(response, MAX_RESPONSE_BYTES);
     const hookOutput = parseHookOutput(responseText, event.hook_event_name);
     output.write(`${JSON.stringify(hookOutput)}\n`);
+    return 0;
   } catch (error) {
     diagnostics.write(`Agent Memory hook unavailable (${errorName(error)}).\n`);
+    if (DURABLE_WRITE_EVENTS.has(eventName)) return 1;
     output.write(`${JSON.stringify(UNAVAILABLE_OUTPUT)}\n`);
+    return 0;
   }
 }
 
@@ -63,6 +72,8 @@ function parseHookOutput(raw, eventName) {
     throw new Error("invalid sidecar output");
   }
   const specific = value.hookSpecificOutput;
+  const requiresSpecific = eventName === "SessionStart" || eventName === "UserPromptSubmit";
+  if (specific === undefined && !requiresSpecific) return value;
   if (
     !isRecord(specific) ||
     specific.hookEventName !== eventName
@@ -139,5 +150,5 @@ const isMain = process.argv[1]
   : false;
 
 if (isMain) {
-  await runMemoryHook();
+  process.exitCode = await runMemoryHook();
 }

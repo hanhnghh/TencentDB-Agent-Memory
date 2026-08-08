@@ -26,6 +26,42 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/scripts/memory-hook.mjs\"",
+            "timeout": 5,
+            "statusMessage": "Recording Agent Memory tool event"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/scripts/memory-hook.mjs\"",
+            "timeout": 10,
+            "statusMessage": "Committing completed Agent Memory round"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/scripts/memory-hook.mjs\"",
+            "timeout": 5,
+            "statusMessage": "Signaling Agent Memory session end"
+          }
+        ]
+      }
     ]
   }
 }

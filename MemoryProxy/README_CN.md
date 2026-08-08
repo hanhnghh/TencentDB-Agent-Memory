@@ -120,8 +120,9 @@ npm run codex -- unbind
 ### Codex 生命周期上下文
 
 仓库内插件骨架位于 `plugins/tencentdb-agent-memory`。其中唯一的轻量可执行程序
-会把官方 `SessionStart` 和 `UserPromptSubmit` JSON payload 发送到仅监听回环地址的
-hook sidecar；Codex 仍然通过自己的订阅通道调用模型。
+会把官方 `SessionStart`、`UserPromptSubmit`、`PostToolUse`、`Stop` 和
+`SessionEnd` JSON payload 发送到仅监听回环地址的 hook sidecar；Codex 仍然通过
+自己的订阅通道调用模型。
 
 无需配置 proxy 上游凭据即可启动 sidecar：
 
@@ -148,9 +149,21 @@ session, turn, prompt)` 身份持久写入 SQLite journal 后才确认成功。�
 }
 ```
 
-hook 不会替换或改写原 prompt。sidecar 不可用时，可执行程序返回合法的空 hook
-输出，Codex 会在没有注入 memory 的情况下继续。插件安装与 trust 自动化属于后续
-独立 packaging workflow；使用前仍需审查 hook 定义。
+hook 不会替换或改写原 prompt。sidecar 不可用时，context 读取会返回合法的空 hook
+输出，Codex 会在没有注入 memory 的情况下继续。
+
+`PostToolUse` 会在确认前把官方 payload 中的 tool name、tool-use ID、input、response
+和失败 shell outcome 写入 journal，覆盖可观察的本地 shell/exec、`apply_patch` 与
+MCP 路径。`Stop` 先持久化最终 assistant message，再通过 durable outbox 入队唯一的
+L0 user/assistant pair 和完整、含工具信息的 normalized skill round。稳定的
+session/turn/source identity 保证重复 tool event、重复 `Stop` 以及 sidecar 重启后的
+replay 都是幂等的。`SessionEnd` 仅用于通知，绝不是 round 的必需 commit point。
+
+Codex 并不会为所有 hosted 或特殊工具暴露 `PostToolUse`。这些事件会明确缺失；集成
+不会从 `transcript_path` 推断它们，也不会对不支持的路径声称精确的 tool visibility。
+若 sidecar 在 `UserPromptSubmit`、`PostToolUse` 或 `Stop` 期间不可用，可执行程序会
+失败退出，而不会确认尚未持久化的写入。插件安装与 trust 自动化属于后续独立
+packaging workflow；使用前仍需审查 hook 定义。
 
 ### 1. 安装依赖
 

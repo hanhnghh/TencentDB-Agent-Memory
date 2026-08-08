@@ -125,7 +125,8 @@ or `upstream.apiKey`) nor the internal memory-distillation model credential
 The repo-local plugin scaffold is under
 `plugins/tencentdb-agent-memory`. Its single thin executable forwards the
 documented `SessionStart` and `UserPromptSubmit` JSON payloads to the
-loopback-only hook listener; Codex still calls the model through its own
+loopback-only hook listener. The same executable also forwards `PostToolUse`,
+`Stop`, and `SessionEnd`; Codex still calls the model through its own
 subscription transport.
 
 Start the sidecar without any proxy upstream credential:
@@ -156,9 +157,24 @@ recall and cap the number of returned blocks:
 ```
 
 The hook never replaces or rewrites the original prompt. If the sidecar is
-unavailable, the executable returns valid empty hook output and Codex continues
-without injected memory. Plugin installation/trust automation is delivered by
-the separate packaging workflow; hook definitions must be reviewed before use.
+unavailable during a context read, the executable returns valid empty hook
+output and Codex continues without injected memory.
+
+`PostToolUse` journals the documented tool name, tool-use ID, input, response,
+and failed-shell outcome before acknowledgement for observable local shell/exec,
+`apply_patch`, and MCP paths. `Stop` durably stores the final assistant message,
+then enqueues exactly one L0 user/assistant pair and one full normalized,
+tool-aware skill round. Stable session/turn/source identities make duplicate
+tool events, repeated `Stop`, and replay after a sidecar restart idempotent.
+`SessionEnd` is advisory and is never required to commit a round.
+
+Codex does not expose every hosted or specialized tool through `PostToolUse`.
+Those events are intentionally omitted; the integration does not infer them
+from `transcript_path` or claim exact tool visibility on unsupported paths. If
+the sidecar is unavailable during `UserPromptSubmit`, `PostToolUse`, or `Stop`,
+the executable exits unsuccessfully instead of acknowledging an unpersisted write. Plugin
+installation/trust automation is delivered by the separate packaging workflow;
+hook definitions must be reviewed before use.
 
 ### 1. Install dependencies
 
