@@ -103,4 +103,39 @@ describe("CoreSkillClient conversation receipts", () => {
       retryable: false,
     });
   });
+
+  it("rejects a success envelope that omits the durable receipt", async () => {
+    const client = new CoreSkillClient(
+      config,
+      vi.fn(async () => response({ code: 0, data: { status: "ok" } })) as typeof fetch,
+    );
+    const failure = await client.addConversation({
+      session_id: "session-1",
+      user_id: "user-1",
+      team_id: "team-1",
+      agent_id: "agent-1",
+      messages: [{ role: "user", content: "hello" }],
+    }).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      name: "CoreSkillClientError",
+      kind: "invalid_response",
+      retryable: false,
+    });
+  });
+
+  it("rejects a non-object data payload in a generic success envelope", async () => {
+    const client = new CoreSkillClient(
+      config,
+      vi.fn(async () => response({ code: 0, data: [] })) as typeof fetch,
+    );
+    const failure = await client.post("/v3/skill/listing", {})
+      .catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      name: "CoreSkillClientError",
+      kind: "invalid_response",
+      retryable: false,
+    });
+  });
 });

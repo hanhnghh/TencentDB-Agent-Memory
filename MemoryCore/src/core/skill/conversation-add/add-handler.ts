@@ -185,12 +185,13 @@ export class SkillConversationAddHandler {
     state = await this.flushPendingArchives(sess, state, input.perfRequestId);
 
     const fingerprint = fingerprintInput(input);
-    const eventKey = input.source_event_id ? sourceEventKey(input.source_event_id) : undefined;
+    const sourceEventId = input.source_event_id;
+    const eventKey = sourceEventId ? sourceEventKey(sourceEventId) : undefined;
     const existing = eventKey ? state.receipts[eventKey] : undefined;
     if (existing) {
       if (existing.fingerprint !== fingerprint) {
         throw new SourceEventConflictError(
-          input.source_event_id!,
+          sourceEventId,
           existing.result.receipt.content_hash,
           input.content_hash ?? fingerprint,
         );
@@ -256,7 +257,7 @@ export class SkillConversationAddHandler {
           : hitTool
             ? "tool_calls"
             : "bytes";
-      const plan = this.trigger.planArchive(sess);
+      const plan = this.trigger.planArchive(sess, state.meta.last_archived_at_ms);
       nextCurrent = { messages: [] };
       nextMeta = {
         session_id: sess.session_id,

@@ -10,16 +10,29 @@ import type {
 import { StorageAdapter } from "../../storage/adapter.js";
 import { conversationAddRequestSchema } from "../../../gateway/skill-schemas.js";
 import { handleConversationAdd } from "../../../gateway/skill-handlers.js";
+import {
+  LocalSkillAgentTaskQueue,
+  RedisSkillAgentTaskQueue,
+  type RedisLike,
+} from "./agent-task-queue.js";
+import { SkillBufferStorage } from "./buffer-storage.js";
+import { SkillConversationAddHandler } from "./add-handler.js";
+import { SkillTriggerService } from "./trigger-service.js";
 import { wireConversationAdd } from "./wire.js";
 
 class MemoryBackend implements IStorageBackend {
   readonly type = "local" as const;
   readonly objects = new Map<string, Buffer>();
   throwAfterSessionCommitOnce = false;
+  failSessionCommitOnce = false;
   readDelaysMs: number[] = [];
   private readCount = 0;
 
   async putObject(key: string, content: string | Buffer, _opts?: PutObjectOptions): Promise<void> {
+    if (this.failSessionCommitOnce && key.endsWith("/state.json")) {
+      this.failSessionCommitOnce = false;
+      throw new Error("secret-storage-path /credentials/internal-state.json");
+    }
     this.objects.set(key, Buffer.isBuffer(content) ? Buffer.from(content) : Buffer.from(content));
     if (this.throwAfterSessionCommitOnce && key.endsWith("/state.json")) {
       this.throwAfterSessionCommitOnce = false;
@@ -65,6 +78,63 @@ class MemoryBackend implements IStorageBackend {
     keys.forEach((key) => this.objects.delete(key));
     return keys.length;
   }
+}
+
+class LeaseRedis implements RedisLike {
+  private readonly values = new Map<string, { value: string; expiresAt: number }>();
+
+  private read(key: string): { value: string; expiresAt: number } | undefined {
+    const current = this.values.get(key);
+    if (current && current.expiresAt <= Date.now()) {
+      this.values.delete(key);
+      return undefined;
+    }
+    return current;
+  }
+
+  async set(key: string, value: string, ...args: (string | number)[]): Promise<"OK" | null> {
+    if (this.read(key)) return null;
+    const pxIndex = args.indexOf("PX");
+    const ttlMs = Number(args[pxIndex + 1]);
+    this.values.set(key, { value, expiresAt: Date.now() + ttlMs });
+    return "OK";
+  }
+
+  async eval(script: string, _numKeys: number, ...args: (string | number)[]): Promise<unknown> {
+    const [key, token, ttlMs] = args;
+    const current = this.read(String(key));
+    if (!current || current.value !== token) return 0;
+    if (script.includes("PEXPIRE")) {
+      current.expiresAt = Date.now() + Number(ttlMs);
+      return 1;
+    }
+    this.values.delete(String(key));
+    return 1;
+  }
+
+  async get(key: string): Promise<string | null> {
+    return this.read(key)?.value ?? null;
+  }
+
+  async del(...keys: string[]): Promise<number> {
+    let removed = 0;
+    for (const key of keys) removed += this.values.delete(key) ? 1 : 0;
+    return removed;
+  }
+
+  async pexpire(key: string, ms: number): Promise<number> {
+    const current = this.read(key);
+    if (!current) return 0;
+    current.expiresAt = Date.now() + ms;
+    return 1;
+  }
+
+  async sadd(): Promise<number> { return 0; }
+  async srem(): Promise<number> { return 0; }
+  async lpush(): Promise<number> { return 0; }
+  async lrem(): Promise<number> { return 0; }
+  async brpop(): Promise<[string, string] | null> { return null; }
+  async rpop(): Promise<string | null> { return null; }
 }
 
 const baseInput = {
@@ -167,6 +237,46 @@ describe("skill conversation ingestion duplicate safety", () => {
     });
   });
 
+  it("rejects a body space that differs from the authenticated instance", async () => {
+    const { backend, wired } = makeWired();
+    const result = await handleConversationAdd(
+      { ...baseInput, space_id: "attacker-space", source_event_id: "event-1" },
+      { apiKey: "key", serviceId: "space-1" },
+      "request-1",
+      {
+        getSkillCore: () => undefined,
+        logger: { debug() {}, info() {}, warn() {}, error() {} },
+        resolveConversationAdd: async () => wired,
+      },
+    );
+
+    expect(result).toMatchObject({
+      code: 40001,
+      message: expect.stringContaining("space_id"),
+    });
+    expect(backend.objects.size).toBe(0);
+  });
+
+  it("does not expose storage failure details in the public envelope", async () => {
+    const backend = new MemoryBackend();
+    backend.failSessionCommitOnce = true;
+    const { wired } = makeWired(backend);
+    const result = await handleConversationAdd(
+      { ...baseInput, source_event_id: "event-1" },
+      { apiKey: "key", serviceId: "space-1" },
+      "request-1",
+      {
+        getSkillCore: () => undefined,
+        logger: { debug() {}, info() {}, warn() {}, error() {} },
+        resolveConversationAdd: async () => wired,
+      },
+    );
+
+    expect(result).toMatchObject({ code: 50001 });
+    expect(result.message).not.toContain("secret-storage-path");
+    expect(result.message).not.toContain("credentials");
+  });
+
   it("serializes concurrent appends in one session without losing either event", async () => {
     const backend = new MemoryBackend();
     // Without server serialization these staggered legacy reads both observe
@@ -191,9 +301,23 @@ describe("skill conversation ingestion duplicate safety", () => {
     expect(current.messages.map((message) => message.content).sort()).toEqual(["a", "b"]);
   });
 
+  it("coalesces concurrent delivery of the same source event", async () => {
+    const { wired } = makeWired();
+    const input = { ...baseInput, source_event_id: "concurrent-duplicate" };
+
+    const [first, duplicate] = await Promise.all([
+      wired.handler.handle(input),
+      wired.handler.handle(input),
+    ]);
+
+    expect(duplicate).toEqual(first);
+    const current = await wired.buffer.readCurrent(baseInput);
+    expect(current.messages).toEqual(baseInput.messages);
+  });
+
   it("recovers a committed receipt after the acknowledgement is lost", async () => {
     const backend = new MemoryBackend();
-    const { wired } = makeWired(backend, { toolCallThreshold: 1 });
+    const { wired: beforeRestart } = makeWired(backend, { toolCallThreshold: 1 });
     backend.throwAfterSessionCommitOnce = true;
     const input = {
       ...baseInput,
@@ -201,16 +325,108 @@ describe("skill conversation ingestion duplicate safety", () => {
       messages: [{ role: "tool_call" as const, content: "{}", tool_call_id: "call-1" }],
     };
 
-    await expect(wired.handler.handle(input)).rejects.toThrow("acknowledgement loss");
-    const replay = await wired.handler.handle(input);
+    await expect(beforeRestart.handler.handle(input)).rejects.toThrow("acknowledgement loss");
+    const { wired: afterRestart } = makeWired(backend, { toolCallThreshold: 1 });
+    const replay = await afterRestart.handler.handle(input);
 
     expect(replay).toMatchObject({
       status: "archived",
       receipt: { source_event_id: "event-after-crash" },
     });
-    const current = await wired.buffer.readCurrent(baseInput);
+    const current = await afterRestart.buffer.readCurrent(baseInput);
     expect(current.messages).toEqual([]);
-    const tasks = await wired.buffer.readTasks(baseInput);
+    const tasks = await afterRestart.buffer.readTasks(baseInput);
     expect(tasks.tasks).toHaveLength(1);
+  });
+
+  it("keeps the same-session mutex exclusive after its initial lease duration", async () => {
+    const queue = new LocalSkillAgentTaskQueue();
+    let active = 0;
+    let maxActive = 0;
+    const enter = async (holdMs: number) => queue.withSessionMutex(
+      baseInput,
+      { lockTtlMs: 5, waitDeadlineMs: 100 },
+      async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((resolve) => setTimeout(resolve, holdMs));
+        active -= 1;
+      },
+    );
+
+    const first = enter(30);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await Promise.all([first, enter(1)]);
+
+    expect(maxActive).toBe(1);
+  });
+
+  it("renews the distributed same-session mutex while work is active", async () => {
+    const queue = new RedisSkillAgentTaskQueue({
+      client: new LeaseRedis(),
+      keyPrefix: "test",
+    });
+    let active = 0;
+    let maxActive = 0;
+    const enter = async (holdMs: number) => queue.withSessionMutex(
+      baseInput,
+      { lockTtlMs: 30, waitDeadlineMs: 300 },
+      async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((resolve) => setTimeout(resolve, holdMs));
+        active -= 1;
+      },
+    );
+
+    const first = enter(90);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await Promise.all([first, enter(1)]);
+
+    expect(maxActive).toBe(1);
+  });
+
+  it("uses distinct archive keys when consecutive archives share a wall-clock millisecond", async () => {
+    const backend = new MemoryBackend();
+    const buffer = new SkillBufferStorage({ storage: new StorageAdapter(backend) });
+    const queue = new LocalSkillAgentTaskQueue();
+    const trigger = new SkillTriggerService({ buffer, queue, now: () => 42 });
+    const handler = new SkillConversationAddHandler({
+      buffer,
+      trigger,
+      thresholds: {
+        toolCallThreshold: 1,
+        bytesThreshold: 1_000_000,
+        requestCompressThresholdBytes: 1_000_000,
+      },
+      now: () => 42,
+      serialize: (session, fn) => queue.withSessionMutex(
+        session,
+        { lockTtlMs: 1_000, waitDeadlineMs: 1_000 },
+        fn,
+      ),
+    });
+
+    const first = await handler.handle({
+      ...baseInput,
+      source_event_id: "event-a",
+      messages: [{ role: "tool_call", content: "a", tool_call_id: "call-a" }],
+    });
+    const second = await handler.handle({
+      ...baseInput,
+      source_event_id: "event-b",
+      messages: [{ role: "tool_call", content: "b", tool_call_id: "call-b" }],
+    });
+
+    expect(first.archived).toBeDefined();
+    expect(second.archived).toBeDefined();
+    if (!first.archived || !second.archived) throw new Error("expected both requests to archive");
+    expect(first.archived.archive_key).not.toBe(second.archived.archive_key);
+    await expect(buffer.readArchive(first.archived.archive_key)).resolves.toMatchObject({
+      messages: [{ content: "a" }],
+    });
+    await expect(buffer.readArchive(second.archived.archive_key)).resolves.toMatchObject({
+      messages: [{ content: "b" }],
+    });
   });
 });

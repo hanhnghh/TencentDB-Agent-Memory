@@ -96,9 +96,16 @@ def _decode_response(resp: httpx.Response) -> dict:
             **_classify_failure(resp.status_code, effective_code),
         )
 
-    result = envelope.get("data") or {}
+    result = envelope.get("data")
     if not isinstance(result, dict):
-        raise TDAMError(-1, "API response data must be a JSON object", header_request_id)
+        raise TDAMError(
+            -1,
+            "API response data must be a JSON object",
+            header_request_id,
+            kind="invalid_response",
+            retryable=False,
+            http_status=resp.status_code,
+        )
     trace_id = resp.headers.get("x-trace-id")
     if trace_id:
         result["trace_id"] = trace_id

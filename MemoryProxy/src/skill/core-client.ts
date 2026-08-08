@@ -127,6 +127,7 @@ export interface ExtractAsyncResult {
  *   - messages 是本轮增量（user + 中间 tool_call/tool_result + assistant 总结），
  *     不重传历史（Core 不去重，重传会造成 buffer 重复）
  *   - source_event_id 可选；传入后 Core 对重放去重并返回同一 receipt
+ *   - space_id 若显式提供，必须与请求使用的 x-tdai-service-id 一致
  *   - Core 会在 server 侧串行同 session；caller 仍可串行以减少排队
  *
  * 详见 `2026-07-15-skill-trigger-in-core-design.md` §11.1 & §13。
@@ -289,7 +290,19 @@ export class CoreSkillClient {
     input: ConversationAddInput,
     opts: CoreSkillRequestOptions = {},
   ): Promise<ConversationAddResult> {
-    return this.post<ConversationAddResult>("/v3/skill/conversation/add", input, opts);
+    const result: unknown = await this.post<unknown>(
+      "/v3/skill/conversation/add",
+      input,
+      opts,
+    );
+    if (!isConversationAddResult(result)) {
+      throw new CoreSkillClientError(
+        `${TAG} /v3/skill/conversation/add returned an invalid success payload`,
+        "invalid_response",
+        false,
+      );
+    }
+    return result;
   }
 
   /**
@@ -449,8 +462,47 @@ export class CoreSkillClient {
       );
     }
 
-    return (env.data ?? ({} as T));
+    if (!isRecord(env.data)) {
+      throw new CoreSkillClientError(
+        `${TAG} ${path} response data must be a JSON object`,
+        "invalid_response",
+        false,
+        resp.status,
+        env.code,
+        env.request_id ?? "",
+      );
+    }
+    return env.data as T;
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isConversationAddResult(value: unknown): value is ConversationAddResult {
+  if (!isRecord(value) || (value.status !== "ok" && value.status !== "archived")) return false;
+  if (!isRecord(value.receipt)) return false;
+  if (typeof value.receipt.receipt_id !== "string" || value.receipt.receipt_id.length === 0) return false;
+  if (typeof value.receipt.content_hash !== "string" || value.receipt.content_hash.length === 0) return false;
+  if (typeof value.receipt.accepted_at_ms !== "number" || !Number.isFinite(value.receipt.accepted_at_ms)) {
+    return false;
+  }
+  if (value.receipt.source_event_id !== undefined && typeof value.receipt.source_event_id !== "string") {
+    return false;
+  }
+  if (value.status === "archived") {
+    if (!isRecord(value.archived)) return false;
+    if (typeof value.archived.task_id !== "string" || value.archived.task_id.length === 0) return false;
+    if (typeof value.archived.archive_key !== "string" || value.archived.archive_key.length === 0) return false;
+    if (typeof value.archived.archived_at_ms !== "number" || !Number.isFinite(value.archived.archived_at_ms)) {
+      return false;
+    }
+    if (!["tool_calls", "bytes", "compressed", "oversize"].includes(String(value.archived.reason))) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // ── Singleton + test injection ──────────────────────────────────────────────

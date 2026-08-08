@@ -114,7 +114,16 @@ export class V3HttpTransport {
         );
       }
 
-      const result = (envelope.data ?? {}) as T & { trace_id?: string };
+      if (!envelope.data || typeof envelope.data !== "object" || Array.isArray(envelope.data)) {
+        throw new TDAMError(
+          -1,
+          "API response data must be a JSON object",
+          headerRequestId || envelope.request_id || "",
+          undefined,
+          { kind: "invalid_response", retryable: false, httpStatus: response.status },
+        );
+      }
+      const result = envelope.data as T & { trace_id?: string };
       const traceId = response.headers.get("x-trace-id");
       if (traceId && result && typeof result === "object") {
         (result as Record<string, unknown>).trace_id = traceId;

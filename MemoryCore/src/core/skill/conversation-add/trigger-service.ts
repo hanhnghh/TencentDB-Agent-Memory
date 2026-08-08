@@ -106,8 +106,11 @@ export class SkillTriggerService {
     this.now = opts.now ?? (() => Date.now());
   }
 
-  planArchive(session: SessionKey): TriggerArchivePlan {
-    const archivedAtMs = this.now();
+  planArchive(session: SessionKey, afterMs?: number): TriggerArchivePlan {
+    const nowMs = this.now();
+    const archivedAtMs = afterMs !== undefined && afterMs >= nowMs
+      ? afterMs + 1
+      : nowMs;
     return {
       archivedAtMs,
       archiveKey: this.buffer.archiveKey(session, archivedAtMs),

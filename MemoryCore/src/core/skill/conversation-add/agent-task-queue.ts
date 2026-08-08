@@ -222,11 +222,12 @@ export class LocalSkillAgentTaskQueue implements ISkillAgentTaskQueue {
   ): Promise<T> {
     const deadline = Date.now() + opts.waitDeadlineMs;
     while (true) {
-      const now = Date.now();
       const cur = mutexes.get(key);
-      if (!cur || cur.expireAt <= now) {
+      // An in-process holder cannot crash independently of this queue. Do not
+      // let a wall-clock lease expiry admit a second writer while fn is alive.
+      if (!cur) {
         const token = randomUUID();
-        mutexes.set(key, { token, expireAt: now + opts.lockTtlMs });
+        mutexes.set(key, { token, expireAt: Number.POSITIVE_INFINITY });
         try {
           return await fn();
         } finally {
@@ -460,9 +461,47 @@ export class RedisSkillAgentTaskQueue implements ISkillAgentTaskQueue {
     while (true) {
       const ok = await this.client.set(key, token, "NX", "PX", opts.lockTtlMs);
       if (ok === "OK") {
+        let renewalFailure: Error | undefined;
+        let stopped = false;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let renewal = Promise.resolve();
+        const renewAfterMs = Math.max(1, Math.floor(opts.lockTtlMs / 3));
+        const scheduleRenewal = (): void => {
+          timer = setTimeout(() => {
+            renewal = (async () => {
+              try {
+                const renewed = await this.client.eval(
+                  LUA_RENEW,
+                  1,
+                  key,
+                  token,
+                  opts.lockTtlMs,
+                );
+                if (renewed !== 1) {
+                  renewalFailure = new Error(
+                    `[skill-agent-queue] session-mutex lease lost for ${key}`,
+                  );
+                }
+              } catch (error) {
+                renewalFailure = new Error(
+                  `[skill-agent-queue] session-mutex renewal failed for ${key}`,
+                  { cause: error },
+                );
+              }
+              if (!stopped && !renewalFailure) scheduleRenewal();
+            })();
+          }, renewAfterMs);
+        };
+        scheduleRenewal();
         try {
-          return await fn();
+          const result = await fn();
+          await renewal;
+          if (renewalFailure) throw renewalFailure;
+          return result;
         } finally {
+          stopped = true;
+          if (timer) clearTimeout(timer);
+          await renewal.catch(() => undefined);
           try {
             await this.client.eval(LUA_RELEASE, 1, key, token);
           } catch {

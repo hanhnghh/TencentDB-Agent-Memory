@@ -81,3 +81,33 @@ def test_malformed_success_is_a_typed_permanent_failure():
         _decode_response(response)
     assert caught.value.kind == "invalid_response"
     assert caught.value.retryable is False
+
+
+def test_non_object_success_data_is_a_typed_permanent_failure():
+    response = httpx.Response(200, json={"code": 0, "data": []})
+    with pytest.raises(TDAMError) as caught:
+        _decode_response(response)
+    assert caught.value.kind == "invalid_response"
+    assert caught.value.retryable is False
+
+
+@pytest.mark.parametrize("client_cls", [SkillClient, AsyncSkillClient])
+def test_conversation_add_rejects_success_without_a_durable_receipt(client_cls):
+    class MalformedStub(Stub):
+        def post(self, _path, body, timeout=None):
+            return {"status": "ok"}
+
+    if client_cls is AsyncSkillClient:
+        class MalformedAsyncStub(MalformedStub):
+            async def post(self, path, body, timeout=None):
+                return super().post(path, body, timeout)
+
+        call = client_cls(stub=MalformedAsyncStub()).conversation_add(**REQUEST)
+        invoke = lambda: asyncio.run(call)
+    else:
+        invoke = lambda: client_cls(stub=MalformedStub()).conversation_add(**REQUEST)
+
+    with pytest.raises(TDAMError) as caught:
+        invoke()
+    assert caught.value.kind == "invalid_response"
+    assert caught.value.retryable is False

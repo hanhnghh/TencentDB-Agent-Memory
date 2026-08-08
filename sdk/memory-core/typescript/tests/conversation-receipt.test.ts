@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { SkillClient } from "../src/v3/skill-client.js";
+import { V3HttpTransport } from "../src/v3/http.js";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -74,6 +75,37 @@ describe("TypeScript SDK skill conversation receipt", () => {
   it("surfaces malformed success responses as typed permanent failures", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("not-json", { status: 200 })));
     const failure = await client().conversationAdd(request).catch((error: unknown) => error);
+    expect(failure).toMatchObject({
+      name: "TDAMError",
+      kind: "invalid_response",
+      retryable: false,
+    });
+  });
+
+  it("rejects a success envelope that omits the durable receipt", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => response({
+      code: 0,
+      data: { status: "ok" },
+    })));
+
+    const failure = await client().conversationAdd(request).catch((error: unknown) => error);
+    expect(failure).toMatchObject({
+      name: "TDAMError",
+      kind: "invalid_response",
+      retryable: false,
+    });
+  });
+
+  it("rejects a non-object data payload in a generic success envelope", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => response({ code: 0, data: [] })));
+    const transport = new V3HttpTransport({
+      endpoint: "https://core.example",
+      apiKey: "key",
+      serviceId: "space-1",
+    });
+
+    const failure = await transport.post("/v3/skill/listing", {})
+      .catch((error: unknown) => error);
     expect(failure).toMatchObject({
       name: "TDAMError",
       kind: "invalid_response",

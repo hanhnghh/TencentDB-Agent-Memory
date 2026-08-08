@@ -811,6 +811,23 @@ export async function handleConversationAdd(
   }
   const input = parsed.data;
 
+  // The authenticated service selects both the per-instance storage adapter
+  // and the Redis lock namespace. Accepting a different body value would let
+  // two requests address the same storage object through different locks.
+  if (input.space_id !== undefined && input.space_id !== auth.serviceId) {
+    obsLogger.warn("skill.handleConversationAdd.done", {
+      req_id: requestId,
+      code: 40001,
+      dur_ms: Date.now() - t0,
+      reason: "space_id_mismatch",
+    });
+    return errorEnvelope(
+      40001,
+      "space_id must match the authenticated service instance",
+      requestId,
+    );
+  }
+
   // service 模式下用 auth.serviceId 解析租户级 wired; standalone 忽略 serviceId
   // 由 wiring 返回单例。
   const t0Wire = Date.now();
@@ -823,14 +840,7 @@ export async function handleConversationAdd(
     return errorEnvelope(404, "Skill conversation-add module not enabled for this instance", requestId);
   }
 
-  // space_id 优先取 body, 缺省回落到 auth.serviceId (跟 handleExtract 同一处理).
-  // 两个值在设计上就该相等；不等则告警。
-  const spaceId = input.space_id ?? auth.serviceId;
-  if (input.space_id && input.space_id !== auth.serviceId) {
-    deps.logger.warn(
-      `${TAG} /v3/skill/conversation/add space_id mismatch: body=${input.space_id} auth=${auth.serviceId}; using body`,
-    );
-  }
+  const spaceId = auth.serviceId;
 
   try {
     const t0Handle = Date.now();
@@ -901,7 +911,7 @@ export async function handleConversationAdd(
     }
     deps.logger.warn(`${TAG} /v3/skill/conversation/add failed: ${(err as Error).message}`);
     obsLogger.error("skill.handleConversationAdd.done", { req_id: requestId, dur_ms: Date.now() - t0 }, err instanceof Error ? err : undefined);
-    return errorEnvelope(50001, (err as Error).message ?? "internal error", requestId);
+    return errorEnvelope(50001, "Skill conversation ingestion failed", requestId);
   }
 }
 
@@ -962,6 +972,7 @@ export async function handleForceArchive(
         taskRefId: input.task_id,
         reason: input.reason,
         perfRequestId: requestId,
+        plan: wired.trigger.planArchive(sess, state.meta.last_archived_at_ms),
       });
 
       // Preserve receipts while atomically replacing the buffered state.
