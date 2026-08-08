@@ -46,6 +46,20 @@ interface ParsedOptions {
 }
 
 const BOOLEAN_FLAGS = new Set(["forget-credential", "help"]);
+const VALUE_OPTIONS = new Set([
+  "agent-id",
+  "auth-url",
+  "endpoint",
+  "project",
+  "service-id",
+  "task-id",
+  "team-id",
+  "user-config-dir",
+]);
+const SECRET_OPTION_ENV = new Map([
+  ["service-token", "MEMORY_CORE_SERVICE_TOKEN"],
+  ["user-key", "MEMORY_HUB_USER_KEY"],
+]);
 
 function parseOptions(args: string[]): ParsedOptions {
   const values = new Map<string, string>();
@@ -53,12 +67,26 @@ function parseOptions(args: string[]): ParsedOptions {
   for (let index = 0; index < args.length; index++) {
     const argument = args[index];
     if (!argument.startsWith("--")) {
-      throw new CliUsageError(`Unexpected argument '${argument}'`);
+      throw new CliUsageError("Unexpected positional argument");
     }
-    const name = argument.slice(2);
+    const rawName = argument.slice(2);
+    const equalsIndex = rawName.indexOf("=");
+    const name = equalsIndex === -1 ? rawName : rawName.slice(0, equalsIndex);
+    const secretEnv = SECRET_OPTION_ENV.get(name);
+    if (secretEnv) {
+      throw new CliUsageError(
+        `--${name} is not accepted because command-line values may be exposed; set ${secretEnv} instead`,
+      );
+    }
+    if (equalsIndex !== -1) {
+      throw new CliUsageError("Inline --option=value syntax is not supported");
+    }
     if (BOOLEAN_FLAGS.has(name)) {
       flags.add(name);
       continue;
+    }
+    if (!VALUE_OPTIONS.has(name)) {
+      throw new CliUsageError("Unknown option");
     }
     const value = args[index + 1];
     if (!value || value.startsWith("--")) {
@@ -104,8 +132,8 @@ function usage(): string {
     "Bind options:",
     "  --service-id --team-id --agent-id --task-id",
     "  --endpoint (or MEMORY_CORE_ENDPOINT)",
-    "  --service-token (or MEMORY_CORE_SERVICE_TOKEN)",
-    "  --user-key (or MEMORY_HUB_USER_KEY)",
+    "  MEMORY_CORE_SERVICE_TOKEN (environment only)",
+    "  MEMORY_HUB_USER_KEY (environment only)",
     "  --auth-url (or MEMORY_AUTH_URL; defaults to endpoint)",
     "",
     "Common options:",

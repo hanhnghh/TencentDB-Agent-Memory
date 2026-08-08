@@ -129,12 +129,18 @@ export async function verifyUserKeyWithConfig(
 
     const body = await resp.json() as {
       code?: number;
-      data?: { valid?: boolean; user?: { user_id?: string } };
+      data?: { valid?: boolean; user?: { user_id?: unknown } };
     };
 
     // Only accept: code=0 AND valid=true AND user_id present
-    if (body.code === 0 && body.data?.valid === true && body.data.user?.user_id) {
-      return { userId: body.data.user.user_id, rejected: false };
+    const userId = body.data?.user?.user_id;
+    if (
+      body.code === 0 &&
+      body.data?.valid === true &&
+      typeof userId === "string" &&
+      userId.trim()
+    ) {
+      return { userId, rejected: false };
     }
 
     // Everything else is a rejection

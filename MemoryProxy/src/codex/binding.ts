@@ -204,14 +204,23 @@ async function readCredentialFile(path: string): Promise<CredentialFile> {
 
 const FORBIDDEN_SECRET_FIELDS = new Set([
   "access_token",
+  "auth_token",
   "api_key",
   "authorization",
+  "bearer_token",
+  "client_secret",
+  "cookie",
   "credential",
   "credentials",
+  "id_token",
   "password",
+  "passphrase",
+  "private_key",
   "refresh_token",
   "secret",
+  "secret_key",
   "service_token",
+  "session_token",
   "token",
   "user_key",
 ]);
@@ -537,7 +546,9 @@ export interface UnbindCodexProjectResult {
 export async function unbindCodexProject(
   input: UnbindCodexProjectInput,
 ): Promise<UnbindCodexProjectResult> {
-  const binding = await readCodexProjectBinding(input.projectDir);
+  const binding = input.forgetCredential
+    ? await readCodexProjectBinding(input.projectDir)
+    : null;
   let credentialRemoved = false;
 
   if (input.forgetCredential && binding) {

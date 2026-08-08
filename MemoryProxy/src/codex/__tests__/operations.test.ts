@@ -111,6 +111,22 @@ describe("Codex binding operations", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it("removes an invalid project binding so unbind can recover local state", async () => {
+    const dirs = await setup();
+    const projectPath = join(dirs.projectDir, PROJECT_BINDING_RELATIVE_PATH);
+    await mkdir(dirname(projectPath), { recursive: true });
+    await writeFile(projectPath, "{not-json");
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+
+    await expect(unbindCodexProject(dirs)).resolves.toEqual({
+      removed: true,
+      credentialRemoved: false,
+    });
+    await expect(stat(projectPath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it("rejects secret fields in project-local configuration", async () => {
     const dirs = await setup();
     const projectPath = join(dirs.projectDir, PROJECT_BINDING_RELATIVE_PATH);

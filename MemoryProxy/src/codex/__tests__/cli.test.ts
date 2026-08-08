@@ -76,6 +76,26 @@ describe("Codex binding CLI", () => {
     expect([...h.output, ...h.errors].join("\n")).not.toContain("service-secret");
   });
 
+  it("rejects shell-visible credential options without echoing their values", async () => {
+    const h = harness();
+    const code = await runCodexBindingCli([
+      "bind",
+      "--endpoint", "https://memory.example",
+      "--service-token=service-secret",
+      "--user-key", "user-key-secret",
+      "--service-id", "memory-1",
+      "--team-id", "team-1",
+      "--agent-id", "agent-1",
+      "--task-id", "task-1",
+    ], h.io, {}, h.dependencies);
+
+    expect(code).toBe(2);
+    expect(h.errors.join("\n")).toContain("MEMORY_CORE_SERVICE_TOKEN");
+    expect([...h.output, ...h.errors].join("\n")).not.toContain("service-secret");
+    expect([...h.output, ...h.errors].join("\n")).not.toContain("user-key-secret");
+    expect(h.dependencies.bind).not.toHaveBeenCalled();
+  });
+
   it("supports binding-status, doctor, and unbind without model interaction", async () => {
     const h = harness();
 

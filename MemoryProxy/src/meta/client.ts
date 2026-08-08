@@ -430,9 +430,28 @@ export class MetadataClient {
         path,
         { ...body, limit: pageSize, offset },
       );
+      if (
+        !result ||
+        typeof result !== "object" ||
+        !Array.isArray(result.items) ||
+        !Number.isSafeInteger(result.total) ||
+        result.total < 0 ||
+        !Number.isSafeInteger(result.limit) ||
+        result.limit <= 0 ||
+        !Number.isSafeInteger(result.offset) ||
+        result.offset !== offset
+      ) {
+        throw new Error(`${TAG} ${path} malformed paginated data`);
+      }
       total = result.total;
       allItems.push(...result.items);
+      if (allItems.length > total) {
+        throw new Error(`${TAG} ${path} malformed paginated data`);
+      }
       if (allItems.length >= total) break;
+      if (result.items.length === 0) {
+        throw new Error(`${TAG} ${path} malformed paginated data`);
+      }
       offset += pageSize;
     }
 

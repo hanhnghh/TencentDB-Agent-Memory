@@ -123,6 +123,35 @@ describe("validated Codex project binding", () => {
     await expect(readFile(resolveCredentialPath(userConfigDir))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("rejects a malformed auth success response before metadata access", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    const userConfigDir = join(root, "user-config");
+    await mkdir(projectDir);
+    const fetcher = vi.fn(async () => jsonResponse({
+      code: 0,
+      data: { valid: true, user: { user_id: { value: "user-1" } } },
+    })) as typeof fetch;
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir,
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      fetcher,
+    })).rejects.toThrow("User key is invalid or unauthorized");
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(resolveCredentialPath(userConfigDir))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("rejects missing, cross-team, or unauthorized IDs without persistence", async () => {
     const root = await makeTempRoot();
     const projectDir = join(root, "project");
@@ -206,6 +235,46 @@ describe("validated Codex project binding", () => {
     expect(message).toContain("[REDACTED]");
   });
 
+  it("rejects a malformed metadata success response without persistence", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    const userConfigDir = join(root, "user-config");
+    await mkdir(projectDir);
+    const base = successfulApi();
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/v3/meta/team/list") {
+        return jsonResponse({
+          code: 0,
+          data: {
+            items: [{ team_id: "team-1", name: "Team" }],
+            total: "1",
+            limit: 100,
+            offset: 0,
+          },
+        });
+      }
+      return base(input, init);
+    }) as typeof fetch;
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir,
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      fetcher,
+    })).rejects.toThrow("Unable to validate Team");
+
+    await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(resolveCredentialPath(userConfigDir))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("refuses secret-like project preferences before validation or persistence", async () => {
     const root = await makeTempRoot();
     const projectDir = join(root, "project");
@@ -231,5 +300,29 @@ describe("validated Codex project binding", () => {
     expect(fetcher).not.toHaveBeenCalled();
     await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(resolveCredentialPath(userConfigDir))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("refuses common compound secret names in project preferences", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    await mkdir(projectDir);
+    const fetcher = successfulApi();
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir: join(root, "user-config"),
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      preferences: { clientSecret: "must-not-be-local" },
+      fetcher,
+    })).rejects.toThrow("Project binding contains forbidden secret field 'clientSecret'");
+
+    expect(fetcher).not.toHaveBeenCalled();
   });
 });
