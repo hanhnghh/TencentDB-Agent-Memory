@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Protocol
 
 import httpx
 
@@ -31,6 +31,21 @@ class Stub(ABC):
 
     @abstractmethod
     def close(self) -> None:
+        ...
+
+
+class AsyncStub(Protocol):
+    """Structural transport interface shared by asynchronous clients."""
+
+    async def post(
+        self,
+        path: str,
+        body: dict,
+        timeout: Optional[float] = None,
+    ) -> dict:
+        ...
+
+    async def close(self) -> None:
         ...
 
 
@@ -75,7 +90,7 @@ class HttpStub(Stub):
 
     def post(self, path: str, body: dict, timeout: Optional[float] = None) -> dict:
         url = f"{self.endpoint}{path}"
-        logger.debug("Request %s %s", path, body)
+        logger.debug("Request POST %s", path)
         try:
             resp = self.client.post(
                 url=url,
@@ -87,7 +102,7 @@ class HttpStub(Stub):
             raise TDAMTransportError("timeout", f"POST {path} timed out") from exc
         except httpx.RequestError as exc:
             raise TDAMTransportError("network", f"POST {path} network failure") from exc
-        logger.debug("Response %s %s", path, resp.text)
+        logger.debug("Response %s status=%s", path, resp.status_code)
         return _decode_response(resp)
 
     def close(self) -> None:
@@ -124,7 +139,7 @@ class AsyncHttpStub:
 
     async def post(self, path: str, body: dict, timeout: Optional[float] = None) -> dict:
         url = f"{self.endpoint}{path}"
-        logger.debug("Request %s %s", path, body)
+        logger.debug("Request POST %s", path)
         try:
             resp = await self.client.post(
                 url=url,
@@ -136,7 +151,7 @@ class AsyncHttpStub:
             raise TDAMTransportError("timeout", f"POST {path} timed out") from exc
         except httpx.RequestError as exc:
             raise TDAMTransportError("network", f"POST {path} network failure") from exc
-        logger.debug("Response %s %s", path, resp.text)
+        logger.debug("Response %s status=%s", path, resp.status_code)
         return _decode_response(resp)
 
     async def close(self) -> None:
@@ -153,7 +168,7 @@ def _decode_response(resp: httpx.Response) -> dict:
     try:
         envelope = resp.json()
     except ValueError as exc:
-        message = resp.text or f"HTTP {resp.status_code} returned a non-JSON response"
+        message = f"HTTP {resp.status_code} returned a non-JSON response"
         if resp.is_error:
             raise TDAMError(resp.status_code, message, request_id) from exc
         raise TDAMResponseError(message, request_id) from exc

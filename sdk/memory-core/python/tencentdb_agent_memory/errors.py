@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional
+from typing import Any, Literal, Mapping, Optional
 
 
 class TDAMError(Exception):
@@ -46,7 +46,7 @@ class ParamError(Exception):
 class TDAMTransportError(TDAMError):
     """Typed retryable network/timeout failure."""
 
-    def __init__(self, kind: str, message: str) -> None:
+    def __init__(self, kind: Literal["network", "timeout"], message: str) -> None:
         super().__init__(408 if kind == "timeout" else -1, message)
         self.kind = kind
         self.retryable = True

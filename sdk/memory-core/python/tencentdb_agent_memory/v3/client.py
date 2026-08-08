@@ -34,9 +34,10 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-from .._http import Stub
+from .._conversation import validate_conversation_add_result
+from .._http import AsyncStub, Stub
 from .._v3_http import AsyncHttpStub, HttpStub
-from ..errors import ParamError, TDAMResponseError
+from ..errors import ParamError
 
 logger = logging.getLogger(__name__)
 
@@ -47,40 +48,6 @@ _UNSET = object()
 
 def _strip_none(d: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
-
-
-def _validate_conversation_add_result(
-    data: Any,
-    source_event_id: Optional[str],
-    content_hash: Optional[str],
-) -> Dict[str, Any]:
-    if not isinstance(data, dict):
-        raise TDAMResponseError("conversation/add response data must be an object")
-    if (
-        not isinstance(data.get("accepted_ids"), list)
-        or not all(isinstance(item, str) for item in data["accepted_ids"])
-        or not isinstance(data.get("accepted_versions"), list)
-        or not all(isinstance(item, str) for item in data["accepted_versions"])
-        or len(data["accepted_versions"]) != len(data["accepted_ids"])
-        or isinstance(data.get("total_count"), bool)
-        or not isinstance(data.get("total_count"), int)
-        or data["total_count"] != len(data["accepted_ids"])
-    ):
-        raise TDAMResponseError("conversation/add returned malformed receipt data")
-    if source_event_id is not None:
-        receipt = data.get("receipt")
-        if (
-            not isinstance(receipt, dict)
-            or receipt.get("source_event_id") != source_event_id
-            or not isinstance(receipt.get("content_hash"), str)
-            or (content_hash is not None and receipt.get("content_hash") != content_hash)
-            or receipt.get("status") not in ("committed", "duplicate")
-            or not isinstance(receipt.get("committed_at"), str)
-        ):
-            raise TDAMResponseError(
-                "conversation/add returned a malformed or mismatched source-event receipt"
-            )
-    return data
 
 
 def _validate_construction(team_id: str, agent_id: str, user_id: str) -> None:
@@ -243,7 +210,7 @@ class MemoryClient:
                 "messages": messages,
             }),
         )
-        return _validate_conversation_add_result(data, source_event_id, content_hash)
+        return validate_conversation_add_result(data, source_event_id, content_hash)
 
     def query_conversation(
         self,
@@ -537,7 +504,7 @@ class AsyncMemoryClient:
         task_id: Optional[str] = None,
         timeout: float = 30,
         verify: bool = True,
-        stub: Optional[Stub] = None,
+        stub: Optional[AsyncStub] = None,
     ) -> None:
         _validate_construction(team_id, agent_id, user_id)
         if stub is not None:
@@ -592,7 +559,7 @@ class AsyncMemoryClient:
                 "messages": messages,
             }),
         )
-        return _validate_conversation_add_result(data, source_event_id, content_hash)
+        return validate_conversation_add_result(data, source_event_id, content_hash)
 
     async def query_conversation(
         self,

@@ -1,15 +1,30 @@
-import type http from "node:http";
-import { describe, expect, it, vi } from "vitest";
+import http from "node:http";
+import { Socket } from "node:net";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { IMemoryStore, L0IngestionInput, L0IngestionReceipt } from "../core/store/types.js";
+import { VectorStore } from "../core/store/sqlite.js";
 import { handleConversationAdd, handleV2Route, type V2RouterDeps } from "./v2-router.js";
 import { conversationAddDataSchema } from "./v2-schemas.js";
 
 const auth = { serviceId: "memory-1" };
+const testStores: VectorStore[] = [];
 
-function makeDeps(store: Partial<IMemoryStore>): V2RouterDeps {
+type IngestionStoreOverrides = Partial<Pick<
+  IMemoryStore,
+  "upsertL0" | "getL0IngestionReceipt" | "commitL0Ingestion"
+>>;
+
+afterEach(() => {
+  for (const store of testStores.splice(0)) store.close();
+});
+
+function makeDeps(overrides: IngestionStoreOverrides): V2RouterDeps {
+  const store = Object.assign(new VectorStore(":memory:", 0), overrides);
+  store.init();
+  testStores.push(store);
   return {
-    getStore: () => store as IMemoryStore,
+    getStore: () => store,
     getEmbedding: () => undefined,
     getStorage: () => undefined,
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -35,17 +50,16 @@ async function dispatchConversationAdd(
     taskId?: string;
   } = {},
 ): Promise<{ status: number; envelope: Record<string, unknown> }> {
-  const request = {
-    headers: {
-      authorization: "Bearer test-key",
-      "x-tdai-service-id": identity.serviceId ?? "memory-1",
-      "x-tdai-team-id": identity.teamId ?? "team-1",
-      "x-tdai-user-id": identity.userId ?? "user-1",
-      "x-tdai-agent-id": identity.agentId ?? "agent-1",
-      ...(identity.taskId ? { "x-tdai-task-id": identity.taskId } : {}),
-    },
-  } as http.IncomingMessage;
-  const response = {} as http.ServerResponse;
+  const request = new http.IncomingMessage(new Socket());
+  request.headers = {
+    authorization: "Bearer test-key",
+    "x-tdai-service-id": identity.serviceId ?? "memory-1",
+    "x-tdai-team-id": identity.teamId ?? "team-1",
+    "x-tdai-user-id": identity.userId ?? "user-1",
+    "x-tdai-agent-id": identity.agentId ?? "agent-1",
+    ...(identity.taskId ? { "x-tdai-task-id": identity.taskId } : {}),
+  };
+  const response = new http.ServerResponse(request);
   const sendJson = vi.fn();
 
   const handled = await handleV2Route(
@@ -60,7 +74,13 @@ async function dispatchConversationAdd(
 
   expect(handled).toBe(true);
   expect(sendJson).toHaveBeenCalledTimes(1);
-  const [, status, envelope] = sendJson.mock.calls[0] as [http.ServerResponse, number, Record<string, unknown>];
+  const call: unknown = sendJson.mock.calls[0];
+  if (!Array.isArray(call) || typeof call[1] !== "number") throw new Error("Expected route response status");
+  const status = call[1];
+  const envelope: unknown = call[2];
+  if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
+    throw new Error("Expected route response envelope");
+  }
   return { status, envelope };
 }
 
@@ -109,9 +129,9 @@ describe("conversation/add ingestion receipts", () => {
         upsertL0: vi.fn(() => true),
         getL0IngestionReceipt: vi.fn(async (receiptKey: string) => receipts.get(receiptKey)),
         commitL0Ingestion: commit,
-      } as Partial<IMemoryStore>);
+      });
       deps.notifyPipeline = notifyPipeline;
-      deps.quotaManager = { checkMemoryQuota, reportMemoryAdded } as V2RouterDeps["quotaManager"];
+      deps.quotaManager = { checkMemoryQuota, reportMemoryAdded };
       const body = {
         session_id: "session-1",
         source_event_id: "event-lost-ack",
@@ -148,7 +168,7 @@ describe("conversation/add ingestion receipts", () => {
         upsertL0: vi.fn(() => true),
         getL0IngestionReceipt: vi.fn(async () => priorReceipt),
         commitL0Ingestion: vi.fn(),
-      } as Partial<IMemoryStore>);
+      });
 
       const { status, envelope } = await dispatchConversationAdd(pathname, {
         session_id: "session-1",
@@ -180,7 +200,7 @@ describe("conversation/add ingestion receipts", () => {
       upsertL0: vi.fn(() => false),
       getL0IngestionReceipt: vi.fn(async () => undefined),
       commitL0Ingestion: vi.fn(async () => ({ status: "failed" as const })),
-    } as Partial<IMemoryStore>);
+    });
     deps.notifyPipeline = notifyPipeline;
     const body = {
       session_id: "session-1",
@@ -218,7 +238,7 @@ describe("conversation/add ingestion receipts", () => {
             },
           };
         }),
-      } as Partial<IMemoryStore>);
+      });
       const baseIdentity = {
         serviceId: "memory-1",
         teamId: "team-1",
@@ -269,7 +289,7 @@ describe("conversation/add ingestion receipts", () => {
           committedAt: "2026-08-08T00:00:00.000Z",
         },
       })),
-    } as Partial<IMemoryStore>);
+    });
     const body = {
       session_id: "session-1",
       source_event_id: field === "source_event_id" ? "x".repeat(length) : "event-boundary",
@@ -307,7 +327,7 @@ describe("conversation/add ingestion receipts", () => {
             committedAt: "2026-08-08T00:00:00.000Z",
           },
         })),
-      } as Partial<IMemoryStore>);
+      });
       const body = {
         session_id: "session-1",
         source_event_id: "event-payload-boundary",
@@ -365,12 +385,12 @@ describe("conversation/add ingestion receipts", () => {
       upsertL0: vi.fn(() => true),
       getL0IngestionReceipt: vi.fn(async (receiptKey: string) => receipts.get(receiptKey)),
       commitL0Ingestion: commit,
-    } as Partial<IMemoryStore>);
+    });
     deps.notifyPipeline = notifyPipeline;
     deps.quotaManager = {
       checkMemoryQuota,
       reportMemoryAdded,
-    } as V2RouterDeps["quotaManager"];
+    };
 
     const body = {
       session_id: "session-1",
@@ -414,7 +434,7 @@ describe("conversation/add ingestion receipts", () => {
       upsertL0: vi.fn(() => true),
       getL0IngestionReceipt: vi.fn(async () => priorReceipt),
       commitL0Ingestion: vi.fn(async () => ({ status: "conflict", receipt: priorReceipt })),
-    } as Partial<IMemoryStore>);
+    });
 
     const response = await handleConversationAdd({
       session_id: "session-1",
@@ -451,7 +471,7 @@ describe("conversation/add ingestion receipts", () => {
       upsertL0: vi.fn(() => true),
       getL0IngestionReceipt: vi.fn(async (receiptKey: string) => receipts.get(receiptKey)),
       commitL0Ingestion: commit,
-    } as Partial<IMemoryStore>);
+    });
     const base = {
       session_id: "session-1",
       source_event_id: "event-reused-hash",
@@ -493,7 +513,7 @@ describe("conversation/add ingestion receipts", () => {
           },
         };
       }),
-    } as Partial<IMemoryStore>);
+    });
     const body = {
       session_id: "session-1",
       source_event_id: "event-shared",
@@ -528,7 +548,7 @@ describe("conversation/add ingestion receipts", () => {
           },
         };
       }),
-    } as Partial<IMemoryStore>);
+    });
     const body = {
       session_id: "session-1",
       source_event_id: "event-stable",
@@ -562,7 +582,7 @@ describe("conversation/add ingestion receipts", () => {
       upsertL0: vi.fn(() => true),
       getL0IngestionReceipt: vi.fn(async () => undefined),
       commitL0Ingestion: vi.fn(async () => ({ status: "failed" })),
-    } as Partial<IMemoryStore>);
+    });
     deps.notifyPipeline = notifyPipeline;
 
     const response = await handleConversationAdd({
@@ -583,15 +603,14 @@ describe("conversation/add ingestion receipts", () => {
         throw new Error("storage credentials leaked only to server logs");
       }),
       commitL0Ingestion: vi.fn(async () => ({ status: "failed" })),
-    } as Partial<IMemoryStore>);
+    });
     deps.notifyPipeline = notifyPipeline;
-    const request = {
-      headers: {
-        authorization: "Bearer test-key",
-        "x-tdai-service-id": "memory-1",
-      },
-    } as http.IncomingMessage;
-    const response = {} as http.ServerResponse;
+    const request = new http.IncomingMessage(new Socket());
+    request.headers = {
+      authorization: "Bearer test-key",
+      "x-tdai-service-id": "memory-1",
+    };
+    const response = new http.ServerResponse(request);
     const sendJson = vi.fn();
 
     const handled = await handleV2Route(

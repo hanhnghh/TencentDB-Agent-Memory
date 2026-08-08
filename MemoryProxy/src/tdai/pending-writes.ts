@@ -25,6 +25,55 @@
  */
 
 const pendingWrites = new Set<Promise<unknown>>();
+const sessionWriteTails = new Map<string, Promise<void>>();
+
+export interface L0WriteScope {
+  serviceId: string;
+  teamId: string;
+  userId: string;
+  agentId: string;
+  taskId?: string;
+  agentSource: string;
+  sessionId: string;
+}
+
+/** Serialize writes sharing the complete applicable L0 isolation tuple. */
+export async function withL0SessionOrdering<T>(
+  scope: L0WriteScope,
+  write: () => Promise<T>,
+): Promise<T> {
+  const key = JSON.stringify([
+    scope.serviceId,
+    scope.teamId,
+    scope.userId,
+    scope.agentId,
+    scope.taskId ?? "",
+    scope.agentSource,
+    scope.sessionId,
+  ]);
+  const prior = sessionWriteTails.get(key) ?? Promise.resolve();
+  let release = (): void => undefined;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = prior.then(() => current);
+  sessionWriteTails.set(key, tail);
+  await prior;
+  try {
+    return await write();
+  } finally {
+    release();
+    if (sessionWriteTails.get(key) === tail) sessionWriteTails.delete(key);
+  }
+}
+
+/** Reset module-owned ordering state between deterministic tests. */
+export function __resetL0WriteOrderingForTests(): void {
+  if (pendingWrites.size > 0 || sessionWriteTails.size > 0) {
+    throw new Error("Cannot reset while L0 writes are pending");
+  }
+  sessionWriteTails.clear();
+}
 
 /**
  * 注册一个 in-flight 写。返回同一个 promise 便于链式使用。

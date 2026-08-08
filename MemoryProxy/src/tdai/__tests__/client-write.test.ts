@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TdaiClient, TdaiWriteError } from "../client.js";
-import { withL0Retry } from "../pending-writes.js";
+import {
+  __resetL0WriteOrderingForTests,
+  withL0Retry,
+  withL0SessionOrdering,
+} from "../pending-writes.js";
 import { recordTdaiTurn } from "../recorder.js";
 import type { TdaiIdentity, TdaiMemoryConfig, TdaiMessage } from "../types.js";
 
@@ -25,13 +29,79 @@ const identity: TdaiIdentity = {
   sessionId: "session-1",
 };
 
+interface ConversationWriteBody {
+  sourceEventId: string;
+  contentHash: string;
+  messages: TdaiMessage[];
+}
+
+function parseConversationWriteBody(init: RequestInit): ConversationWriteBody {
+  if (typeof init.body !== "string") throw new Error("Expected JSON request body");
+  const body: unknown = JSON.parse(init.body);
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("Expected request object");
+  const sourceEventId = Reflect.get(body, "source_event_id");
+  const contentHash = Reflect.get(body, "content_hash");
+  const messages = Reflect.get(body, "messages");
+  if (typeof sourceEventId !== "string" || typeof contentHash !== "string" || !Array.isArray(messages)) {
+    throw new Error("Expected source-event conversation request");
+  }
+  const parsedMessages = messages.map((message: unknown): TdaiMessage => {
+    if (!message || typeof message !== "object" || Array.isArray(message)) {
+      throw new Error("Expected conversation message object");
+    }
+    const role = Reflect.get(message, "role");
+    const content = Reflect.get(message, "content");
+    if ((role !== "user" && role !== "assistant") || typeof content !== "string") {
+      throw new Error("Expected normalized conversation message");
+    }
+    return { role, content };
+  });
+  return { sourceEventId, contentHash, messages: parsedMessages };
+}
+
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  __resetL0WriteOrderingForTests();
 });
 
 describe("TdaiClient L0 write contract", () => {
+  it("serializes same-session writes while keeping agent-source scopes independent", async () => {
+    const order: string[] = [];
+    let releaseFirst = (): void => undefined;
+    const firstBlocked = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const scope = {
+      serviceId: "memory-1",
+      teamId: "team-1",
+      userId: "user-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      agentSource: "codebuddy",
+      sessionId: "session-1",
+    };
+
+    const first = withL0SessionOrdering(scope, async () => {
+      order.push("first:start");
+      await firstBlocked;
+      order.push("first:end");
+    });
+    const second = withL0SessionOrdering(scope, async () => {
+      order.push("second");
+    });
+    const otherSource = withL0SessionOrdering({ ...scope, agentSource: "claude-code" }, async () => {
+      order.push("other-source");
+    });
+
+    await otherSource;
+    expect(order).toEqual(["first:start", "other-source"]);
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(order).toEqual(["first:start", "other-source", "first:end", "second"]);
+  });
+
   it("derives stable but distinct source events for separate same-turn responses", async () => {
     const seenSourceEvents: string[] = [];
     const client = {
@@ -65,12 +135,8 @@ describe("TdaiClient L0 write contract", () => {
     vi.spyOn(Math, "random").mockReturnValue(0);
     vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
       request += 1;
-      const body = JSON.parse(String(init.body)) as {
-        source_event_id: string;
-        content_hash: string;
-        messages: unknown[];
-      };
-      seenEventIds.push(body.source_event_id);
+      const body = parseConversationWriteBody(init);
+      seenEventIds.push(body.sourceEventId);
       if (request === 2) {
         return new Response(JSON.stringify({ code: 503, message: "storage unavailable", request_id: "req-2" }), {
           status: 503,
@@ -78,7 +144,7 @@ describe("TdaiClient L0 write contract", () => {
         });
       }
       const duplicate = request === 3;
-      const acceptedIds = body.messages.map((_: unknown, index: number) => `${body.source_event_id}-${index}`);
+      const acceptedIds = body.messages.map((_, index) => `${body.sourceEventId}-${index}`);
       return new Response(JSON.stringify({
         code: 0,
         message: "ok",
@@ -88,8 +154,8 @@ describe("TdaiClient L0 write contract", () => {
           accepted_versions: acceptedIds.map(() => "v1"),
           total_count: acceptedIds.length,
           receipt: {
-            source_event_id: body.source_event_id,
-            content_hash: body.content_hash,
+            source_event_id: body.sourceEventId,
+            content_hash: body.contentHash,
             status: duplicate ? "duplicate" : "committed",
             committed_at: "2026-08-08T00:00:00.000Z",
           },
@@ -118,13 +184,9 @@ describe("TdaiClient L0 write contract", () => {
   ])("preserves the $count-message batch boundary without dropping content", async ({ count, expectedBatches }) => {
     const batches: Array<Array<{ content: string }>> = [];
     vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
-      const body = JSON.parse(String(init.body)) as {
-        source_event_id: string;
-        content_hash: string;
-        messages: Array<{ content: string }>;
-      };
+      const body = parseConversationWriteBody(init);
       batches.push(body.messages);
-      const acceptedIds = body.messages.map((_, index) => `${body.source_event_id}-${index}`);
+      const acceptedIds = body.messages.map((_, index) => `${body.sourceEventId}-${index}`);
       return new Response(JSON.stringify({
         code: 0,
         data: {
@@ -132,8 +194,8 @@ describe("TdaiClient L0 write contract", () => {
           accepted_versions: acceptedIds.map(() => "v1"),
           total_count: acceptedIds.length,
           receipt: {
-            source_event_id: body.source_event_id,
-            content_hash: body.content_hash,
+            source_event_id: body.sourceEventId,
+            content_hash: body.contentHash,
             status: "committed",
             committed_at: "2026-08-08T00:00:00.000Z",
           },
@@ -158,13 +220,9 @@ describe("TdaiClient L0 write contract", () => {
   ])("preserves all content at the $chars-character message boundary", async ({ chars, expectedChunks }) => {
     const chunks: string[] = [];
     vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
-      const body = JSON.parse(String(init.body)) as {
-        source_event_id: string;
-        content_hash: string;
-        messages: Array<{ content: string }>;
-      };
+      const body = parseConversationWriteBody(init);
       chunks.push(...body.messages.map(({ content }) => content));
-      const acceptedIds = body.messages.map((_, index) => `${body.source_event_id}-${index}`);
+      const acceptedIds = body.messages.map((_, index) => `${body.sourceEventId}-${index}`);
       return new Response(JSON.stringify({
         code: 0,
         data: {
@@ -172,8 +230,8 @@ describe("TdaiClient L0 write contract", () => {
           accepted_versions: acceptedIds.map(() => "v1"),
           total_count: acceptedIds.length,
           receipt: {
-            source_event_id: body.source_event_id,
-            content_hash: body.content_hash,
+            source_event_id: body.sourceEventId,
+            content_hash: body.contentHash,
             status: "committed",
             committed_at: "2026-08-08T00:00:00.000Z",
           },
@@ -218,6 +276,7 @@ describe("TdaiClient L0 write contract", () => {
 
     expect(error).toBeInstanceOf(TdaiWriteError);
     expect(error).toMatchObject({ kind: "http", status: 503, retryable: true });
+    expect(String(error)).not.toContain("upstream unavailable");
   });
 
   it("surfaces a permanent HTTP 400 write failure as typed and non-retryable", async () => {
@@ -278,7 +337,7 @@ describe("TdaiClient L0 write contract", () => {
 
   it("rejects mismatched success counts as a malformed response", async () => {
     vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
-      const body = JSON.parse(String(init.body)) as { source_event_id: string; content_hash: string };
+      const body = parseConversationWriteBody(init);
       return new Response(JSON.stringify({
         code: 0,
         data: {
@@ -286,8 +345,8 @@ describe("TdaiClient L0 write contract", () => {
           accepted_versions: [],
           total_count: 2,
           receipt: {
-            source_event_id: body.source_event_id,
-            content_hash: body.content_hash,
+            source_event_id: body.sourceEventId,
+            content_hash: body.contentHash,
             status: "committed",
             committed_at: "2026-08-08T00:00:00.000Z",
           },
@@ -334,5 +393,17 @@ describe("TdaiClient L0 write contract", () => {
       [{ role: "user", content: "hello" }],
       { sourceEventId: "event-write-failure" },
     )).rejects.toMatchObject({ kind: "network", retryable: true });
+  });
+
+  it("fails ACL checks closed when an allowed-looking response omits the envelope code", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      data: { allowed: true },
+    }), { status: 200 })));
+
+    await expect(new TdaiClient(config).checkAcl({
+      user_key: "user-key",
+      asset_id: "asset-1",
+      action: "read",
+    })).rejects.toThrow("acl/check malformed response envelope");
   });
 });

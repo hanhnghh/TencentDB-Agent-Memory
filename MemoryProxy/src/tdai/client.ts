@@ -389,14 +389,14 @@ export class TdaiClient {
       }
 
       const responseText = await response.text().catch(() => "");
-      let envelope: TdaiEnvelope<ConversationAddData> & { request_id?: string } | undefined;
+      let envelope: unknown;
       try {
-        envelope = JSON.parse(responseText) as TdaiEnvelope<ConversationAddData> & { request_id?: string };
+        envelope = JSON.parse(responseText);
       } catch (err) {
         if (!response.ok) {
           throw new TdaiWriteError(
             "http",
-            `tdai POST ${path} HTTP ${response.status}: ${responseText.slice(0, 200) || "non-JSON response"}`,
+            `tdai POST ${path} HTTP ${response.status} returned a non-JSON response`,
             isRetryableStatus(response.status),
             response.status,
             undefined,
@@ -415,41 +415,38 @@ export class TdaiClient {
         );
       }
 
+      if (!isUnknownRecord(envelope)) {
+        throw new TdaiWriteError("malformed", `tdai POST ${path} response is not an object`, true, response.status);
+      }
+      const responseMessage = typeof envelope.message === "string" ? envelope.message : undefined;
+      const responseCode = typeof envelope.code === "number" ? envelope.code : undefined;
+      const responseRequestId = typeof envelope.request_id === "string" ? envelope.request_id : undefined;
       if (!response.ok) {
         throw new TdaiWriteError(
           "http",
-          `tdai POST ${path} HTTP ${response.status}: ${envelope?.message ?? responseText.slice(0, 200)}`,
+          `tdai POST ${path} HTTP ${response.status}: ${responseMessage ?? "request failed"}`,
           isRetryableStatus(response.status),
           response.status,
-          envelope?.code,
-          envelope?.request_id,
+          responseCode,
+          responseRequestId,
         );
       }
-      if (typeof envelope?.code !== "number") {
+      if (responseCode === undefined) {
         throw new TdaiWriteError("malformed", `tdai POST ${path} response is missing numeric code`, true, response.status);
       }
-      if (envelope.code !== 0) {
+      if (responseCode !== 0) {
         throw new TdaiWriteError(
           "envelope",
-          `tdai POST ${path} envelope code=${envelope.code}: ${envelope.message ?? "unknown error"}`,
-          isRetryableStatus(envelope.code),
+          `tdai POST ${path} envelope code=${responseCode}: ${responseMessage ?? "unknown error"}`,
+          isRetryableStatus(responseCode),
           response.status,
-          envelope.code,
-          envelope.request_id,
+          responseCode,
+          responseRequestId,
         );
       }
 
       const data = envelope.data;
-      if (
-        !data
-        || !Array.isArray(data.accepted_ids)
-        || !data.accepted_ids.every((id) => typeof id === "string")
-        || !Array.isArray(data.accepted_versions)
-        || !data.accepted_versions.every((version) => typeof version === "string")
-        || data.accepted_versions.length !== data.accepted_ids.length
-        || !Number.isInteger(data.total_count)
-        || data.total_count !== data.accepted_ids.length
-      ) {
+      if (!isConversationAddData(data)) {
         throw new TdaiWriteError("malformed", `tdai POST ${path} response has malformed conversation receipt data`, true, response.status);
       }
       const expectedSourceEventId = body.source_event_id;
@@ -514,18 +511,23 @@ export class TdaiClient {
         }),
       });
       if (!res.ok) {
-        const body = await res.text().catch(() => "");
-        throw new Error(`acl/check http ${res.status}: ${body.slice(0, 200)}`);
+        throw new Error(`acl/check http ${res.status}`);
       }
-      const envelope = (await res.json()) as TdaiEnvelope<AclCheckResult>;
-      if (typeof envelope.code === "number" && envelope.code !== 0) {
-        throw new Error(`acl/check envelope code=${envelope.code} msg=${envelope.message ?? ""}`);
+      const envelope: unknown = await res.json();
+      if (!isUnknownRecord(envelope) || typeof envelope.code !== "number") {
+        throw new Error("acl/check malformed response envelope");
+      }
+      if (envelope.code !== 0) {
+        throw new Error(`acl/check envelope code=${envelope.code}`);
       }
       const data = envelope.data;
-      if (!data || typeof data.allowed !== "boolean") {
-        throw new Error(`acl/check malformed response: ${JSON.stringify(data).slice(0, 200)}`);
+      if (!isUnknownRecord(data) || typeof data.allowed !== "boolean") {
+        throw new Error("acl/check malformed response data");
       }
-      return data;
+      return {
+        allowed: data.allowed,
+        ...(typeof data.reason === "string" ? { reason: data.reason } : {}),
+      };
     } finally {
       clearTimeout(timer);
     }
@@ -578,13 +580,29 @@ function isConversationReceipt(
   sourceEventId: unknown,
   contentHash: unknown,
 ): value is TdaiConversationReceipt {
-  if (!value || typeof value !== "object") return false;
-  const receipt = value as Record<string, unknown>;
-  return receipt.source_event_id === sourceEventId
-    && typeof receipt.content_hash === "string"
-    && (contentHash === undefined || receipt.content_hash === contentHash)
-    && (receipt.status === "committed" || receipt.status === "duplicate")
-    && typeof receipt.committed_at === "string";
+  if (!isUnknownRecord(value)) return false;
+  return value.source_event_id === sourceEventId
+    && typeof value.content_hash === "string"
+    && (contentHash === undefined || value.content_hash === contentHash)
+    && (value.status === "committed" || value.status === "duplicate")
+    && typeof value.committed_at === "string"
+    && Number.isFinite(Date.parse(value.committed_at));
+}
+
+function isConversationAddData(value: unknown): value is ConversationAddData {
+  if (!isUnknownRecord(value)) return false;
+  return Array.isArray(value.accepted_ids)
+    && value.accepted_ids.every((id) => typeof id === "string")
+    && Array.isArray(value.accepted_versions)
+    && value.accepted_versions.every((version) => typeof version === "string")
+    && value.accepted_versions.length === value.accepted_ids.length
+    && typeof value.total_count === "number"
+    && Number.isInteger(value.total_count)
+    && value.total_count === value.accepted_ids.length;
+}
+
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** 打印敏感 userKey 时脱敏：只保留前 6 位 + 后 4 位。 */

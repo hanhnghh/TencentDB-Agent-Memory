@@ -5,6 +5,17 @@ import { ParamError, TDAMError, TDAMResponseError, TDAMTransportError } from "..
 import type { HttpTransportOptions } from "../http.js";
 import type { ApiResponseEnvelope } from "../types.js";
 
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isApiResponseEnvelope(value: unknown): value is ApiResponseEnvelope<unknown> {
+  return isUnknownRecord(value)
+    && typeof value.code === "number"
+    && typeof value.message === "string"
+    && typeof value.request_id === "string";
+}
+
 export class V3HttpTransport {
   private readonly endpoint: string;
   private readonly headers: Record<string, string>;
@@ -55,41 +66,42 @@ export class V3HttpTransport {
         signal: controller.signal,
       };
       if (this.dispatcher) fetchOptions.dispatcher = this.dispatcher;
-      const response = await fetch(`${this.endpoint}${path}`, fetchOptions as RequestInit);
+      const response = await fetch(`${this.endpoint}${path}`, fetchOptions);
       const responseText = await response.text().catch(() => "");
       const headerRequestId =
         response.headers.get("x-qcloud-transaction-id") ??
         response.headers.get("x-trace-id") ??
         "";
 
-      let envelope: ApiResponseEnvelope<T>;
+      let parsed: unknown;
       try {
-        envelope = JSON.parse(responseText) as ApiResponseEnvelope<T>;
+        parsed = JSON.parse(responseText);
       } catch (err) {
         if (!response.ok) {
           throw new TDAMError(
             response.status,
-            responseText || `HTTP ${response.status} returned a non-JSON response`,
+            `HTTP ${response.status} returned a non-JSON response`,
             headerRequestId,
           );
         }
         throw new TDAMResponseError(
-          responseText || `HTTP ${response.status} returned a non-JSON response`,
+          `HTTP ${response.status} returned a non-JSON response`,
           headerRequestId,
           { cause: err },
         );
       }
 
-      if (!envelope || typeof envelope !== "object" || typeof envelope.code !== "number") {
+      if (!isApiResponseEnvelope(parsed)) {
         throw new TDAMResponseError("API response must be an envelope with a numeric code", headerRequestId);
       }
+      const envelope = parsed;
 
-      const businessCode = typeof envelope.code === "number" ? envelope.code : undefined;
+      const businessCode = envelope.code;
       if (!response.ok || businessCode !== 0) {
         const code = businessCode && businessCode !== 0 ? businessCode : response.status;
         const details =
-          envelope.data && typeof envelope.data === "object"
-            ? (envelope.data as Record<string, unknown>)
+          isUnknownRecord(envelope.data)
+            ? envelope.data
             : undefined;
         throw new TDAMError(
           code,
@@ -99,12 +111,15 @@ export class V3HttpTransport {
         );
       }
 
-      const result = (envelope.data ?? {}) as T & { trace_id?: string };
-      const traceId = response.headers.get("x-trace-id");
-      if (traceId && result && typeof result === "object") {
-        (result as Record<string, unknown>).trace_id = traceId;
+      const result = envelope.data ?? {};
+      if (!isUnknownRecord(result)) {
+        throw new TDAMResponseError("API response data must be a JSON object", headerRequestId);
       }
-      return result;
+      const traceId = response.headers.get("x-trace-id");
+      const data = traceId ? { ...result, trace_id: traceId } : result;
+      // Endpoint-specific public clients validate their success payloads. The
+      // generic transport can only prove the shared object envelope here.
+      return data as T & { trace_id?: string };
     } catch (err) {
       if (err instanceof TDAMError) throw err;
       const timedOut = controller.signal.aborted;

@@ -47,6 +47,11 @@ import type {
   KnowledgeListResult,
   BatchDeleteResult,
 } from "./types.js";
+import {
+  parseReceiptStringArray,
+  requireReceiptString,
+  validateAcceptedReceiptArrays,
+} from "./l0-ingestion.js";
 import { DEFAULT_ISOLATION_ID } from "./types.js";
 import { TcvdbClient, TcvdbApiError } from "./tcvdb-client.js";
 import type { BM25LocalEncoder } from "./bm25-local.js";
@@ -72,6 +77,19 @@ export interface TcvdbMemoryStoreConfig {
 }
 
 const TAG = "[memory-tdai][tcvdb]";
+
+function l0IngestionOrderingKey(input: L0IngestionInput): string {
+  const record = input.records[0]?.record;
+  if (!record) return input.receiptKey;
+  return JSON.stringify([
+    record.teamId ?? "",
+    record.userId ?? "",
+    record.agentId ?? "",
+    record.taskId ?? "",
+    record.sessionId,
+    record.sessionKey,
+  ]);
+}
 
 /** Base collection suffixes (prefixed with database name at construction time). */
 const L1_COLLECTION_SUFFIX = "l1_memories";
@@ -976,13 +994,14 @@ export class TcvdbMemoryStore implements IMemoryStore {
   }
 
   async commitL0Ingestion(input: L0IngestionInput): Promise<L0IngestionCommitResult> {
-    const prior = this.l0IngestionTails.get(input.receiptKey) ?? Promise.resolve();
+    const orderingKey = l0IngestionOrderingKey(input);
+    const prior = this.l0IngestionTails.get(orderingKey) ?? Promise.resolve();
     let release: () => void = () => undefined;
     const current = new Promise<void>((resolve) => {
       release = resolve;
     });
     const tail = prior.then(() => current);
-    this.l0IngestionTails.set(input.receiptKey, tail);
+    this.l0IngestionTails.set(orderingKey, tail);
     await prior;
 
     try {
@@ -1030,8 +1049,8 @@ export class TcvdbMemoryStore implements IMemoryStore {
       return { status: "failed" };
     } finally {
       release();
-      if (this.l0IngestionTails.get(input.receiptKey) === tail) {
-        this.l0IngestionTails.delete(input.receiptKey);
+      if (this.l0IngestionTails.get(orderingKey) === tail) {
+        this.l0IngestionTails.delete(orderingKey);
       }
     }
   }
@@ -1045,13 +1064,20 @@ export class TcvdbMemoryStore implements IMemoryStore {
     });
     const doc = response.documents[0];
     if (!doc) return undefined;
+    const committedAtMs = doc.committed_at_ms;
+    if (typeof committedAtMs !== "number" || !Number.isFinite(committedAtMs)) {
+      throw new Error("Malformed L0 ingestion receipt field: committed_at_ms");
+    }
+    const acceptedIds = parseReceiptStringArray(doc.accepted_ids_json, "accepted_ids_json");
+    const acceptedVersions = parseReceiptStringArray(doc.accepted_versions_json, "accepted_versions_json");
+    validateAcceptedReceiptArrays(acceptedIds, acceptedVersions);
     return {
-      sourceEventId: String(doc.source_event_id),
-      contentHash: String(doc.content_hash),
-      payloadHash: String(doc.payload_hash),
-      acceptedIds: JSON.parse(String(doc.accepted_ids_json)) as string[],
-      acceptedVersions: JSON.parse(String(doc.accepted_versions_json)) as string[],
-      committedAt: new Date(Number(doc.committed_at_ms)).toISOString(),
+      sourceEventId: requireReceiptString(doc.source_event_id, "source_event_id"),
+      contentHash: requireReceiptString(doc.content_hash, "content_hash"),
+      payloadHash: requireReceiptString(doc.payload_hash, "payload_hash"),
+      acceptedIds,
+      acceptedVersions,
+      committedAt: new Date(committedAtMs).toISOString(),
     };
   }
 

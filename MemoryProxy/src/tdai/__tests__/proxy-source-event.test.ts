@@ -5,7 +5,7 @@ import { createApp } from "../../server.js";
 import { __resetSessionStoreForTests, getSessionStore } from "../../session/store.js";
 import type { AgentDetail, SessionInfo, TaskDetail } from "../../session/types.js";
 import type { ProxyConfig } from "../../types.js";
-import { flushPendingWrites } from "../pending-writes.js";
+import { __resetL0WriteOrderingForTests, flushPendingWrites } from "../pending-writes.js";
 
 const identity = {
   spaceId: "memory-1",
@@ -89,11 +89,17 @@ async function seedSession(agentSource: "claude-code" | "codebuddy"): Promise<vo
 }
 
 function parseBody(init: RequestInit | undefined): Record<string, unknown> {
-  return JSON.parse(String(init?.body)) as Record<string, unknown>;
+  if (typeof init?.body !== "string") throw new Error("Expected JSON request body");
+  const body: unknown = JSON.parse(init.body);
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("Expected request object");
+  const result: Record<string, unknown> = {};
+  for (const key of Object.keys(body)) result[key] = Reflect.get(body, key);
+  return result;
 }
 
 afterEach(() => {
   __resetSessionStoreForTests();
+  __resetL0WriteOrderingForTests();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -164,7 +170,8 @@ describe("proxy routes propagate duplicate-safe L0 source identity", () => {
       if (url.endsWith("/v3/conversation/add")) {
         const body = parseBody(init);
         writes.push(body);
-        const messages = body.messages as unknown[];
+        const messages = body.messages;
+        if (!Array.isArray(messages)) throw new Error("Expected conversation messages");
         const acceptedIds = messages.map((_, index) => `msg-${index}`);
         return new Response(JSON.stringify({
           code: 0,
@@ -189,11 +196,17 @@ describe("proxy routes propagate duplicate-safe L0 source identity", () => {
       if (value !== undefined) headers.set(name, value);
     }
     headers.set("x-conversation-id", identity.sessionId);
-    headers.set("x-user-id", identity.userId);
+    headers.set("x-user-id", "caller-supplied-user");
     const response = await createApp(proxyConfig).request(fixture.path, {
       method: "POST",
       headers,
-      body: JSON.stringify(fixture.request),
+      body: JSON.stringify({
+        ...fixture.request,
+        team_id: "caller-supplied-team",
+        user_id: "caller-supplied-user",
+        agent_id: "caller-supplied-agent",
+        task_id: "caller-supplied-task",
+      }),
     });
 
     expect(response.status).toBe(200);
@@ -206,7 +219,7 @@ describe("proxy routes propagate duplicate-safe L0 source identity", () => {
       task_id: identity.taskId,
       session_id: identity.sessionId,
       source_event_id: expect.stringMatching(
-        new RegExp(`^proxy:${identity.sessionId}:turn:\\d+:payload:[a-f0-9]{24}:batch:0-of-1$`),
+        new RegExp(`^proxy:${fixture.agentSource}:${identity.sessionId}:turn:\\d+:payload:[a-f0-9]{24}:batch:0-of-1$`),
       ),
       content_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
     });

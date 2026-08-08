@@ -34,6 +34,9 @@ class AsyncStub:
         self.calls.append((path, body))
         return self.response
 
+    async def close(self) -> None:
+        pass
+
 
 def receipt_data() -> dict:
     return {
@@ -288,6 +291,28 @@ def test_v3_client_rejects_mismatched_receipt_content_hash() -> None:
         )
 
 
+def test_v3_client_rejects_invalid_receipt_timestamp() -> None:
+    response = receipt_data()
+    response["receipt"]["committed_at"] = "not-a-timestamp"
+    client = MemoryClient(
+        endpoint="http://memory-core.test",
+        api_key="key",
+        service_id="memory-1",
+        team_id="team-1",
+        agent_id="agent-1",
+        user_id="user-1",
+        session_id="session-1",
+        stub=Stub(response),
+    )
+
+    with pytest.raises(TDAMResponseError):
+        client.add_conversation(
+            [{"role": "user", "content": "hello"}],
+            source_event_id="event-1",
+            content_hash="hash-1",
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("client_kind", ["v2", "v3"])
 async def test_async_v2_and_v3_clients_reject_mismatched_success_counts(
@@ -400,6 +425,7 @@ def test_sync_v2_and_v3_http_stubs_classify_non_json_failure_by_status(
     assert not isinstance(caught.value, TDAMResponseError)
     assert caught.value.code == status
     assert caught.value.retryable is retryable
+    assert "plain-text failure" not in str(caught.value)
 
 
 @pytest.mark.parametrize("stub_cls", [V2HttpStub, HttpStub], ids=["v2", "v3"])

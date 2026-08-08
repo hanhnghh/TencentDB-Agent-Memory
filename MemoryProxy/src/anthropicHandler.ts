@@ -42,7 +42,7 @@ import { handleSystemUserPassthrough } from "./systemUserPassthrough.js";
 import { TdaiClient } from "./tdai/client.js";
 import { deriveTdaiIdentity } from "./tdai/identity.js";
 import { extractLatestUserMessage, recordTdaiTurn } from "./tdai/recorder.js";
-import { trackWrite, withL0Retry } from "./tdai/pending-writes.js";
+import { trackWrite, withL0Retry, withL0SessionOrdering } from "./tdai/pending-writes.js";
 import type { TdaiIdentity, TdaiMessage } from "./tdai/types.js";
 import { triggerSkillExtractIfReady } from "./skill/handler-glue.js";
 import { isExtractionAllowed, logExtractionSkipped } from "./extraction-gate.js";
@@ -1460,10 +1460,21 @@ export async function handleAnthropicMessages(
   // 常用的 stream:false）沉默丢失。缺失该调用意味着 CC non-stream 场景
   // 完全没有 L0 记忆写入。
   if (isMainDialog && tdaiClient && isExtractionAllowed(config, "tdai-memory")) {
-    recordTdaiTurn(tdaiClient, tdaiIdentity, tdaiUserMessage, outputContent, {
-      sourceEventId: `proxy:${sessionKey}:turn:${lf.turnSeq}`,
-    })
-      .catch((err: unknown) => pipe.error("TDAI_L0", err));
+    await withL0SessionOrdering({
+      serviceId: config.tdai.serviceId || "default",
+      teamId: tdaiIdentity?.teamId ?? "",
+      userId: tdaiIdentity?.userId ?? "",
+      agentId: tdaiIdentity?.agentId ?? "",
+      taskId: tdaiIdentity?.taskId,
+      agentSource,
+      sessionId: sessionKey,
+    }, () => withL0Retry(() => recordTdaiTurn(
+      tdaiClient,
+      tdaiIdentity,
+      tdaiUserMessage,
+      outputContent,
+      { sourceEventId: `proxy:${agentSource}:${sessionKey}:turn:${lf.turnSeq}` },
+    ))).catch((err: unknown) => pipe.error("TDAI_L0", err));
   } else if (isMainDialog && tdaiClient) {
     logExtractionSkipped(config, "tdai-memory", sessionKey);
   } else if (!isMainDialog) {
@@ -1775,19 +1786,30 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
       const isMainDialog = ctx.requestKind === "main";
 
       // Tdai L0 write
-      if (isMainDialog && ctx.tdaiClient && isExtractionAllowed(ctx.config, "tdai-memory")) {
+      const tdaiClient = ctx.tdaiClient;
+      if (isMainDialog && tdaiClient && isExtractionAllowed(ctx.config, "tdai-memory")) {
         // Streaming 不 await（会拖慢 SSE 关流），trackWrite + withL0Retry 应对两条丢包线：
         //   - trackWrite 注册 in-flight promise 到全局 set；SIGTERM 时 index.ts 会
         //     flushPendingWrites 兜底，避免 pod rolling 时 event loop 未 flush 就退出丢 L0。
         //   - withL0Retry 3 次退避重试（~3.5s），挡 tdai kernel 瞬断 / 5xx / 网络抖动。
         trackWrite(
-          withL0Retry(() => recordTdaiTurn(
-            ctx.tdaiClient!, ctx.tdaiIdentity, ctx.tdaiUserMessage,
+          withL0SessionOrdering({
+            serviceId: ctx.config.tdai.serviceId || "default",
+            teamId: ctx.tdaiIdentity?.teamId ?? "",
+            userId: ctx.tdaiIdentity?.userId ?? "",
+            agentId: ctx.tdaiIdentity?.agentId ?? "",
+            taskId: ctx.tdaiIdentity?.taskId,
+            agentSource: ctx.agentSource,
+            sessionId: ctx.sessionKeyForSkill,
+          }, () => withL0Retry(() => recordTdaiTurn(
+            tdaiClient,
+            ctx.tdaiIdentity,
+            ctx.tdaiUserMessage,
             outputText || null,
-            { sourceEventId: `proxy:${ctx.sessionKeyForSkill}:turn:${lf.turnSeq}` },
-          )).catch((err: unknown) => pipe.error("TDAI_L0", err))
+            { sourceEventId: `proxy:${ctx.agentSource}:${ctx.sessionKeyForSkill}:turn:${lf.turnSeq}` },
+          ))).catch((err: unknown) => pipe.error("TDAI_L0", err))
         );
-      } else if (isMainDialog && ctx.tdaiClient) {
+      } else if (isMainDialog && tdaiClient) {
         logExtractionSkipped(ctx.config, "tdai-memory", ctx.sessionKeyForSkill);
       } else if (!isMainDialog) {
         console.log(`[cc-routing] skip L0 write (stream) for kind=${ctx.requestKind} session=${ctx.sessionKeyForSkill}`);

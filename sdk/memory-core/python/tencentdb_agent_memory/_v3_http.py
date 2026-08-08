@@ -44,7 +44,7 @@ def _decode_response(resp: httpx.Response) -> dict:
     try:
         envelope = resp.json()
     except ValueError as exc:
-        message = resp.text or f"HTTP {resp.status_code} returned a non-JSON response"
+        message = f"HTTP {resp.status_code} returned a non-JSON response"
         if resp.is_error:
             raise TDAMError(resp.status_code, message, header_request_id) from exc
         raise TDAMResponseError(message, header_request_id) from exc
@@ -111,7 +111,7 @@ class HttpStub(Stub):
             raise TDAMTransportError("timeout", f"POST {path} timed out") from exc
         except httpx.RequestError as exc:
             raise TDAMTransportError("network", f"POST {path} network failure") from exc
-        logger.debug("Response %s %s", path, resp.text)
+        logger.debug("Response %s status=%s", path, resp.status_code)
         return _decode_response(resp)
 
     def close(self) -> None:
@@ -155,7 +155,7 @@ class AsyncHttpStub:
             raise TDAMTransportError("timeout", f"POST {path} timed out") from exc
         except httpx.RequestError as exc:
             raise TDAMTransportError("network", f"POST {path} network failure") from exc
-        logger.debug("Response %s %s", path, resp.text)
+        logger.debug("Response %s status=%s", path, resp.status_code)
         return _decode_response(resp)
 
     async def close(self) -> None:

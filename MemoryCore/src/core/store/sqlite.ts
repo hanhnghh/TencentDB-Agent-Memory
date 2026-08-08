@@ -59,6 +59,12 @@ import type {
   AuditEntry,
   AuditQueryFilter,
 } from "./types.js";
+import {
+  isUnknownRecord,
+  parseReceiptStringArray,
+  requireReceiptString,
+  validateAcceptedReceiptArrays,
+} from "./l0-ingestion.js";
 import { DEFAULT_ISOLATION_ID, rowMatchesIsolation } from "./types.js";
 import { SKILLS_DDL, SKILL_FTS_DDL } from "../skill/skill-store-ddl.js";
 import type { Logger } from "../types.js";
@@ -120,6 +126,14 @@ export interface L0RecordRow {
 }
 
 const TAG = "[memory-tdai][sqlite]";
+
+function requireReceiptTimestamp(value: unknown): string {
+  const timestamp = requireReceiptString(value, "committed_at");
+  if (!Number.isFinite(Date.parse(timestamp))) {
+    throw new Error("Malformed L0 ingestion receipt field: committed_at");
+  }
+  return timestamp;
+}
 
 /** Persisted metadata about the embedding provider used to generate stored vectors. */
 interface EmbeddingMeta {
@@ -1791,74 +1805,9 @@ export class VectorStore implements IMemoryStore {
       return false;
     }
     try {
-      const skipVec = !embedding || embedding.every(v => v === 0) || !this.vecTablesReady;
-
-      this.logger?.debug?.(
-        `${TAG} [L0-upsert] START id=${record.id}, session=${record.sessionKey}, role=${record.role}, ` +
-        `text="${record.messageText.slice(0, 60)}..."` +
-        (embedding
-          ? `, embeddingDims=${embedding.length}, ` +
-            `embeddingNorm=${Math.sqrt(Array.from(embedding).reduce((s, v) => s + v * v, 0)).toFixed(4)}` +
-            `${skipVec ? " (ZERO VECTOR or vec tables not ready — vec write will be skipped)" : ""}`
-          : " (no embedding — metadata-only write)"),
-      );
-
       this.db.exec("BEGIN");
       try {
-        // Legacy callers may omit isolation fields; normalize them to the
-        // same default identity used by schema defaults and query filters.
-        this.stmtL0UpsertMeta.run(
-          record.id,
-          record.sessionKey,
-          record.sessionId || DEFAULT_ISOLATION_ID,
-          (record as L0Record & { teamId?: string }).teamId || DEFAULT_ISOLATION_ID,
-          record.taskId || "",
-          record.role,
-          record.messageText,
-          record.recordedAt,
-          record.timestamp,
-          (record as L0Record & { userId?: string }).userId || DEFAULT_ISOLATION_ID,
-          (record as L0Record & { agentId?: string }).agentId || DEFAULT_ISOLATION_ID,
-        );
-
-        if (!skipVec) {
-          // vec0 does not support ON CONFLICT → delete then insert
-          this.stmtL0DeleteVec!.run(record.id);
-          this.stmtL0InsertVec!.run(record.id, Buffer.from(embedding!.buffer), record.recordedAt);
-        } else {
-          this.logger?.debug?.(
-            `${TAG} [L0-upsert] Skipping vec write (${embedding ? "zero vector" : "no embedding"}) id=${record.id}`,
-          );
-        }
-
-        // Sync FTS5 (delete + re-insert to handle updates).
-        // user_id / agent_id mirrored into FTS so post-recall isolation
-        // filtering doesn't require a join.
-        if (this.ftsAvailable) {
-          try {
-            this.stmtL0FtsDelete.run(record.id);
-            this.stmtL0FtsInsert.run(
-              tokenizeForFts(record.messageText), // message_text — segmented for indexing
-              record.messageText,                 // message_text_original — raw for display
-              record.id,
-              record.sessionKey,
-              record.sessionId || DEFAULT_ISOLATION_ID,
-              (record as L0Record & { teamId?: string }).teamId || DEFAULT_ISOLATION_ID,
-              record.taskId || "",
-              (record as L0Record & { userId?: string }).userId || DEFAULT_ISOLATION_ID,
-              (record as L0Record & { agentId?: string }).agentId || DEFAULT_ISOLATION_ID,
-              record.role,
-              record.recordedAt,
-              record.timestamp,
-            );
-          } catch (ftsErr) {
-            // FTS write failure is non-fatal — log and continue
-            this.logger?.warn(
-              `${TAG} [L0-upsert] FTS write failed (non-fatal) id=${record.id}: ${ftsErr instanceof Error ? ftsErr.message : String(ftsErr)}`,
-            );
-          }
-        }
-
+        this.writeL0Record(record, embedding);
         this.db.exec("COMMIT");
       } catch (err) {
         try {
@@ -1866,7 +1815,7 @@ export class VectorStore implements IMemoryStore {
         } catch { /* ignore rollback errors */ }
         throw err;
       }
-      this.logger?.debug?.(`${TAG} [L0-upsert] OK id=${record.id}${skipVec ? " (meta-only)" : ""}`);
+      this.logger?.debug?.(`${TAG} [L0-upsert] OK id=${record.id}`);
       return true;
     } catch (err) {
       this.logger?.warn(
@@ -1877,19 +1826,23 @@ export class VectorStore implements IMemoryStore {
   }
 
   getL0IngestionReceipt(receiptKey: string): L0IngestionReceipt | undefined {
-    const row = this.db.prepare(`
+    const row: unknown = this.db.prepare(`
       SELECT source_event_id, content_hash, payload_hash, accepted_ids_json,
              accepted_versions_json, committed_at
       FROM l0_ingestion_receipts WHERE receipt_key = ?
-    `).get(receiptKey) as Record<string, unknown> | undefined;
+    `).get(receiptKey);
     if (!row) return undefined;
+    if (!isUnknownRecord(row)) throw new Error("Malformed L0 ingestion receipt row");
+    const acceptedIds = parseReceiptStringArray(row.accepted_ids_json, "accepted_ids_json");
+    const acceptedVersions = parseReceiptStringArray(row.accepted_versions_json, "accepted_versions_json");
+    validateAcceptedReceiptArrays(acceptedIds, acceptedVersions);
     return {
-      sourceEventId: String(row.source_event_id),
-      contentHash: String(row.content_hash),
-      payloadHash: String(row.payload_hash),
-      acceptedIds: JSON.parse(String(row.accepted_ids_json)) as string[],
-      acceptedVersions: JSON.parse(String(row.accepted_versions_json)) as string[],
-      committedAt: String(row.committed_at),
+      sourceEventId: requireReceiptString(row.source_event_id, "source_event_id"),
+      contentHash: requireReceiptString(row.content_hash, "content_hash"),
+      payloadHash: requireReceiptString(row.payload_hash, "payload_hash"),
+      acceptedIds,
+      acceptedVersions,
+      committedAt: requireReceiptTimestamp(row.committed_at),
     };
   }
 
@@ -1904,24 +1857,26 @@ export class VectorStore implements IMemoryStore {
     });
 
     try {
-      const existing = this.getL0IngestionReceipt(input.receiptKey);
-      if (existing) return classifyExisting(existing);
-
-      // Deterministic record IDs make replay safe if a process stops after a
-      // subset is durable but before the receipt row is inserted.
-      for (const entry of input.records) {
-        if (!this.upsertL0(entry.record, entry.embedding)) return { status: "failed" };
-      }
-
-      const receipt: L0IngestionReceipt = {
-        sourceEventId: input.sourceEventId,
-        contentHash: input.contentHash,
-        payloadHash: input.payloadHash,
-        acceptedIds: input.records.map(({ record }) => record.id),
-        acceptedVersions: input.records.map(() => "v1"),
-        committedAt: new Date().toISOString(),
-      };
+      // BEGIN IMMEDIATE serializes competing writers before receipt lookup.
+      // L0 rows and the receipt then commit or roll back as one mutation.
+      this.db.exec("BEGIN IMMEDIATE");
       try {
+        const existing = this.getL0IngestionReceipt(input.receiptKey);
+        if (existing) {
+          this.db.exec("COMMIT");
+          return classifyExisting(existing);
+        }
+
+        for (const entry of input.records) this.writeL0Record(entry.record, entry.embedding);
+
+        const receipt: L0IngestionReceipt = {
+          sourceEventId: input.sourceEventId,
+          contentHash: input.contentHash,
+          payloadHash: input.payloadHash,
+          acceptedIds: input.records.map(({ record }) => record.id),
+          acceptedVersions: input.records.map(() => "v1"),
+          committedAt: new Date().toISOString(),
+        };
         this.db.prepare(`
           INSERT INTO l0_ingestion_receipts (
             receipt_key, source_event_id, content_hash, payload_hash,
@@ -1936,17 +1891,76 @@ export class VectorStore implements IMemoryStore {
           JSON.stringify(receipt.acceptedVersions),
           receipt.committedAt,
         );
+        this.db.exec("COMMIT");
         return { status: "committed", receipt };
-      } catch {
-        // A concurrent identical request may have won the unique-key race.
-        const raced = this.getL0IngestionReceipt(input.receiptKey);
-        return raced ? classifyExisting(raced) : { status: "failed" };
+      } catch (err) {
+        try {
+          this.db.exec("ROLLBACK");
+        } catch { /* preserve the original storage failure */ }
+        throw err;
       }
     } catch (err) {
       this.logger?.warn(
         `${TAG} [L0-ingestion] FAILED event=${input.sourceEventId}: ${err instanceof Error ? err.message : String(err)}`,
       );
       return { status: "failed" };
+    }
+  }
+
+  /** Write one L0 record inside the caller-owned transaction. */
+  private writeL0Record(record: L0Record, embedding: Float32Array | undefined): void {
+    const skipVec = !embedding || embedding.every((value) => value === 0) || !this.vecTablesReady;
+    this.logger?.debug?.(
+      `${TAG} [L0-upsert] START id=${record.id}, session=${record.sessionKey}, role=${record.role}` +
+      (embedding ? `, embeddingDims=${embedding.length}` : " (no embedding — metadata-only write)"),
+    );
+
+    this.stmtL0UpsertMeta.run(
+      record.id,
+      record.sessionKey,
+      record.sessionId || DEFAULT_ISOLATION_ID,
+      record.teamId || DEFAULT_ISOLATION_ID,
+      record.taskId || "",
+      record.role,
+      record.messageText,
+      record.recordedAt,
+      record.timestamp,
+      record.userId || DEFAULT_ISOLATION_ID,
+      record.agentId || DEFAULT_ISOLATION_ID,
+    );
+
+    if (!skipVec) {
+      const deleteVector = this.stmtL0DeleteVec;
+      const insertVector = this.stmtL0InsertVec;
+      if (!embedding || !deleteVector || !insertVector) {
+        throw new Error("L0 vector statements are unavailable");
+      }
+      deleteVector.run(record.id);
+      insertVector.run(record.id, Buffer.from(embedding.buffer), record.recordedAt);
+    }
+
+    if (this.ftsAvailable) {
+      try {
+        this.stmtL0FtsDelete.run(record.id);
+        this.stmtL0FtsInsert.run(
+          tokenizeForFts(record.messageText),
+          record.messageText,
+          record.id,
+          record.sessionKey,
+          record.sessionId || DEFAULT_ISOLATION_ID,
+          record.teamId || DEFAULT_ISOLATION_ID,
+          record.taskId || "",
+          record.userId || DEFAULT_ISOLATION_ID,
+          record.agentId || DEFAULT_ISOLATION_ID,
+          record.role,
+          record.recordedAt,
+          record.timestamp,
+        );
+      } catch (ftsErr) {
+        this.logger?.warn(
+          `${TAG} [L0-upsert] FTS write failed (non-fatal) id=${record.id}: ${ftsErr instanceof Error ? ftsErr.message : String(ftsErr)}`,
+        );
+      }
     }
   }
 

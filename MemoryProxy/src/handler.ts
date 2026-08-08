@@ -41,7 +41,7 @@ import { handleSystemUserPassthrough } from "./systemUserPassthrough.js";
 import { TdaiClient } from "./tdai/client.js";
 import { deriveTdaiIdentity } from "./tdai/identity.js";
 import { extractLatestUserMessage, recordTdaiTurn } from "./tdai/recorder.js";
-import { trackWrite, withL0Retry } from "./tdai/pending-writes.js";
+import { trackWrite, withL0Retry, withL0SessionOrdering } from "./tdai/pending-writes.js";
 import type { TdaiIdentity, TdaiMessage } from "./tdai/types.js";
 import { triggerSkillExtractIfReady } from "./skill/handler-glue.js";
 import { isExtractionAllowed, logExtractionSkipped } from "./extraction-gate.js";
@@ -1216,9 +1216,21 @@ export async function handleChatCompletions(
     }
 
     if (tdaiClient && isExtractionAllowed(config, "tdai-memory")) {
-      await recordTdaiTurn(tdaiClient, tdaiIdentity, tdaiUserMessage, assistantContentForTdai(assistantMessage), {
-        sourceEventId: `proxy:${sessionKey}:turn:${lf.turnSeq}`,
-      });
+      await withL0SessionOrdering({
+        serviceId: config.tdai.serviceId || "default",
+        teamId: tdaiIdentity?.teamId ?? "",
+        userId: tdaiIdentity?.userId ?? "",
+        agentId: tdaiIdentity?.agentId ?? "",
+        taskId: tdaiIdentity?.taskId,
+        agentSource,
+        sessionId: sessionKey,
+      }, () => withL0Retry(() => recordTdaiTurn(
+        tdaiClient,
+        tdaiIdentity,
+        tdaiUserMessage,
+        assistantContentForTdai(assistantMessage),
+        { sourceEventId: `proxy:${agentSource}:${sessionKey}:turn:${lf.turnSeq}` },
+      )));
     } else if (tdaiClient) {
       logExtractionSkipped(config, "tdai-memory", sessionKey);
     }
@@ -1632,19 +1644,30 @@ function createUsageTapTransform(ctx: TapContext): TransformStream<Uint8Array, U
       }
     }
 
-    if (ctx.tdaiClient && isExtractionAllowed(ctx.config, "tdai-memory")) {
+    const tdaiClient = ctx.tdaiClient;
+    if (tdaiClient && isExtractionAllowed(ctx.config, "tdai-memory")) {
       // Streaming 不 await（会拖慢 SSE 关流体感），改成 trackWrite + 重试：
       //   - trackWrite 注册 in-flight promise 到全局 set；SIGTERM 时 index.ts 会
       //     flushPendingWrites 等待或超时兜底，避免 pod rolling 时丢 L0。
       //   - withL0Retry 应对 tdai kernel 瞬断 / 5xx（3 次退避 ~3.5s 总时长）。
       trackWrite(
-        withL0Retry(() => recordTdaiTurn(
-          ctx.tdaiClient!, ctx.tdaiIdentity, ctx.tdaiUserMessage,
+        withL0SessionOrdering({
+          serviceId: ctx.config.tdai.serviceId || "default",
+          teamId: ctx.tdaiIdentity?.teamId ?? "",
+          userId: ctx.tdaiIdentity?.userId ?? "",
+          agentId: ctx.tdaiIdentity?.agentId ?? "",
+          taskId: ctx.tdaiIdentity?.taskId,
+          agentSource: ctx.agentSource,
+          sessionId: ctx.sessionKeyForSkill,
+        }, () => withL0Retry(() => recordTdaiTurn(
+          tdaiClient,
+          ctx.tdaiIdentity,
+          ctx.tdaiUserMessage,
           outputMessageContent(outputMessage),
-          { sourceEventId: `proxy:${ctx.sessionKeyForSkill}:turn:${lf.turnSeq}` },
-        )).catch((err: unknown) => pipe.error("TDAI_L0", err))
+          { sourceEventId: `proxy:${ctx.agentSource}:${ctx.sessionKeyForSkill}:turn:${lf.turnSeq}` },
+        ))).catch((err: unknown) => pipe.error("TDAI_L0", err))
       );
-    } else if (ctx.tdaiClient) {
+    } else if (tdaiClient) {
       logExtractionSkipped(ctx.config, "tdai-memory", ctx.sessionKeyForSkill);
     }
 

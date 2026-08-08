@@ -63,12 +63,12 @@ class IsolationContext {
   }
 
   baseBody(): V3IsolationContext {
-    return stripUndefined({
+    return {
       team_id: this.teamId,
       agent_id: this.agentId,
       user_id: this.userId,
-      task_id: this.taskId,
-    }) as unknown as V3IsolationContext;
+      ...(this.taskId ? { task_id: this.taskId } : {}),
+    };
   }
 
   resolveSession(override?: string): string | undefined {
@@ -188,6 +188,7 @@ export class MemoryClient {
         || (params.content_hash !== undefined && receipt.content_hash !== params.content_hash)
         || (receipt.status !== "committed" && receipt.status !== "duplicate")
         || typeof receipt.committed_at !== "string"
+        || !Number.isFinite(Date.parse(receipt.committed_at))
       ) {
         throw new TDAMResponseError("conversation/add returned a malformed or mismatched source-event receipt");
       }
@@ -326,7 +327,7 @@ export class MemoryClient {
   // -- L3 Core ------------------------------------------------------------
 
   readCore(_params: V3CoreReadRequest = {}): Promise<V3CoreFile> {
-    return this.http.post(`${V3}/core/read`, this.iso.baseBody() as unknown as Record<string, unknown>);
+    return this.http.post(`${V3}/core/read`, { ...this.iso.baseBody() });
   }
 
   writeCore(params: V3CoreWriteRequest): Promise<V3CoreWriteData> {
@@ -334,6 +335,6 @@ export class MemoryClient {
   }
 
   countCore(): Promise<V3CountData> {
-    return this.http.post(`${V3}/core/count`, this.iso.baseBody() as unknown as Record<string, unknown>);
+    return this.http.post(`${V3}/core/count`, { ...this.iso.baseBody() });
   }
 }
