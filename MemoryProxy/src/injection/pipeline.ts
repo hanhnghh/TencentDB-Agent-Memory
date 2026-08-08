@@ -26,6 +26,18 @@ import type { HookCacheRepo } from "../db/hookCacheRepo.js";
 import type { InjectionObserver, HookResult } from "./observer.js";
 import { NoopInjectionObserver } from "./observer.js";
 
+const INJECTION_EXECUTION_ORDER: InjectionPoint[] = [
+  "system.prefix",
+  "system.before_tools",
+  "system.after_tools",
+  "system.suffix",
+  "tools.prepend",
+  "tools.append",
+  "user.first_turn",
+  "user.before",
+  "user.after",
+];
+
 /** Optional pipeline behaviors (agent detection, etc.). */
 export interface InjectionPipelineOptions {
   /**
@@ -47,6 +59,10 @@ export interface InjectionPipelineOptions {
    * If omitted, ALL hooks run as if `cacheStrategy="none"` (legacy behavior).
    */
   hookCacheRepo?: HookCacheRepo;
+}
+
+export interface PreparedInjectionBlock extends ContextBlock {
+  sourceHookId?: string;
 }
 
 /**
@@ -103,29 +119,7 @@ export class InjectionPipeline {
       //               ② legacy detectAgent (system prompt content scanning, for un-prefixed paths).
       //     A matching Profile enables precise anchor landing; otherwise hooks fall
       //     back to coarse-grained `point` behavior.
-      {
-        let profile: AgentProfile | null = null;
-
-        // ① Fast path: URL-path-based lookup (zero cost, no string scanning)
-        if (this.agentProfiles) {
-          profile = this.agentProfiles.get(metadata.agentSource) ?? null;
-        }
-
-        // ② Legacy fallback: scan system prompt text (for paths without agent prefix)
-        if (!profile && this.detectAgent) {
-          const sysMsg = getSystemMessage(ctx);
-          if (sysMsg) {
-            profile = this.detectAgent(getMessageText(sysMsg));
-          }
-        }
-
-        if (profile) {
-          ctx.metadata.custom = {
-            ...(ctx.metadata.custom ?? {}),
-            agentProfile: profile,
-          };
-        }
-      }
+      this.attachAgentProfile(ctx);
 
       // 3. Execute hooks at each injection point
       const hookResults: HookResult[] = await this.executeHooks(ctx);
@@ -146,6 +140,85 @@ export class InjectionPipeline {
     }
   }
 
+  /** Apply blocks already prepared by MemoryRuntime without executing hooks again. */
+  async applyPrepared(
+    body: Record<string, unknown>,
+    metadata: AgentContextMetadata,
+    prepared: PreparedInjectionBlock[],
+  ): Promise<Record<string, unknown>> {
+    const pipelineStartMs = Date.now();
+    safeCall(() => this.observer.onPipelineStart(metadata));
+    const adapter = this.adapters.get(metadata.protocol);
+    if (!adapter) throw new Error(`No adapter found for protocol "${metadata.protocol}"`);
+    const ctx = adapter.parse(body, metadata);
+    this.attachAgentProfile(ctx);
+
+    const byHook = new Map<string, ContextBlock[]>();
+    for (const block of prepared) {
+      if (!block.sourceHookId) continue;
+      const existing = byHook.get(block.sourceHookId) ?? [];
+      existing.push({
+        type: block.type,
+        content: block.content,
+        ...(block.metadata === undefined ? {} : { metadata: block.metadata }),
+      });
+      byHook.set(block.sourceHookId, existing);
+    }
+    const results: HookResult[] = [];
+    try {
+      for (const point of INJECTION_EXECUTION_ORDER) {
+        for (const hook of this.registry.getHooks(point)) {
+          const startedAt = Date.now();
+          safeCall(() => this.observer.onHookStart(hook, point));
+          try {
+            const blocks = hook.cacheStrategy === "none"
+              ? await hook.execute(ctx)
+              : (byHook.get(hook.id) ?? []);
+            if (blocks.length > 0) this.applyInjection(ctx, hook, point, blocks);
+            const durationMs = Date.now() - startedAt;
+            safeCall(() => this.observer.onHookDone(
+              hook,
+              point,
+              blocks,
+              durationMs,
+              hook.cacheStrategy,
+            ));
+            results.push({
+              hookId: hook.id,
+              point,
+              blockCount: blocks.length,
+              durationMs,
+              cacheStrategy: hook.cacheStrategy ?? "none",
+            });
+          } catch (error: unknown) {
+            const durationMs = Date.now() - startedAt;
+            const normalized = error instanceof Error ? error : new Error(String(error));
+            safeCall(() => this.observer.onHookError(hook, point, normalized, durationMs));
+            results.push({
+              hookId: hook.id,
+              point,
+              blockCount: 0,
+              durationMs,
+              error: normalized.message,
+              cacheStrategy: hook.cacheStrategy ?? "none",
+            });
+          }
+        }
+      }
+      const result = adapter.serialize(ctx);
+      safeCall(() => this.observer.onPipelineEnd(
+        metadata,
+        Date.now() - pipelineStartMs,
+        results,
+      ));
+      return result;
+    } catch (error: unknown) {
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      safeCall(() => this.observer.onPipelineError(metadata, normalized));
+      throw error;
+    }
+  }
+
   // ── Hook Execution ──────────────────────────────────────────────────────────
 
   /**
@@ -162,18 +235,6 @@ export class InjectionPipeline {
    * preserve legacy semantics.
    */
   private async executeHooks(ctx: AgentContext): Promise<HookResult[]> {
-    const executionOrder: InjectionPoint[] = [
-      "system.prefix",
-      "system.before_tools",
-      "system.after_tools",
-      "system.suffix",
-      "tools.prepend",
-      "tools.append",
-      "user.first_turn",
-      "user.before",
-      "user.after",
-    ];
-
     const sessionId = this.getSessionId(ctx);
     // Hook cache 隔离键 —— userId 从 metadata 里取（handler 层已透传）；
     // 缺省时 fallback 到 "anonymous"（与 handler 层一致，防止未鉴权请求撞
@@ -186,7 +247,7 @@ export class InjectionPipeline {
     const spaceId = ctx.metadata.spaceId ?? "";
     const results: HookResult[] = [];
 
-    for (const point of executionOrder) {
+    for (const point of INJECTION_EXECUTION_ORDER) {
       const hooks = this.registry.getHooks(point);
       for (const hook of hooks) {
         const hookStartMs = Date.now();
@@ -252,6 +313,18 @@ export class InjectionPipeline {
     }
 
     return results;
+  }
+
+  private attachAgentProfile(ctx: AgentContext): void {
+    let profile: AgentProfile | null = null;
+    if (this.agentProfiles) profile = this.agentProfiles.get(ctx.metadata.agentSource) ?? null;
+    if (!profile && this.detectAgent) {
+      const sysMsg = getSystemMessage(ctx);
+      if (sysMsg) profile = this.detectAgent(getMessageText(sysMsg));
+    }
+    if (profile) {
+      ctx.metadata.custom = { ...(ctx.metadata.custom ?? {}), agentProfile: profile };
+    }
   }
 
   /** Read `session_id` from metadata.custom.session (set in handler.ts). */

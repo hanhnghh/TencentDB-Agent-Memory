@@ -46,6 +46,7 @@ export type RuntimeContextKind = "memory" | "skill" | "knowledge";
 
 export interface RuntimeContextBlock extends ContextBlock {
   id: string;
+  sourceHookId?: string;
   kind: RuntimeContextKind;
   order: number;
 }

@@ -100,10 +100,11 @@ export class SessionStoreBindingAdapter implements RuntimeBindingAdapter {
   constructor(
     private readonly store: SessionStore,
     private readonly metadataClientFor?: (identity: RuntimeIdentity) => MetadataClient | undefined,
+    private readonly sessionKeyFor: (identity: RuntimeIdentity) => string = createRuntimeSessionKey,
   ) {}
 
   async resolveBinding(identity: RuntimeIdentity): Promise<ResolvedRuntimeBinding> {
-    const keyId = createRuntimeSessionKey(identity);
+    const keyId = this.sessionKeyFor(identity);
     const cached = this.store.get(keyId)?.status === "initialized";
     const state = await this.store.getOrRecover(
       keyId,
@@ -418,6 +419,7 @@ function toRuntimeBlock(
   };
   return {
     id: `${hookId}:${index}`,
+    sourceHookId: hookId,
     kind,
     order: kindOrder[kind] * 10_000 + hookIndex * 100 + index,
     type: block.type,

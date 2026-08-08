@@ -155,16 +155,20 @@ export class OutboxConflictError extends Error {
 
 export class MemoryCoreRoundDelivery implements RoundDeliveryPort {
   constructor(
-    private readonly l0Client: Pick<TdaiClient, "addConversation">,
+    private readonly l0Client: Pick<TdaiClient, "addConversation"> |
+      ((serviceId: string) => Pick<TdaiClient, "addConversation">),
     private readonly skillClient: Pick<CoreSkillClient, "addConversation">,
-    private readonly l0ServiceId: string,
+    private readonly l0ServiceId?: string,
   ) {}
 
   async deliverL0(input: L0RoundDelivery): Promise<DeliveryReceipt> {
-    if (input.identity.serviceId !== this.l0ServiceId) {
+    if (typeof this.l0Client !== "function" && input.identity.serviceId !== this.l0ServiceId) {
       throw new OutboxConfigurationError("l0_service_mismatch");
     }
-    const result = await this.l0Client.addConversation(
+    const client = typeof this.l0Client === "function"
+      ? this.l0Client(input.identity.serviceId)
+      : this.l0Client;
+    const result = await client.addConversation(
       {
         teamId: input.identity.teamId,
         userId: input.identity.userId,

@@ -13,9 +13,16 @@ import { hasCostGuardMarker } from "./routes/whitelist.js";
 import { tryActivateStorage, tryActivateRedis } from "./injection/index.js";
 import { getEffectiveBackend } from "./storage/factory.js";
 import type { ProxyConfig } from "./types.js";
+import type { OpenAIMemoryRuntimeProvider } from "./runtime/openai-production.js";
 
-export function createApp(config: ProxyConfig): Hono {
+export interface CreateAppOptions {
+  openAIMemoryRuntimeProvider?: OpenAIMemoryRuntimeProvider;
+}
+
+export function createApp(config: ProxyConfig, options: CreateAppOptions = {}): Hono {
   const app = new Hono();
+  const handleOpenAI = (c: Parameters<typeof handleChatCompletions>[0]) =>
+    handleChatCompletions(c, config, options.openAIMemoryRuntimeProvider);
 
   // Eagerly activate storage/bindingRepo so bridge-only requests (no main
   // /v1/messages hits yet) can still recover session state via L2 fallthrough
@@ -53,7 +60,7 @@ export function createApp(config: ProxyConfig): Hono {
   // 返回 503 + degraded=true，让 k8s LB 把该 pod 摘掉，避免"两个节点各写各
   // 的内存"这种数据一致性事故。sqlite 也算 process-local——多节点各自本地
   // 文件也是不共享的。见 docs/design/2026-07-13-proxy-multinode-state-audit.md P0-2。
-  app.get("/health", (c) => {
+  app.get("/health", async (c) => {
     const eff = getEffectiveBackend();
     const wantsShared = config.storage?.enabled && eff.requested === "cos";
     const degraded = wantsShared && eff.effective !== eff.requested;
@@ -71,6 +78,9 @@ export function createApp(config: ProxyConfig): Hono {
         degraded,
         ...(eff.error ? { lastError: eff.error } : {}),
       },
+      ...(options.openAIMemoryRuntimeProvider?.health
+        ? { memoryRuntime: await options.openAIMemoryRuntimeProvider.health() }
+        : {}),
     };
     return c.json(body, degraded ? 503 : 200);
   });
@@ -159,7 +169,7 @@ export function createApp(config: ProxyConfig): Hono {
   // Hono 优先匹配更精确的路径，需注册在通用 `/:agent/:spaceId/v1/...` 之前。
   if (config.costGuard.markerOptIn) {
     app.post("/:agent/:spaceId/cost-guard/v1/messages", (c) => handleAnthropicMessages(c, config));
-    app.post("/:agent/:spaceId/cost-guard/v1/chat/completions", (c) => handleChatCompletions(c, config));
+    app.post("/:agent/:spaceId/cost-guard/v1/chat/completions", handleOpenAI);
   }
 
   // `/analyse` marker (asset-reflection 内部效果评估) —— 跟 cost-guard 完全对称：
@@ -173,7 +183,7 @@ export function createApp(config: ProxyConfig): Hono {
   // markerOptIn=true 就必须显式注册这两条 anthropic/openai 5 段路由。
   if (config.injection?.assetReflection?.markerOptIn) {
     app.post("/:agent/:spaceId/analyse/v1/messages", (c) => handleAnthropicMessages(c, config));
-    app.post("/:agent/:spaceId/analyse/v1/chat/completions", (c) => handleChatCompletions(c, config));
+    app.post("/:agent/:spaceId/analyse/v1/chat/completions", handleOpenAI);
   }
 
   app.post("/:agent/:spaceId/v1/messages", (c) => handleAnthropicMessages(c, config));
@@ -181,11 +191,11 @@ export function createApp(config: ProxyConfig): Hono {
   app.post("/:agent/:spaceId/v1/embeddings", (c) => handleAuxiliaryEndpoint(c, config));
   app.post("/:agent/:spaceId/v1/completions", (c) => handleAuxiliaryEndpoint(c, config));
   app.post("/:agent/:spaceId/v1/moderations", (c) => handleAuxiliaryEndpoint(c, config));
-  app.post("/:agent/:spaceId/v1/chat/completions", (c) => handleChatCompletions(c, config));
+  app.post("/:agent/:spaceId/v1/chat/completions", handleOpenAI);
 
   // Agent-prefixed routes without spaceId (deprecated: no credit reporting)
   app.post("/:agent/v1/messages", (c) => handleAnthropicMessages(c, config));
-  app.post("/:agent/v1/chat/completions", (c) => handleChatCompletions(c, config));
+  app.post("/:agent/v1/chat/completions", handleOpenAI);
 
   // Legacy /proxy/<spaceId>/ prefix — no agent info, defaults to codebuddy.
   // 保留以兼容不带 agent 前缀的客户端。
@@ -194,10 +204,10 @@ export function createApp(config: ProxyConfig): Hono {
   app.post("/proxy/:spaceId/v1/embeddings", (c) => handleAuxiliaryEndpoint(c, config));
   app.post("/proxy/:spaceId/v1/completions", (c) => handleAuxiliaryEndpoint(c, config));
   app.post("/proxy/:spaceId/v1/moderations", (c) => handleAuxiliaryEndpoint(c, config));
-  app.post("/proxy/:spaceId/*", (c) => handleChatCompletions(c, config));
+  app.post("/proxy/:spaceId/*", handleOpenAI);
 
   // OpenAI-compatible chat completions (catch-all for any remaining POST paths)
-  app.post("/*", (c) => handleChatCompletions(c, config));
+  app.post("/*", handleOpenAI);
 
   return app;
 }

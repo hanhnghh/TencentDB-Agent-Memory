@@ -54,6 +54,9 @@ import {
   canonicalizeAgentSource,
   createSessionNamespace,
 } from "./agent-sources.js";
+import type { MemoryRuntimeContract, PrepareContextResult } from "./runtime/index.js";
+import { buildOpenAICompletedRound } from "./runtime/openai-adapter.js";
+import type { OpenAIMemoryRuntimeProvider } from "./runtime/openai-production.js";
 
 /**
  * Build a per-request TdaiClient. `spaceId` (extracted from the request path
@@ -426,6 +429,7 @@ async function forwardWithRetry(
 export async function handleChatCompletions(
   c: Context,
   config: ProxyConfig,
+  memoryRuntimeProvider?: OpenAIMemoryRuntimeProvider,
 ): Promise<Response> {
   const startTime = new Date().toISOString();
   const traceId = uuidv7();
@@ -436,7 +440,10 @@ export async function handleChatCompletions(
   // both the systemUser short-circuit and the normal pipeline.
   const earlyAuthHeader = c.req.header("authorization") ?? c.req.header("Authorization") ?? "";
   const earlyApiKey = extractBearerToken(earlyAuthHeader);
-  const earlySpaceId = extractSpaceIdFromPath(c.req.path) ?? "";
+  const extractedSpaceId = extractSpaceIdFromPath(c.req.path) ?? "";
+  // Deprecated `/:agent/v1/...` routes have no tenant segment; the generic
+  // path extractor otherwise mistakes the literal API version for a space ID.
+  const earlySpaceId = extractedSpaceId === "v1" ? "" : extractedSpaceId;
   const earlyVerify = await verifyUserKey(earlyApiKey, earlySpaceId);
   if (earlyVerify.rejected) {
     return c.json({ error: `Authentication failed: ${earlyVerify.rejectReason ?? "unknown"}` }, 401);
@@ -555,12 +562,15 @@ export async function handleChatCompletions(
   // system-user short-circuit; running verify again here would double the
   // network round-trip for every request.
   const spaceId = earlySpaceId;
+  const runtimeServiceId = spaceId || config.tdai.serviceId;
   const userId = earlyVerify.userId
     || c.req.header("x-user-id")
     || c.req.header("x-cb-user-id")
     || c.req.header("x-tdai-user-token")
     || "";
   if (userId) keyId = userId;
+  const memoryRuntime = memoryRuntimeProvider?.forRequest({ userKey: apiKey });
+  let runtimePrepared: PrepareContextResult | null = null;
 
   // Activate Redis storage early — must run BEFORE session init.
   if (config.redis?.enabled) {
@@ -667,7 +677,7 @@ export async function handleChatCompletions(
         console.log(`[session-init] session=${sessionKey} bypassed → skipping all injection`);
       }
 
-      if (!initResult.bypassed && initResult.sessionInfo) {
+      if (!memoryRuntime && !initResult.bypassed && initResult.sessionInfo) {
         try {
           const { fetchAssetCapabilities } = await import("./tdai/capabilities.js");
           assetCapabilities = await fetchAssetCapabilities({
@@ -702,6 +712,7 @@ export async function handleChatCompletions(
       // the pipeline ran before the cache was populated, silently injecting
       // zero blocks for the entire first turn.
       if (
+        !memoryRuntime &&
         !initResult.bypassed &&
         initResult.justRegistered &&
         initResult.sessionInfo &&
@@ -750,6 +761,58 @@ export async function handleChatCompletions(
       injectedSkipped = true;
     }
   }
+
+  // Freeze the transport conversation after session-init cleanup but before
+  // runtime context injection. Write-back must never recapture injected blocks.
+  const memoryCaptureMessages = messages;
+
+  // MemoryRuntime owns post-bootstrap binding recovery, ACL, capabilities and
+  // prewarm/cache. Interactive session-init remains a transport concern; once
+  // it has produced a verified binding, all memory orchestration crosses this seam.
+  if (memoryRuntime && !injectedSkipped && sessionInfo && runtimeServiceId && userId) {
+    try {
+      runtimePrepared = await memoryRuntime.prepareContext({
+        identity: { serviceId: runtimeServiceId, userId, agentSource, sessionId: sessionKey },
+      });
+      assetCapabilities = {
+        skill: runtimePrepared.capabilities.skill.enabled,
+        llm_wiki: runtimePrepared.capabilities.knowledge.wiki.enabled,
+        code_graph: runtimePrepared.capabilities.knowledge.codeGraph.enabled,
+        chat_memory: runtimePrepared.capabilities.memory.enabled,
+      };
+      if (
+        config.injection?.enabled &&
+        config.injection.injectors.length > 0
+      ) {
+        const injectionTurnSeq = countHumanTurns(messages, "openai");
+        const { getInjectionPipeline } = await import("./injection/index.js");
+        body = await getInjectionPipeline(config).applyPrepared(body, {
+          protocol: "openai",
+          traceId,
+          keyId,
+          modelId: modelId as string,
+          stream: isStream,
+          agentSource,
+          userId,
+          spaceId,
+          sessionKey,
+          turnSeq: injectionTurnSeq,
+          requestPath: c.req.path,
+          custom: { session: sessionInfo, assetCapabilities, userKey: apiKey || undefined },
+        }, runtimePrepared.blocks);
+        messages = Array.isArray(body.messages) ? body.messages : messages;
+      }
+    } catch (err: unknown) {
+      console.warn(
+        "[memory-runtime] OpenAI prepare skipped:",
+        err instanceof Error ? err.message : String(err),
+      );
+      runtimePrepared = null;
+    }
+  }
+  const memoryRuntimeWriteEnabled = Boolean(
+    memoryRuntime && !injectedSkipped && sessionInfo && runtimeServiceId && userId,
+  );
 
   // ── mem: command intercept ────────────────────────────────────────────────
   // 位置对齐 anthropicHandler.ts:847 —— session init 完成后、injection 之前。
@@ -809,7 +872,7 @@ export async function handleChatCompletions(
         userId: userId || null,
         sessionKey,
       });
-      if (tdaiClientForMem && tdaiIdentityForMem && isExtractionAllowed(config, "tdai-memory")) {
+      if (!memoryRuntime && tdaiClientForMem && tdaiIdentityForMem && isExtractionAllowed(config, "tdai-memory")) {
         const userMsg = { role: "user" as const, content: memCmd.rawMessage };
         try {
           await recordTdaiTurn(tdaiClientForMem, tdaiIdentityForMem, userMsg, memResult.messageText);
@@ -819,7 +882,7 @@ export async function handleChatCompletions(
       }
 
       // Skill extract trigger — 保证对话轮次计数正常累积（跟 anthropic 侧对称）
-      if (isExtractionAllowed(config, "skill")) {
+      if (!memoryRuntime && isExtractionAllowed(config, "skill")) {
         try {
           // OpenAI 协议 assistant content 是字符串，normalize-conversation 那侧
           // 会走 convertOpenAIAssistant 兜底处理 string 形态。
@@ -839,6 +902,16 @@ export async function handleChatCompletions(
         }
       }
 
+      if (memoryRuntime && memoryRuntimeWriteEnabled) {
+        await commitOpenAICompletedRound({
+          runtime: memoryRuntime,
+          identity: { serviceId: runtimeServiceId, userId, agentSource, sessionId: sessionKey },
+          turnSequence: countHumanTurns(messages, "openai") || 1,
+          inputMessages: [{ role: "user", content: memCmd.rawMessage }],
+          assistantMessage: { role: "assistant", content: memResult.messageText },
+        });
+      }
+
       console.log(`[mem-command] cmd=${memCmd.command} session=${sessionKey} success=${memResult.success}`);
 
       return memResult.response;
@@ -856,7 +929,7 @@ export async function handleChatCompletions(
   const tdaiUserMessage = extractLatestUserMessage(messages);
 
   // ── Context injection (before cost guard) ──────────────────────────────
-  if (!injectedSkipped && config.injection?.enabled && config.injection.injectors.length > 0) {
+  if (!memoryRuntime && !injectedSkipped && config.injection?.enabled && config.injection.injectors.length > 0) {
     try {
       const injectionTurnSeq = countHumanTurns(messages, "openai");
       const { getInjectionPipeline } = await import("./injection/index.js");
@@ -1146,6 +1219,10 @@ export async function handleChatCompletions(
       upstreamRequestId,
       langfuseDebug,
       debugMetadata,
+      memoryRuntime,
+      memoryRuntimeWriteEnabled,
+      runtimeIdentity: { serviceId: runtimeServiceId, userId, agentSource, sessionId: sessionKey },
+      runtimeInputMessages: memoryCaptureMessages,
     };
     const passthrough = createUsageTapTransform(tapCtx);
     const tappedStream = upstreamResp.body.pipeThrough(passthrough);
@@ -1219,7 +1296,7 @@ export async function handleChatCompletions(
       });
     }
 
-    if (tdaiClient && isExtractionAllowed(config, "tdai-memory")) {
+    if (!memoryRuntime && tdaiClient && isExtractionAllowed(config, "tdai-memory")) {
       await withL0SessionOrdering({
         serviceId: config.tdai.serviceId || "default",
         teamId: tdaiIdentity?.teamId ?? "",
@@ -1235,7 +1312,7 @@ export async function handleChatCompletions(
         assistantContentForTdai(assistantMessage),
         { sourceEventId: `proxy:${agentSource}:${sessionKey}:turn:${lf.turnSeq}` },
       )));
-    } else if (tdaiClient) {
+    } else if (!memoryRuntime && tdaiClient) {
       logExtractionSkipped(config, "tdai-memory", sessionKey);
     }
 
@@ -1299,9 +1376,19 @@ export async function handleChatCompletions(
 
   pipe.responseDone(usage);
 
+  if (memoryRuntime && memoryRuntimeWriteEnabled) {
+    await commitOpenAICompletedRound({
+      runtime: memoryRuntime,
+      identity: { serviceId: runtimeServiceId, userId, agentSource, sessionId: sessionKey },
+      turnSequence: lf.turnSeq,
+      inputMessages: memoryCaptureMessages,
+      assistantMessage,
+    });
+  }
+
   // Skill extract trigger — count tool calls + buffer conversation.
   // 同步 await：直到 store 落盘再继续，保证下一轮跨节点读到最新数据。
-  if (isExtractionAllowed(config, "skill")) {
+  if (!memoryRuntime && isExtractionAllowed(config, "skill")) {
     await triggerSkillExtractIfReady({
       config,
       sessionKey,
@@ -1313,7 +1400,7 @@ export async function handleChatCompletions(
       assetCapabilities,
       turnSequence: lf.turnSeq,
     });
-  } else {
+  } else if (!memoryRuntime) {
     logExtractionSkipped(config, "skill", sessionKey);
   }
 
@@ -1353,6 +1440,23 @@ export async function handleChatCompletions(
   }
 
   return new Response(respText, { status: upstreamResp.status, headers: respHeaders });
+}
+
+async function commitOpenAICompletedRound(input: {
+  runtime: MemoryRuntimeContract;
+  identity: {
+    serviceId: string;
+    userId: string;
+    agentSource: string;
+    sessionId: string;
+  };
+  turnSequence: number;
+  inputMessages: unknown[];
+  assistantMessage: Record<string, unknown> | null;
+}): Promise<void> {
+  const completedRound = buildOpenAICompletedRound(input);
+  if (!completedRound) return;
+  await input.runtime.commitCompletedRound(completedRound);
 }
 
 
@@ -1410,6 +1514,15 @@ interface TapContext {
   langfuseDebug: boolean;
   /** buildRequestDebugMetadata 结果；debug=false 时为 {}。 */
   debugMetadata: Record<string, unknown>;
+  memoryRuntime?: MemoryRuntimeContract;
+  memoryRuntimeWriteEnabled: boolean;
+  runtimeIdentity: {
+    serviceId: string;
+    userId: string;
+    agentSource: string;
+    sessionId: string;
+  };
+  runtimeInputMessages: unknown[];
 }
 
 /** Accumulated tool call state during SSE streaming. */
@@ -1524,14 +1637,18 @@ function createUsageTapTransform(ctx: TapContext): TransformStream<Uint8Array, U
     let outputMessage: Record<string, unknown> | null = null;
     if (assistantContent || toolCallAccumulators.size > 0) {
       if (toolCallAccumulators.size > 0) {
-        const toolCallEntries = Array.from(toolCallAccumulators.entries())
+        const toolCalls = Array.from(toolCallAccumulators.entries())
           .sort(([a], [b]) => a - b)
-          .map(([, acc]) => JSON.stringify({ tool_call_id: acc.id, tool_name: acc.functionName, arguments: acc.functionArguments }, null, 2))
-          .join("\n\n");
-        const parts: string[] = [];
-        if (assistantContent) parts.push(assistantContent);
-        parts.push(toolCallEntries);
-        outputMessage = { role: "assistant", content: parts.join("\n\n") };
+          .map(([, acc]) => ({
+            id: acc.id,
+            type: acc.type || "function",
+            function: { name: acc.functionName, arguments: acc.functionArguments },
+          }));
+        outputMessage = {
+          role: "assistant",
+          content: assistantContent || null,
+          tool_calls: toolCalls,
+        };
       } else {
         outputMessage = { role: "assistant", content: assistantContent };
       }
@@ -1650,7 +1767,7 @@ function createUsageTapTransform(ctx: TapContext): TransformStream<Uint8Array, U
     }
 
     const tdaiClient = ctx.tdaiClient;
-    if (tdaiClient && isExtractionAllowed(ctx.config, "tdai-memory")) {
+    if (!ctx.memoryRuntime && tdaiClient && isExtractionAllowed(ctx.config, "tdai-memory")) {
       // Streaming 不 await（会拖慢 SSE 关流体感），改成 trackWrite + 重试：
       //   - trackWrite 注册 in-flight promise 到全局 set；SIGTERM 时 index.ts 会
       //     flushPendingWrites 等待或超时兜底，避免 pod rolling 时丢 L0。
@@ -1672,15 +1789,25 @@ function createUsageTapTransform(ctx: TapContext): TransformStream<Uint8Array, U
           { sourceEventId: `proxy:${ctx.agentSource}:${ctx.sessionKeyForSkill}:turn:${lf.turnSeq}` },
         ))).catch((err: unknown) => pipe.error("TDAI_L0", err))
       );
-    } else if (tdaiClient) {
+    } else if (!ctx.memoryRuntime && tdaiClient) {
       logExtractionSkipped(ctx.config, "tdai-memory", ctx.sessionKeyForSkill);
     }
 
     pipe.streamDone(lastUsage);
 
+    if (ctx.memoryRuntime && ctx.memoryRuntimeWriteEnabled) {
+      await commitOpenAICompletedRound({
+        runtime: ctx.memoryRuntime,
+        identity: ctx.runtimeIdentity,
+        turnSequence: ctx.lf.turnSeq,
+        inputMessages: ctx.runtimeInputMessages,
+        assistantMessage: outputMessage,
+      });
+    }
+
     // Skill extract trigger — after stream finalization.
     // 同步 await：直到 store 落盘再继续，保证下一轮跨节点读到最新数据。
-    if (isExtractionAllowed(ctx.config, "skill")) {
+    if (!ctx.memoryRuntime && isExtractionAllowed(ctx.config, "skill")) {
       await triggerSkillExtractIfReady({
         config: ctx.config,
         sessionKey: ctx.sessionKeyForSkill,
@@ -1693,7 +1820,7 @@ function createUsageTapTransform(ctx: TapContext): TransformStream<Uint8Array, U
         toolCallCountOverride: toolCallAccumulators.size,
         turnSequence: ctx.lf.turnSeq,
       });
-    } else {
+    } else if (!ctx.memoryRuntime) {
       logExtractionSkipped(ctx.config, "skill", ctx.sessionKeyForSkill);
     }
 
