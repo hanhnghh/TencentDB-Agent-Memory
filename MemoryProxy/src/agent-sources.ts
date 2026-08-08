@@ -12,6 +12,16 @@ export function normalizeAgentSource(value: string | null | undefined): AgentSou
   return knownSources.has(normalized) ? normalized as KnownAgentSource : "unknown";
 }
 
+/** Canonicalize registered labels while preserving legacy custom namespaces. */
+export function canonicalizeAgentSource(
+  value: string | null | undefined,
+  fallback = "unknown",
+): string {
+  const sourceLabel = value?.trim() || fallback;
+  const registeredSource = normalizeAgentSource(sourceLabel);
+  return registeredSource === "unknown" ? sourceLabel : registeredSource;
+}
+
 /**
  * Build the in-process session key used by caches and recovery.
  *
@@ -28,5 +38,22 @@ export function createSessionNamespace(
     const label = normalizeAgentSource(source) === "codex" ? "Codex" : "Agent";
     throw new Error(`${label} session identity is required`);
   }
-  return `${normalizeAgentSource(source)}:${identity}`;
+  return `${canonicalizeAgentSource(source)}:${identity}`;
+}
+
+/**
+ * Lookup order for bridge calls that only carry a bare session identity.
+ * Keep the two legacy namespaces in their established order, then include
+ * every newer registered source so capability lookups cannot drift from the
+ * source registry.
+ */
+export function createSessionNamespaceCandidates(sessionIdentity: string): string[] {
+  const legacyOrder: KnownAgentSource[] = ["codebuddy", "claude-code"];
+  const remainingSources = AGENT_SOURCES.filter((source) => !legacyOrder.includes(source));
+  return [
+    sessionIdentity,
+    ...[...legacyOrder, ...remainingSources].map((source) => (
+      createSessionNamespace(source, sessionIdentity)
+    )),
+  ];
 }

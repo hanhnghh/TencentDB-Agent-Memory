@@ -96,6 +96,30 @@ describe("Codex binding CLI", () => {
     expect(h.dependencies.bind).not.toHaveBeenCalled();
   });
 
+  it("redacts environment credentials from bind failures", async () => {
+    const h = harness({
+      bind: vi.fn(async () => {
+        throw new Error("dependency echoed user-key-secret and service-secret");
+      }),
+    });
+    const code = await runCodexBindingCli([
+      "bind",
+      "--endpoint", "https://memory.example",
+      "--service-id", "memory-1",
+      "--team-id", "team-1",
+      "--agent-id", "agent-1",
+      "--task-id", "task-1",
+    ], h.io, {
+      MEMORY_CORE_SERVICE_TOKEN: "service-secret",
+      MEMORY_HUB_USER_KEY: "user-key-secret",
+    }, h.dependencies);
+
+    expect(code).toBe(1);
+    expect(h.errors.join("\n")).toContain("[REDACTED]");
+    expect(h.errors.join("\n")).not.toContain("user-key-secret");
+    expect(h.errors.join("\n")).not.toContain("service-secret");
+  });
+
   it("supports binding-status, doctor, and unbind without model interaction", async () => {
     const h = harness();
 
@@ -108,13 +132,16 @@ describe("Codex binding CLI", () => {
     expect(h.dependencies.unbind).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects a bind command without the parity-required Task ID", async () => {
+  it.each([
+    { label: "Team", args: ["--agent-id", "agent-1", "--task-id", "task-1"] },
+    { label: "Agent", args: ["--team-id", "team-1", "--task-id", "task-1"] },
+    { label: "Task", args: ["--team-id", "team-1", "--agent-id", "agent-1"] },
+  ])("rejects a bind command without the required $label ID", async ({ label, args }) => {
     const h = harness();
     const code = await runCodexBindingCli([
       "bind",
       "--service-id", "memory-1",
-      "--team-id", "team-1",
-      "--agent-id", "agent-1",
+      ...args,
     ], h.io, {
       MEMORY_CORE_ENDPOINT: "https://memory.example",
       MEMORY_CORE_SERVICE_TOKEN: "service-secret",
@@ -122,7 +149,7 @@ describe("Codex binding CLI", () => {
     }, h.dependencies);
 
     expect(code).toBe(2);
-    expect(h.errors.join("\n")).toContain("--task-id is required");
+    expect(h.errors.join("\n")).toContain(`--${label.toLowerCase()}-id is required`);
     expect(h.dependencies.bind).not.toHaveBeenCalled();
   });
 });

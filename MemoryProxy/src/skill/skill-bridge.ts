@@ -19,6 +19,7 @@
 
 import type { Context } from "hono";
 import type { Redis } from "ioredis";
+import { createSessionNamespaceCandidates } from "../agent-sources.js";
 import { extractBearerToken } from "../opik.js";
 import { apiKeyToKeyId } from "../opik.js";
 import { getSessionStore } from "../session/store.js";
@@ -244,7 +245,7 @@ function loadSessionIdsL1(sessionKey: string): SessionIdFields | null {
   // bare 命中，命中不到再按已知 agentSource 前缀试。
   const candidates = sessionKey.includes(":")
     ? [sessionKey]
-    : [sessionKey, `codebuddy:${sessionKey}`, `claude-code:${sessionKey}`];
+    : createSessionNamespaceCandidates(sessionKey);
   for (const k of candidates) {
     const s = getSessionStore().get(k);
     if (s) return stateToIdFields(s, k);
@@ -270,7 +271,7 @@ async function loadSessionIdsL2(
   // 与 L1 一样按前缀候选跑一遍
   const candidates = sessionKey.includes(":")
     ? [sessionKey]
-    : [sessionKey, `codebuddy:${sessionKey}`, `claude-code:${sessionKey}`];
+    : createSessionNamespaceCandidates(sessionKey);
   for (const compositeKey of candidates) {
     const colonIdx = compositeKey.indexOf(":");
     const agentSource = colonIdx > 0 ? compositeKey.slice(0, colonIdx) : "claude-code";

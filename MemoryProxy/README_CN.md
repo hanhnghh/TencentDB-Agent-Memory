@@ -112,6 +112,11 @@ npm run codex -- unbind
 `unbind --forget-credential` 还会删除该 Memory 服务对应的用户密钥。
 `binding-status`、`doctor` 和 `unbind` 都是本地操作，不会调用模型。
 
+这些凭据的用途彼此独立：`MEMORY_HUB_USER_KEY` 用于授权用户绑定，
+`MEMORY_CORE_SERVICE_TOKEN` 用于本地集成向 MemoryCore 鉴权。两者都不是代理
+模型凭据（`PROXY_UPSTREAM_API_KEY` 或 `upstream.apiKey`），也不是内部记忆提炼
+模型凭据（`MEMORY_LLM_API_KEY`）。
+
 ### 1. 安装依赖
 
 ```bash

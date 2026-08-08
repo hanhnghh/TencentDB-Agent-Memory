@@ -45,12 +45,26 @@ function successfulApi(): typeof fetch {
     expect(new Headers(init?.headers).get("authorization")).toBe("Bearer service-secret");
 
     if (path === "/v3/meta/team/list") {
+      expect(body).toMatchObject({ user_id: "user-1", limit: 100, offset: 0 });
       return jsonResponse({ code: 0, data: { items: [{ team_id: "team-1", name: "Team" }], total: 1, limit: 100, offset: 0 } });
     }
     if (path === "/v3/meta/agent/list") {
+      expect(body).toMatchObject({
+        team_id: "team-1",
+        owner_user_id: "user-1",
+        status: "active",
+        limit: 100,
+        offset: 0,
+      });
       return jsonResponse({ code: 0, data: { items: [{ agent_id: "agent-1", team_id: "team-1", name: "Agent" }], total: 1, limit: 100, offset: 0 } });
     }
     if (path === "/v3/meta/task/list") {
+      expect(body).toMatchObject({
+        team_id: "team-1",
+        status: "running",
+        limit: 100,
+        offset: 0,
+      });
       return jsonResponse({ code: 0, data: { items: [{ task_id: "task-1", team_id: "team-1", title: "Task" }], total: 1, limit: 100, offset: 0 } });
     }
     throw new Error(`unexpected path ${path}`);
@@ -97,6 +111,34 @@ describe("validated Codex project binding", () => {
     expect(credentialText).not.toContain("service-secret");
     expect((await stat(userConfigDir)).mode & 0o777).toBe(0o700);
     expect((await stat(credentialPath)).mode & 0o777).toBe(0o600);
+  });
+
+  it("persists only JSON-safe non-secret project preferences", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    await mkdir(projectDir);
+
+    await bindCodexProject({
+      projectDir,
+      userConfigDir: join(root, "user-config"),
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      preferences: { dynamicRecall: true, contextLimit: 3, profile: "concise" },
+      fetcher: successfulApi(),
+    });
+
+    const projectText = await readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH), "utf8");
+    expect(JSON.parse(projectText)).toMatchObject({
+      preferences: { dynamicRecall: true, contextLimit: 3, profile: "concise" },
+    });
+    expect(projectText).not.toContain("user-key-secret");
+    expect(projectText).not.toContain("service-secret");
   });
 
   it("rejects an invalid user key before creating either config", async () => {
@@ -156,6 +198,35 @@ describe("validated Codex project binding", () => {
     await expect(readFile(resolveCredentialPath(userConfigDir))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("fails closed when user-key verification is unavailable", async () => {
+    const root = await makeTempRoot();
+    const projectDir = join(root, "project");
+    const userConfigDir = join(root, "user-config");
+    await mkdir(projectDir);
+    const fetcher = vi.fn(async () => {
+      throw new Error("network unavailable");
+    }) as typeof fetch;
+
+    await expect(bindCodexProject({
+      projectDir,
+      userConfigDir,
+      endpoint: "https://memory.example",
+      authUrl: "https://auth.example",
+      serviceId: "memory-1",
+      serviceToken: "service-secret",
+      userKey: "user-key-secret",
+      teamId: "team-1",
+      agentId: "agent-1",
+      taskId: "task-1",
+      fetcher,
+    })).rejects.toMatchObject({ code: "validation_failed" });
+
+    await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH)))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(resolveCredentialPath(userConfigDir)))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it.each([
     {
       label: "Team",
@@ -195,9 +266,14 @@ describe("validated Codex project binding", () => {
     await expect(readFile(resolveCredentialPath(userConfigDir))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("requires Task for initial runtime parity", async () => {
+  it.each([
+    { label: "Team", ids: { teamId: "", agentId: "agent-1", taskId: "task-1" } },
+    { label: "Agent", ids: { teamId: "team-1", agentId: "", taskId: "task-1" } },
+    { label: "Task", ids: { teamId: "team-1", agentId: "agent-1", taskId: "" } },
+  ])("rejects a missing $label ID before validation or persistence", async ({ label, ids }) => {
     const root = await makeTempRoot();
     const projectDir = join(root, "project");
+    const fetcher = successfulApi();
     await mkdir(projectDir);
 
     await expect(bindCodexProject({
@@ -208,11 +284,13 @@ describe("validated Codex project binding", () => {
       serviceId: "memory-1",
       serviceToken: "service-secret",
       userKey: "user-key-secret",
-      teamId: "team-1",
-      agentId: "agent-1",
-      taskId: "",
-      fetcher: successfulApi(),
-    })).rejects.toThrow("Task ID is required");
+      ...ids,
+      fetcher,
+    })).rejects.toThrow(`${label} ID is required`);
+
+    expect(fetcher).not.toHaveBeenCalled();
+    await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH)))
+      .rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("does not expose dependency responses or credentials in validation failures", async () => {
@@ -402,7 +480,11 @@ describe("validated Codex project binding", () => {
     await expect(readFile(resolveCredentialPath(userConfigDir))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("rejects malformed metadata entities with a clear validation error", async () => {
+  it.each([
+    { label: "Team", path: "/v3/meta/team/list" },
+    { label: "Agent", path: "/v3/meta/agent/list" },
+    { label: "Task", path: "/v3/meta/task/list" },
+  ])("rejects malformed $label metadata entities with a clear validation error", async ({ label, path: malformedPath }) => {
     const root = await makeTempRoot();
     const projectDir = join(root, "project");
     const userConfigDir = join(root, "user-config");
@@ -410,7 +492,7 @@ describe("validated Codex project binding", () => {
     const base = successfulApi();
     const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = new URL(String(input)).pathname;
-      if (path === "/v3/meta/team/list") {
+      if (path === malformedPath) {
         return jsonResponse({
           code: 0,
           data: { items: [null], total: 1, limit: 100, offset: 0 },
@@ -433,7 +515,7 @@ describe("validated Codex project binding", () => {
       fetcher,
     })).rejects.toMatchObject({
       code: "validation_failed",
-      message: "Unable to validate Team: MemoryCore metadata returned malformed data",
+      message: `Unable to validate ${label}: MemoryCore metadata returned malformed data`,
     });
 
     await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH)))

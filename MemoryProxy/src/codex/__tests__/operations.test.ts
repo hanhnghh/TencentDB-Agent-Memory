@@ -92,6 +92,20 @@ describe("Codex binding operations", () => {
     expect(JSON.stringify(diagnosis)).not.toContain("user-key-secret");
   });
 
+  it("diagnoses broad protected credential directory permissions locally", async () => {
+    const dirs = await setup();
+    await bind(dirs.projectDir, dirs.userConfigDir);
+
+    await chmod(dirs.userConfigDir, 0o755);
+    const diagnosis = await doctorCodexBinding(dirs);
+    expect(diagnosis.ok).toBe(false);
+    expect(diagnosis.checks).toContainEqual(expect.objectContaining({
+      name: "credential_directory_permissions",
+      status: "fail",
+    }));
+    expect(JSON.stringify(diagnosis)).not.toContain("user-key-secret");
+  });
+
   it("diagnoses a credential store placed inside the project", async () => {
     const dirs = await setup();
     await bind(dirs.projectDir, dirs.userConfigDir);
@@ -210,4 +224,87 @@ describe("Codex binding operations", () => {
     expect(diagnosis.ok).toBe(false);
     expect(JSON.stringify(diagnosis)).not.toContain("must-not-be-here");
   });
+
+  it.each([
+    {
+      label: "malformed JSON",
+      content: "{not-json",
+      message: "Cannot read project binding",
+    },
+    {
+      label: "unsupported version",
+      content: JSON.stringify({
+        version: 2,
+        source: "codex",
+        service_id: "memory-1",
+        team_id: "team-1",
+        agent_id: "agent-1",
+        task_id: "task-1",
+      }),
+      message: "version 1 and source 'codex'",
+    },
+    {
+      label: "non-Codex source",
+      content: JSON.stringify({
+        version: 1,
+        source: "unknown",
+        service_id: "memory-1",
+        team_id: "team-1",
+        agent_id: "agent-1",
+        task_id: "task-1",
+      }),
+      message: "version 1 and source 'codex'",
+    },
+    {
+      label: "missing Task ID",
+      content: JSON.stringify({
+        version: 1,
+        source: "codex",
+        service_id: "memory-1",
+        team_id: "team-1",
+        agent_id: "agent-1",
+      }),
+      message: "Task ID is required",
+    },
+    {
+      label: "unsupported field",
+      content: JSON.stringify({
+        version: 1,
+        source: "codex",
+        service_id: "memory-1",
+        team_id: "team-1",
+        agent_id: "agent-1",
+        task_id: "task-1",
+        extra: true,
+      }),
+      message: "unsupported field 'extra'",
+    },
+  ])("rejects an invalid project binding with $label", async ({ content, message }) => {
+    const dirs = await setup();
+    const projectPath = join(dirs.projectDir, PROJECT_BINDING_RELATIVE_PATH);
+    await mkdir(dirname(projectPath), { recursive: true });
+    await writeFile(projectPath, content);
+
+    await expect(getCodexBindingStatus(dirs)).rejects.toThrow(message);
+    const diagnosis = await doctorCodexBinding(dirs);
+    expect(diagnosis.ok).toBe(false);
+    expect(diagnosis.checks).toContainEqual(expect.objectContaining({
+      name: "project_binding",
+      status: "fail",
+    }));
+  });
+
+  it.fails(
+    "TARGET (deferred runtime validation): doctor rejects well-formed project IDs edited after bind",
+    async () => {
+      const dirs = await setup();
+      await bind(dirs.projectDir, dirs.userConfigDir);
+      const projectPath = join(dirs.projectDir, PROJECT_BINDING_RELATIVE_PATH);
+      const edited = JSON.parse(await readFile(projectPath, "utf8")) as Record<string, unknown>;
+      edited.task_id = "task-not-authorized";
+      await writeFile(projectPath, `${JSON.stringify(edited)}\n`);
+
+      await expect(doctorCodexBinding(dirs)).resolves.toMatchObject({ ok: false });
+    },
+  );
 });
