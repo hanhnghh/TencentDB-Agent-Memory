@@ -152,7 +152,7 @@ function validatedUrl(label: string, value: string): string {
 
 function classifyValidationFailure(error: unknown): string {
   const detail = error instanceof Error ? error.message : "";
-  if (/malformed|unexpected (?:null|token|end)|JSON/i.test(detail)) {
+  if (/malformed|unexpected (?:null|token|end|verify response)|JSON/i.test(detail)) {
     return "returned malformed data";
   }
   if (/timeout|timed out|abort/i.test(detail)) return "timed out";
@@ -169,6 +169,21 @@ function wrapValidationError(scope: string, error: unknown): CodexBindingError {
   return new CodexBindingError(
     "validation_failed",
     `Unable to validate ${scope}: MemoryCore metadata ${classifyValidationFailure(error)}`,
+  );
+}
+
+function wrapAuthenticationError(rejectReason: string | undefined): CodexBindingError {
+  if (rejectReason === "invalid user_key") {
+    return new CodexBindingError(
+      "authentication_failed",
+      "User key is invalid or unauthorized for the selected Memory service",
+    );
+  }
+  return new CodexBindingError(
+    "validation_failed",
+    `Unable to validate user key: MemoryCore authentication ${
+      classifyValidationFailure(new Error(rejectReason ?? "malformed response"))
+    }`,
   );
 }
 
@@ -532,10 +547,7 @@ export async function bindCodexProject(
     fetcher,
   );
   if (verified.rejected || !verified.userId) {
-    throw new CodexBindingError(
-      "authentication_failed",
-      "User key is invalid or unauthorized for the selected Memory service",
-    );
+    throw wrapAuthenticationError(verified.rejectReason);
   }
 
   const metadata = new MetadataClient(
@@ -771,22 +783,16 @@ export async function unbindCodexProject(
     let credentialRemoved = false;
 
     if (binding) {
-      try {
-        const credentials = await readCredentialFile(credentialPath);
-        if (Object.hasOwn(credentials.user_keys, binding.service_id)) {
-          delete credentials.user_keys[binding.service_id];
-          credentialRemoved = true;
-          if (Object.keys(credentials.user_keys).length === 0) {
-            await unlink(credentialPath).catch((error: NodeJS.ErrnoException) => {
-              if (error.code !== "ENOENT") throw error;
-            });
-          } else {
-            await atomicWriteJson(credentialPath, credentials, 0o600);
-          }
-        }
-      } catch (error) {
-        if (!(error instanceof CodexBindingError && error.code === "credential_store_invalid")) {
-          throw error;
+      const credentials = await readCredentialFile(credentialPath);
+      if (Object.hasOwn(credentials.user_keys, binding.service_id)) {
+        delete credentials.user_keys[binding.service_id];
+        credentialRemoved = true;
+        if (Object.keys(credentials.user_keys).length === 0) {
+          await unlink(credentialPath).catch((error: NodeJS.ErrnoException) => {
+            if (error.code !== "ENOENT") throw error;
+          });
+        } else {
+          await atomicWriteJson(credentialPath, credentials, 0o600);
         }
       }
     }

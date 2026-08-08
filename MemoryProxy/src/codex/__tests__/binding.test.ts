@@ -146,7 +146,10 @@ describe("validated Codex project binding", () => {
       agentId: "agent-1",
       taskId: "task-1",
       fetcher,
-    })).rejects.toThrow("User key is invalid or unauthorized");
+    })).rejects.toMatchObject({
+      code: "validation_failed",
+      message: "Unable to validate user key: MemoryCore authentication returned malformed data",
+    });
 
     expect(fetcher).toHaveBeenCalledTimes(1);
     await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH))).rejects.toMatchObject({ code: "ENOENT" });

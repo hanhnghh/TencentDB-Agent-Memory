@@ -171,7 +171,7 @@ describe("Codex binding operations", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it("removes the project binding when the credential store is malformed", async () => {
+  it("does not acknowledge unbind when requested credential cleanup fails", async () => {
     const dirs = await setup();
     await bind(dirs.projectDir, dirs.userConfigDir);
     await writeFile(resolveCredentialPath(dirs.userConfigDir), "{not-json", { mode: 0o600 });
@@ -181,12 +181,11 @@ describe("Codex binding operations", () => {
     await expect(unbindCodexProject({
       ...dirs,
       forgetCredential: true,
-    })).resolves.toEqual({
-      removed: true,
-      credentialRemoved: false,
-    });
+    })).rejects.toMatchObject({ code: "credential_store_invalid" });
     await expect(stat(join(dirs.projectDir, PROJECT_BINDING_RELATIVE_PATH)))
-      .rejects.toMatchObject({ code: "ENOENT" });
+      .resolves.toBeDefined();
+    await expect(readFile(resolveCredentialPath(dirs.userConfigDir), "utf8"))
+      .resolves.toBe("{not-json");
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
