@@ -68,6 +68,8 @@ export interface TriggerInput {
   assetCapabilities?: AssetCapabilityFlags;
   /** Optional override (e.g. SSE accumulators contain the truth in streaming mode). */
   toolCallCountOverride?: number;
+  /** Monotonic transport turn identity; survives visible-history compaction. */
+  turnSequence?: number;
 }
 
 export async function triggerSkillExtractIfReady(input: TriggerInput): Promise<void> {
@@ -125,7 +127,9 @@ export async function triggerSkillExtractIfReady(input: TriggerInput): Promise<v
 
     // Keep identity independent from content: an exact retry returns Core's
     // original receipt, while changed content for the same turn conflicts.
-    const turnSequence = countHumanTurns(rawMsgs, input.protocol);
+    const turnSequence = input.turnSequence !== undefined && input.turnSequence > 0
+      ? input.turnSequence
+      : countHumanTurns(rawMsgs, input.protocol);
     const sourceEventId = `proxy:${sha256(JSON.stringify({
       agent_source: input.agentSource,
       protocol: input.protocol,

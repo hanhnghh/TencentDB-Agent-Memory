@@ -128,4 +128,43 @@ describe("MemoryProxy skill ingestion identity", () => {
 
     expect(bodies[1]?.source_event_id).not.toBe(bodies[0]?.source_event_id);
   });
+
+  it("keeps event identity stable across compacted history for the same monotonic turn", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetcher = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      return new Response(JSON.stringify({
+        code: 0,
+        data: {
+          status: "ok",
+          receipt: {
+            receipt_id: "receipt-1",
+            source_event_id: body.source_event_id,
+            content_hash: body.content_hash,
+            accepted_at_ms: 42,
+          },
+        },
+      }), { status: 200 });
+    });
+    setCoreSkillClient(new CoreSkillClient(DEFAULT_CONFIG.coreSkill, fetcher as typeof fetch));
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await triggerSkillExtractIfReady({
+      ...makeInput([
+        { role: "user", content: "old turn" },
+        { role: "assistant", content: "old answer" },
+        { role: "user", content: "current turn" },
+      ], "current answer"),
+      turnSequence: 7,
+    });
+    await triggerSkillExtractIfReady({
+      ...makeInput([{ role: "user", content: "current turn" }], "current answer"),
+      turnSequence: 7,
+    });
+
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]?.source_event_id).toBe(bodies[0]?.source_event_id);
+    expect(bodies[1]?.content_hash).toBe(bodies[0]?.content_hash);
+  });
 });

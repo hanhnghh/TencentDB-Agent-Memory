@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { IncomingMessage, ServerResponse } from "node:http";
 
 import type {
   IStorageBackend,
@@ -9,7 +10,11 @@ import type {
 } from "../../storage/types.js";
 import { StorageAdapter } from "../../storage/adapter.js";
 import { conversationAddRequestSchema } from "../../../gateway/skill-schemas.js";
-import { handleConversationAdd } from "../../../gateway/skill-handlers.js";
+import { handleV2Route } from "../../../gateway/v2-router.js";
+import {
+  handleConversationAdd,
+  makeSkillRouteTable,
+} from "../../../gateway/skill-handlers.js";
 import {
   LocalSkillAgentTaskQueue,
   RedisSkillAgentTaskQueue,
@@ -166,7 +171,205 @@ function makeWired(
   return { backend, wired };
 }
 
+async function dispatchConversation(
+  wired: ReturnType<typeof makeWired>["wired"],
+  body: unknown,
+): Promise<{ status: number; envelope: Record<string, unknown> }> {
+  const req = {
+    headers: {
+      authorization: "Bearer key",
+      "x-tdai-service-id": "space-1",
+    },
+  } as IncomingMessage;
+  const res = {} as ServerResponse;
+  let sent: { status: number; envelope: Record<string, unknown> } | undefined;
+  const deps = {
+    getStore: () => undefined,
+    getEmbedding: () => undefined,
+    getStorage: () => undefined,
+    deployMode: "standalone" as const,
+    logger: { debug() {}, info() {}, warn() {}, error() {} },
+    getSkillCore: () => undefined,
+    resolveConversationAdd: async () => wired,
+  };
+
+  const handled = await handleV2Route(
+    req,
+    res,
+    "/v3/skill/conversation/add",
+    "POST",
+    async () => body,
+    (_response, status, payload) => {
+      sent = { status, envelope: payload as Record<string, unknown> };
+    },
+    deps,
+    makeSkillRouteTable() as unknown as NonNullable<Parameters<typeof handleV2Route>[7]>,
+  );
+  if (!handled || !sent) throw new Error("conversation route did not emit an HTTP response");
+  return sent;
+}
+
 describe("skill conversation ingestion duplicate safety", () => {
+  it("keeps the legacy HTTP contract valid when source identity is omitted", async () => {
+    const { wired } = makeWired();
+
+    const response = await dispatchConversation(wired, baseInput);
+
+    expect(response).toMatchObject({
+      status: 200,
+      envelope: {
+        code: 0,
+        data: {
+          status: "ok",
+          receipt: {
+            receipt_id: expect.any(String),
+            content_hash: expect.stringMatching(/^sha256:/),
+            accepted_at_ms: expect.any(Number),
+          },
+        },
+      },
+    });
+    expect((response.envelope.data as { receipt: Record<string, unknown> }).receipt)
+      .not.toHaveProperty("source_event_id");
+  });
+
+  it("returns the original receipt for an exact replay through HTTP dispatch", async () => {
+    const { wired } = makeWired();
+    const body = {
+      ...baseInput,
+      source_event_id: "http-replay",
+      content_hash: "sha256:caller-content",
+    };
+
+    const first = await dispatchConversation(wired, body);
+    const replay = await dispatchConversation(wired, body);
+
+    expect(first.status).toBe(200);
+    expect(replay.status).toBe(200);
+    expect(replay.envelope.data).toEqual(first.envelope.data);
+    await expect(wired.buffer.readCurrent(baseInput)).resolves.toEqual({
+      messages: baseInput.messages,
+    });
+  });
+
+  it("returns a conflict envelope for changed content through HTTP dispatch", async () => {
+    const { wired } = makeWired();
+    const body = { ...baseInput, source_event_id: "http-conflict" };
+    await dispatchConversation(wired, body);
+
+    const conflict = await dispatchConversation(wired, {
+      ...body,
+      messages: [{ role: "user", content: "changed" }],
+    });
+
+    // The gateway's established compatibility surface uses HTTP 200 for
+    // multi-digit business codes; retry clients classify envelope code 40902.
+    expect(conflict).toMatchObject({
+      status: 200,
+      envelope: {
+        code: 40902,
+        data: { source_event_id: "http-conflict" },
+      },
+    });
+  });
+
+  it("serializes concurrent distinct appends through HTTP dispatch", async () => {
+    const backend = new MemoryBackend();
+    backend.readDelaysMs = [0, 20, 10, 0];
+    const { wired } = makeWired(backend);
+
+    await Promise.all([
+      dispatchConversation(wired, {
+        ...baseInput,
+        source_event_id: "http-event-a",
+        messages: [{ role: "user", content: "a" }],
+      }),
+      dispatchConversation(wired, {
+        ...baseInput,
+        source_event_id: "http-event-b",
+        messages: [{ role: "assistant", content: "b" }],
+      }),
+    ]);
+
+    const current = await wired.buffer.readCurrent(baseInput);
+    expect(current.messages.map((message) => message.content).sort()).toEqual(["a", "b"]);
+  });
+
+  it("coalesces concurrent duplicate delivery through HTTP dispatch", async () => {
+    const { wired } = makeWired();
+    const body = { ...baseInput, source_event_id: "http-concurrent-duplicate" };
+
+    const [first, replay] = await Promise.all([
+      dispatchConversation(wired, body),
+      dispatchConversation(wired, body),
+    ]);
+
+    expect(replay.envelope.data).toEqual(first.envelope.data);
+    await expect(wired.buffer.readCurrent(baseInput)).resolves.toEqual({
+      messages: baseInput.messages,
+    });
+  });
+
+  it("recovers the committed receipt after acknowledgement loss through HTTP dispatch", async () => {
+    const backend = new MemoryBackend();
+    const { wired: beforeRestart } = makeWired(backend);
+    backend.throwAfterSessionCommitOnce = true;
+    const body = { ...baseInput, source_event_id: "http-ack-loss" };
+
+    const ambiguous = await dispatchConversation(beforeRestart, body);
+    expect(ambiguous.envelope).toMatchObject({ code: 50001 });
+
+    const { wired: afterRestart } = makeWired(backend);
+    const replay = await dispatchConversation(afterRestart, body);
+    expect(replay).toMatchObject({
+      status: 200,
+      envelope: {
+        code: 0,
+        data: { receipt: { source_event_id: "http-ack-loss" } },
+      },
+    });
+    await expect(afterRestart.buffer.readCurrent(baseInput)).resolves.toEqual({
+      messages: baseInput.messages,
+    });
+  });
+
+  it("accepts exactly 500 messages through HTTP dispatch", async () => {
+    const { wired } = makeWired();
+    const messages = Array.from({ length: 500 }, (_, index) => ({
+      role: "user" as const,
+      content: `message-${index}`,
+    }));
+
+    const response = await dispatchConversation(wired, {
+      ...baseInput,
+      source_event_id: "http-500-messages",
+      messages,
+    });
+
+    expect(response).toMatchObject({ status: 200, envelope: { code: 0 } });
+    await expect(wired.buffer.readCurrent(baseInput)).resolves.toEqual({ messages });
+  });
+
+  it("rejects 501 messages through HTTP dispatch", async () => {
+    const { wired } = makeWired();
+    const messages = Array.from({ length: 501 }, (_, index) => ({
+      role: "user" as const,
+      content: `message-${index}`,
+    }));
+
+    const response = await dispatchConversation(wired, {
+      ...baseInput,
+      source_event_id: "http-501-messages",
+      messages,
+    });
+
+    expect(response).toMatchObject({
+      status: 200,
+      envelope: { code: 40001, message: expect.stringContaining("messages") },
+    });
+    await expect(wired.buffer.readCurrent(baseInput)).resolves.toEqual({ messages: [] });
+  });
+
   it("accepts optional source identity fields at the request boundary", () => {
     const parsed = conversationAddRequestSchema.safeParse({
       ...baseInput,
