@@ -239,13 +239,16 @@ function stateToIdFields(
   };
 }
 
-function loadSessionIdsL1(sessionKey: string): SessionIdFields | null {
+function loadSessionIdsL1(
+  sessionKey: string,
+  explicitSource?: string,
+): SessionIdFields | null {
   // 会话 keyId 在 handler 层是 `${agentSource}:${sessionId}`；skill-bridge 拿到
   // 的通常是 bare sessionKey（外部 curl 不知道 agentSource）。原语义是先按
   // bare 命中，命中不到再按已知 agentSource 前缀试。
   const candidates = sessionKey.includes(":")
     ? [sessionKey]
-    : createSessionNamespaceCandidates(sessionKey);
+    : createSessionNamespaceCandidates(sessionKey, explicitSource);
   for (const k of candidates) {
     const s = getSessionStore().get(k);
     if (s) return stateToIdFields(s, k);
@@ -262,6 +265,7 @@ async function loadSessionIdsL2(
   apiKey: string,
   spaceId: string,
   sessionKey: string,
+  explicitSource?: string,
 ): Promise<SessionIdFields | null> {
   if (!isAuthEnabled() || !apiKey) return null;
   const verifyResult = await verifyUserKey(apiKey, spaceId);
@@ -271,7 +275,7 @@ async function loadSessionIdsL2(
   // 与 L1 一样按前缀候选跑一遍
   const candidates = sessionKey.includes(":")
     ? [sessionKey]
-    : createSessionNamespaceCandidates(sessionKey);
+    : createSessionNamespaceCandidates(sessionKey, explicitSource);
   for (const compositeKey of candidates) {
     const colonIdx = compositeKey.indexOf(":");
     const agentSource = colonIdx > 0 ? compositeKey.slice(0, colonIdx) : "claude-code";
@@ -286,7 +290,11 @@ async function loadSessionIdsL2(
       const fields = stateToIdFields(recovered, compositeKey);
       if (fields) return fields;
     } catch (err) {
-      console.warn(`${TAG} L2 fallthrough error key=${compositeKey}: ${(err as Error).message}`);
+      console.warn(
+        `${TAG} L2 fallthrough error key=${compositeKey} type=${
+          err instanceof Error ? err.name : "UnknownError"
+        }`,
+      );
     }
   }
   return null;
@@ -419,22 +427,31 @@ export function createSkillBridgeHandler(
 
     // Session must be initialized — IdFields come from there.
     const { sessionKey } = deriveSessionKey(c);
-    let ids = loadSessionIdsL1(sessionKey);
+    const explicitSource = c.req.header("x-agent-source");
+    const requestedSpaceId = c.req.header("x-tdai-service-id")
+      ?? config.tdai?.serviceId
+      ?? config.coreSkill?.serviceId
+      ?? "";
+    let ids = loadSessionIdsL1(sessionKey, explicitSource);
     if (!ids) {
       // §6.1 修复：跨 pod L2 fallthrough
       const auth = c.req.header("authorization") ?? c.req.header("Authorization") ?? "";
       const apiKey = extractBearerToken(auth);
-      const spaceId = c.req.header("x-tdai-service-id")
-        ?? config.tdai?.serviceId
-        ?? config.coreSkill?.serviceId
-        ?? "";
-      if (apiKey && spaceId) {
-        console.log(`${TAG} session=${sessionKey} L1 miss → L2 fallthrough (apiKey=${apiKeyToKeyId(apiKey)} spaceId=${spaceId})`);
-        ids = await loadSessionIdsL2(apiKey, spaceId, sessionKey);
+      if (apiKey && requestedSpaceId) {
+        console.log(`${TAG} session=${sessionKey} L1 miss → L2 fallthrough (apiKey=${apiKeyToKeyId(apiKey)} spaceId=${requestedSpaceId})`);
+        ids = await loadSessionIdsL2(
+          apiKey,
+          requestedSpaceId,
+          sessionKey,
+          explicitSource,
+        );
       }
     }
     if (!ids) {
       return envelope(40101, `${TAG} session not initialized; cannot derive identity`, 401);
+    }
+    if (ids.space_id && requestedSpaceId && ids.space_id !== requestedSpaceId) {
+      return envelope(40301, `${TAG} session does not belong to the requested service`, 403);
     }
 
     // Backing storage for extract trigger + version pin.
@@ -464,8 +481,8 @@ export function createSkillBridgeHandler(
           return envelope(40001, `${TAG} body must be a JSON object`, 400);
         }
       }
-    } catch (err) {
-      return envelope(40001, `${TAG} invalid JSON body: ${(err as Error).message}`, 400);
+    } catch {
+      return envelope(40001, `${TAG} invalid JSON body`, 400);
     }
 
     // ── files/download: read from core, decode, return raw bytes ──────
@@ -493,8 +510,12 @@ export function createSkillBridgeHandler(
           signal: AbortSignal.timeout(Math.max(5000, config.coreSkill.timeoutMs * 4)),
         });
       } catch (err) {
-        console.warn(`${TAG} files/download upstream fetch failed: ${(err as Error).message}`);
-        return envelope(50301, `${TAG} upstream unavailable: ${(err as Error).message}`, 502);
+        console.warn(
+          `${TAG} files/download upstream fetch failed type=${
+            err instanceof Error ? err.name : "UnknownError"
+          }`,
+        );
+        return envelope(50301, `${TAG} upstream unavailable`, 502);
       }
       const coreText = await coreResp.text().catch(() => "");
       const elapsed = (deps.now ?? Date.now)() - t0;
@@ -628,7 +649,11 @@ export function createSkillBridgeHandler(
           console.log(`${TAG} team search whitelist size=${whitelist.length} user=${ids.user_id} team=${ids.team_id}`);
         } catch (err) {
           // Fail-closed: return empty rather than falling back to unfiltered search.
-          console.warn(`${TAG} team search whitelist resolver failed, fail-closed: ${(err as Error).message}`);
+          console.warn(
+            `${TAG} team search whitelist resolver failed, fail-closed type=${
+              err instanceof Error ? err.name : "UnknownError"
+            }`,
+          );
           return new Response(
             JSON.stringify({ code: 0, message: "ok", request_id: `bridge-${(deps.now ?? Date.now)()}`, data: { items: [] } }),
             { status: 200, headers: { "content-type": "application/json" } },
@@ -698,9 +723,11 @@ export function createSkillBridgeHandler(
       });
     } catch (err) {
       console.warn(
-        `${TAG} upstream fetch failed sub=${sub} err=${(err as Error).message}`,
+        `${TAG} upstream fetch failed sub=${sub} type=${
+          err instanceof Error ? err.name : "UnknownError"
+        }`,
       );
-      return envelope(50301, `${TAG} upstream unavailable: ${(err as Error).message}`, 502);
+      return envelope(50301, `${TAG} upstream unavailable`, 502);
     }
 
     const respText = await resp.text().catch(() => "");

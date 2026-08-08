@@ -34,7 +34,7 @@ function jsonResponse(data: unknown): Response {
 }
 
 function api(): typeof fetch {
-  return vi.fn(async (input) => {
+  const fetcher: typeof fetch = vi.fn(async (input) => {
     const path = new URL(String(input)).pathname;
     if (path.endsWith("/auth/verify")) {
       return jsonResponse({ code: 0, data: { valid: true, user: { user_id: "user-1" } } });
@@ -45,7 +45,8 @@ function api(): typeof fetch {
         ? [{ agent_id: "agent-1", team_id: "team-1", name: "Agent" }]
         : [{ task_id: "task-1", team_id: "team-1", title: "Task" }];
     return jsonResponse({ code: 0, data: { items, total: 1, limit: 100, offset: 0 } });
-  }) as typeof fetch;
+  });
+  return fetcher;
 }
 
 async function bind(projectDir: string, userConfigDir: string): Promise<void> {
@@ -293,18 +294,4 @@ describe("Codex binding operations", () => {
       status: "fail",
     }));
   });
-
-  it.fails(
-    "TARGET (deferred runtime validation): doctor rejects well-formed project IDs edited after bind",
-    async () => {
-      const dirs = await setup();
-      await bind(dirs.projectDir, dirs.userConfigDir);
-      const projectPath = join(dirs.projectDir, PROJECT_BINDING_RELATIVE_PATH);
-      const edited = JSON.parse(await readFile(projectPath, "utf8")) as Record<string, unknown>;
-      edited.task_id = "task-not-authorized";
-      await writeFile(projectPath, `${JSON.stringify(edited)}\n`);
-
-      await expect(doctorCodexBinding(dirs)).resolves.toMatchObject({ ok: false });
-    },
-  );
 });

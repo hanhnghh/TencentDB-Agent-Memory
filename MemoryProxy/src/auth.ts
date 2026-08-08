@@ -42,6 +42,10 @@ function redactVerifierSecrets(message: string, secrets: Array<string | undefine
     .reduce((text, secret) => text.split(secret).join("[REDACTED]"), message);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 // ── Module state ──────────────────────────────────────────────────────────────
 
 let config: AuthConfig | null = null;
@@ -140,26 +144,26 @@ export async function verifyUserKeyWithConfig(
       return { userId: "", rejected: true, rejectReason: reason };
     }
 
-    const body = await resp.json() as {
-      code?: number;
-      data?: { valid?: boolean; user?: { user_id?: unknown } };
-    };
+    const body: unknown = await resp.json();
+    const bodyRecord = isRecord(body) ? body : null;
+    const data = isRecord(bodyRecord?.data) ? bodyRecord.data : null;
+    const user = isRecord(data?.user) ? data.user : null;
 
     // Only accept: code=0 AND valid=true AND user_id present
-    const userId = body.data?.user?.user_id;
+    const userId = user?.user_id;
     if (
-      body.code === 0 &&
-      body.data?.valid === true &&
+      bodyRecord?.code === 0 &&
+      data?.valid === true &&
       typeof userId === "string" &&
       userId.trim()
     ) {
-      return { userId, rejected: false };
+      return { userId: userId.trim(), rejected: false };
     }
 
     // Everything else is a rejection
-    const reason = body.data?.valid === false
+    const reason = data?.valid === false
       ? "invalid user_key"
-      : `unexpected verify response (code=${body.code})`;
+      : `unexpected verify response (code=${String(bodyRecord?.code)})`;
     return { userId: "", rejected: true, rejectReason: reason };
   } catch (err: unknown) {
     const isTimeout = err instanceof DOMException && err.name === "TimeoutError";

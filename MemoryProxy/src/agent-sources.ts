@@ -4,12 +4,10 @@ export const AGENT_SOURCES = ["claude-code", "codebuddy", "codex"] as const;
 export type KnownAgentSource = (typeof AGENT_SOURCES)[number];
 export type AgentSource = KnownAgentSource | "unknown";
 
-const knownSources = new Set<string>(AGENT_SOURCES);
-
 /** Map external source labels onto the bounded registry used by persistence. */
 export function normalizeAgentSource(value: string | null | undefined): AgentSource {
   const normalized = value?.trim().toLowerCase() ?? "";
-  return knownSources.has(normalized) ? normalized as KnownAgentSource : "unknown";
+  return AGENT_SOURCES.find((source) => source === normalized) ?? "unknown";
 }
 
 /** Canonicalize registered labels while preserving legacy custom namespaces. */
@@ -47,7 +45,17 @@ export function createSessionNamespace(
  * every newer registered source so capability lookups cannot drift from the
  * source registry.
  */
-export function createSessionNamespaceCandidates(sessionIdentity: string): string[] {
+export function createSessionNamespaceCandidates(
+  sessionIdentity: string,
+  explicitSource?: string | null,
+): string[] {
+  if (explicitSource !== undefined && explicitSource !== null) {
+    const normalizedSource = normalizeAgentSource(explicitSource);
+    if (normalizedSource === "unknown" && explicitSource.trim().toLowerCase() !== "unknown") {
+      return [];
+    }
+    return [createSessionNamespace(normalizedSource, sessionIdentity)];
+  }
   const legacyOrder: KnownAgentSource[] = ["codebuddy", "claude-code"];
   const remainingSources = AGENT_SOURCES.filter((source) => !legacyOrder.includes(source));
   return [

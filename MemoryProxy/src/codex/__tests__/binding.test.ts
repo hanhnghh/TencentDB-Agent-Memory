@@ -30,10 +30,22 @@ function jsonResponse(data: unknown, status = 200): Response {
   });
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseJsonRecord(value: string): Record<string, unknown> {
+  const parsed: unknown = JSON.parse(value);
+  if (!isRecord(parsed)) {
+    throw new Error("expected a JSON object");
+  }
+  return parsed;
+}
+
 function successfulApi(): typeof fetch {
-  return vi.fn(async (input, init) => {
+  const fetcher: typeof fetch = vi.fn(async (input, init) => {
     const path = new URL(String(input)).pathname;
-    const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    const body = parseJsonRecord(String(init?.body ?? "{}"));
 
     if (path === "/v3/meta/auth/verify") {
       expect(body).toEqual({ user_key: "user-key-secret" });
@@ -68,7 +80,8 @@ function successfulApi(): typeof fetch {
       return jsonResponse({ code: 0, data: { items: [{ task_id: "task-1", team_id: "team-1", title: "Task" }], total: 1, limit: 100, offset: 0 } });
     }
     throw new Error(`unexpected path ${path}`);
-  }) as typeof fetch;
+  });
+  return fetcher;
 }
 
 describe("validated Codex project binding", () => {
@@ -146,7 +159,9 @@ describe("validated Codex project binding", () => {
     const projectDir = join(root, "project");
     const userConfigDir = join(root, "user-config");
     await mkdir(projectDir);
-    const fetcher = vi.fn(async () => jsonResponse({ code: 0, data: { valid: false } })) as typeof fetch;
+    const fetcher: typeof fetch = vi.fn(async () => (
+      jsonResponse({ code: 0, data: { valid: false } })
+    ));
 
     await expect(bindCodexProject({
       projectDir,
@@ -171,10 +186,10 @@ describe("validated Codex project binding", () => {
     const projectDir = join(root, "project");
     const userConfigDir = join(root, "user-config");
     await mkdir(projectDir);
-    const fetcher = vi.fn(async () => jsonResponse({
+    const fetcher: typeof fetch = vi.fn(async () => jsonResponse({
       code: 0,
       data: { valid: true, user: { user_id: { value: "user-1" } } },
-    })) as typeof fetch;
+    }));
 
     await expect(bindCodexProject({
       projectDir,
@@ -203,9 +218,9 @@ describe("validated Codex project binding", () => {
     const projectDir = join(root, "project");
     const userConfigDir = join(root, "user-config");
     await mkdir(projectDir);
-    const fetcher = vi.fn(async () => {
+    const fetcher: typeof fetch = vi.fn(async () => {
       throw new Error("network unavailable");
-    }) as typeof fetch;
+    });
 
     await expect(bindCodexProject({
       projectDir,
@@ -293,12 +308,43 @@ describe("validated Codex project binding", () => {
       .rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it.each([0, -1, 1.5])(
+    "rejects invalid timeout %s before validation or persistence",
+    async (timeoutMs) => {
+      const root = await makeTempRoot();
+      const projectDir = join(root, "project");
+      const fetcher = successfulApi();
+      await mkdir(projectDir);
+
+      await expect(bindCodexProject({
+        projectDir,
+        userConfigDir: join(root, "user-config"),
+        endpoint: "https://memory.example",
+        serviceId: "memory-1",
+        serviceToken: "service-secret",
+        userKey: "user-key-secret",
+        teamId: "team-1",
+        agentId: "agent-1",
+        taskId: "task-1",
+        timeoutMs,
+        fetcher,
+      })).rejects.toMatchObject({ code: "invalid_configuration" });
+
+      expect(fetcher).not.toHaveBeenCalled();
+      await expect(readFile(join(projectDir, PROJECT_BINDING_RELATIVE_PATH)))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
   it("does not expose dependency responses or credentials in validation failures", async () => {
     const root = await makeTempRoot();
     const projectDir = join(root, "project");
     await mkdir(projectDir);
     const base = successfulApi();
-    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const fetcher: typeof fetch = vi.fn(async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
       const path = new URL(String(input)).pathname;
       if (path === "/v3/meta/team/list") {
         return new Response(
@@ -307,7 +353,7 @@ describe("validated Codex project binding", () => {
         );
       }
       return base(input, init);
-    }) as typeof fetch;
+    });
 
     let message = "";
     try {
@@ -398,12 +444,13 @@ describe("validated Codex project binding", () => {
       }),
     ]);
 
-    const credentials = JSON.parse(
+    expect(parseJsonRecord(
       await readFile(resolveCredentialPath(userConfigDir), "utf8"),
-    ) as { user_keys: Record<string, string> };
-    expect(credentials.user_keys).toEqual({
-      "memory-a": "user-key-secret",
-      "memory-b": "user-key-secret",
+    )).toMatchObject({
+      user_keys: {
+        "memory-a": "user-key-secret",
+        "memory-b": "user-key-secret",
+      },
     });
   });
 
@@ -446,7 +493,10 @@ describe("validated Codex project binding", () => {
     const userConfigDir = join(root, "user-config");
     await mkdir(projectDir);
     const base = successfulApi();
-    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const fetcher: typeof fetch = vi.fn(async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
       const path = new URL(String(input)).pathname;
       if (path === "/v3/meta/team/list") {
         return jsonResponse({
@@ -460,7 +510,7 @@ describe("validated Codex project binding", () => {
         });
       }
       return base(input, init);
-    }) as typeof fetch;
+    });
 
     await expect(bindCodexProject({
       projectDir,
@@ -490,7 +540,10 @@ describe("validated Codex project binding", () => {
     const userConfigDir = join(root, "user-config");
     await mkdir(projectDir);
     const base = successfulApi();
-    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const fetcher: typeof fetch = vi.fn(async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
       const path = new URL(String(input)).pathname;
       if (path === malformedPath) {
         return jsonResponse({
@@ -499,7 +552,7 @@ describe("validated Codex project binding", () => {
         });
       }
       return base(input, init);
-    }) as typeof fetch;
+    });
 
     await expect(bindCodexProject({
       projectDir,

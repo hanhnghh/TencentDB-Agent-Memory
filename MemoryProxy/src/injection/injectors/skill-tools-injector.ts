@@ -36,6 +36,7 @@ import type {
   InjectionHook,
   PrewarmInput,
 } from "../types.js";
+import { normalizeAgentSource } from "../../agent-sources.js";
 import { HOOK_PRIORITY } from "../types.js";
 
 export interface SkillToolsInjectorConfig {
@@ -61,6 +62,7 @@ export function renderSkillToolsBlock(
   allowLlmWrite = true,
   sessionId?: string,
   spaceId?: string,
+  agentSource?: string,
 ): string {
   const base = proxyBaseUrl.replace(/\/$/, "");
   const bridge = `${base}/skill-bridge/v3/skill`;
@@ -69,7 +71,11 @@ export function renderSkillToolsBlock(
   // 让 proxy 复用 session 里的身份 (user_id / team_id / agent_id)。
   const sessionHeader = sessionId ? ` -H 'x-conversation-id: ${sessionId}'` : "";
   const tenantHeader = spaceId ? ` -H 'x-tdai-service-id: ${spaceId}'` : "";
-  const authHeader = `${tenantHeader}${sessionHeader}`;
+  const normalizedSource = normalizeAgentSource(agentSource);
+  const sourceHeader = normalizedSource === "unknown"
+    ? ""
+    : ` -H 'x-agent-source: ${normalizedSource}'`;
+  const authHeader = `${tenantHeader}${sessionHeader}${sourceHeader}`;
 
   const readTools = [
     `  <tool name="skill_search">`,
@@ -199,15 +205,27 @@ export class SkillToolsInjector implements InjectionHook {
 
   async prewarm(input: PrewarmInput): Promise<ContextBlock[]> {
     if (input.assetCapabilities?.skill === false) return [];
-    return this.renderBlocks(undefined, input.sessionInfo.session_id, input.sessionInfo.space_id);
+    return this.renderBlocks(
+      undefined,
+      input.sessionInfo.session_id,
+      input.sessionInfo.space_id,
+      input.agentSource,
+    );
   }
 
-  private renderBlocks(ctx?: AgentContext, prewarmSessionId?: string, prewarmSpaceId?: string): ContextBlock[] {
+  private renderBlocks(
+    ctx?: AgentContext,
+    prewarmSessionId?: string,
+    prewarmSpaceId?: string,
+    prewarmAgentSource?: string,
+  ): ContextBlock[] {
     const allowLlmWrite = this.config.allowLlmWrite ?? false;
 
     let sessionId = prewarmSessionId;
     let spaceId = prewarmSpaceId;
+    let agentSource = prewarmAgentSource;
     if (ctx) {
+      agentSource = ctx.metadata.agentSource;
       const custom = ctx.metadata.custom as Record<string, unknown> | undefined;
       const session = custom?.session as Record<string, unknown> | undefined;
       const sid = session?.session_id;
@@ -220,7 +238,13 @@ export class SkillToolsInjector implements InjectionHook {
       }
     }
 
-    const content = renderSkillToolsBlock(this.config.proxyBaseUrl, allowLlmWrite, sessionId, spaceId);
+    const content = renderSkillToolsBlock(
+      this.config.proxyBaseUrl,
+      allowLlmWrite,
+      sessionId,
+      spaceId,
+      agentSource,
+    );
     return [{
       type: "text",
       content,

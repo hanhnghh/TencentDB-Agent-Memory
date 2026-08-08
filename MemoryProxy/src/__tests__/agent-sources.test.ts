@@ -7,16 +7,20 @@ import { normalizeWhitelistRequestPath } from "../routes/whitelist.js";
 import {
   canonicalizeAgentSource,
   createSessionNamespace,
+  createSessionNamespaceCandidates,
   normalizeAgentSource,
 } from "../agent-sources.js";
 import { KvBindingRepo } from "../db/kv-binding-repo.js";
+import { DEFAULT_CONFIG } from "../config.js";
 import { createMemoryBridgeHandler } from "../memory/memory-bridge.js";
+import { renderTdaiMemoryToolsBlock } from "../injection/injectors/tdai-tools-injector.js";
 import {
   __resetSessionStoreForTests,
   getSessionStore,
   SessionStore,
 } from "../session/store.js";
 import { createSkillBridgeHandler } from "../skill/skill-bridge.js";
+import { renderSkillToolsBlock } from "../injection/injectors/skill-tools-injector.js";
 import { MemoryStorage } from "../storage/memory-storage.js";
 import type { ProxyConfig } from "../types.js";
 
@@ -26,13 +30,14 @@ afterEach(() => {
 
 function bridgeConfig(): ProxyConfig {
   return {
+    ...DEFAULT_CONFIG,
     coreSkill: {
       endpoint: "https://memory.example",
       serviceId: "memory-1",
       serviceToken: "service-secret",
       timeoutMs: 5_000,
     },
-  } as ProxyConfig;
+  };
 }
 
 async function seedCodexSession(sessionId: string): Promise<void> {
@@ -90,6 +95,29 @@ describe("Codex agent source registry", () => {
     expect(() => createSessionNamespace("codex", "  ")).toThrow(
       "Codex session identity is required",
     );
+  });
+
+  it("uses an explicit registered source as an exact bridge namespace", () => {
+    expect(createSessionNamespaceCandidates("session-123", "codex")).toEqual([
+      "codex:session-123",
+    ]);
+    expect(createSessionNamespaceCandidates("session-123", "not-registered")).toEqual([]);
+  });
+
+  it("includes the validated source in generated bridge calls", () => {
+    expect(renderTdaiMemoryToolsBlock(
+      "https://proxy.example",
+      "session-123",
+      "memory-1",
+      "codex",
+    )).toContain("x-agent-source: codex");
+    expect(renderSkillToolsBlock(
+      "https://proxy.example",
+      false,
+      "session-123",
+      "memory-1",
+      "codex",
+    )).toContain("x-agent-source: codex");
   });
 
   it.each(["codex", "claude-code", "codebuddy", "unknown"])(
@@ -172,17 +200,21 @@ describe("Codex agent source registry", () => {
 
   it("resolves a Codex session through the published memory bridge", async () => {
     await seedCodexSession("shared-session-id");
-    const upstream = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const upstream: typeof fetch = vi.fn(async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
       expect(JSON.parse(String(init?.body))).toMatchObject({
         user_id: "user-codex",
         team_id: "team-codex",
         agent_id: "agent-codex",
         task_id: "task-codex",
+        session_id: "shared-session-id",
       });
       return new Response(JSON.stringify({ code: 0, data: { items: [] } }), {
         headers: { "content-type": "application/json" },
       });
-    }) as typeof fetch;
+    });
     const app = new Hono();
     app.post("/memory-bridge/v3/atomic/search", createMemoryBridgeHandler(
       bridgeConfig(),
@@ -194,8 +226,17 @@ describe("Codex agent source registry", () => {
       headers: {
         "content-type": "application/json",
         "x-conversation-id": "shared-session-id",
+        "x-agent-source": "codex",
+        "x-tdai-service-id": "memory-1",
       },
-      body: JSON.stringify({ query: "binding" }),
+      body: JSON.stringify({
+        query: "binding",
+        user_id: "caller-user",
+        team_id: "caller-team",
+        agent_id: "caller-agent",
+        task_id: "caller-task",
+        session_id: "caller-session",
+      }),
     });
 
     expect(response.status).toBe(200);
@@ -204,7 +245,10 @@ describe("Codex agent source registry", () => {
 
   it("resolves a Codex session through the published skill bridge", async () => {
     await seedCodexSession("shared-session-id");
-    const upstream = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const upstream: typeof fetch = vi.fn(async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
       expect(JSON.parse(String(init?.body))).toMatchObject({
         user_id: "user-codex",
         team_id: "team-codex",
@@ -213,7 +257,7 @@ describe("Codex agent source registry", () => {
       return new Response(JSON.stringify({ code: 0, data: { items: [] } }), {
         headers: { "content-type": "application/json" },
       });
-    }) as typeof fetch;
+    });
     const app = new Hono();
     app.post("/skill-bridge/v3/skill/list", createSkillBridgeHandler(
       bridgeConfig(),
@@ -225,11 +269,101 @@ describe("Codex agent source registry", () => {
       headers: {
         "content-type": "application/json",
         "x-conversation-id": "shared-session-id",
+        "x-agent-source": "codex",
+        "x-tdai-service-id": "memory-1",
       },
       body: "{}",
     });
 
     expect(response.status).toBe(200);
     expect(upstream).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { header: "codebuddy", status: 401 },
+    { header: "not-registered", status: 401 },
+  ])("fails closed for an explicit $header bridge namespace", async ({ header, status }) => {
+    await seedCodexSession("shared-session-id");
+    const upstream = vi.fn();
+    const app = new Hono();
+    app.post("/memory-bridge/v3/atomic/search", createMemoryBridgeHandler(
+      bridgeConfig(),
+      { fetcher: upstream },
+    ));
+
+    const response = await app.request("/memory-bridge/v3/atomic/search", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-conversation-id": "shared-session-id",
+        "x-agent-source": header,
+      },
+      body: JSON.stringify({ query: "binding" }),
+    });
+
+    expect(response.status).toBe(status);
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it("rejects a bridge service that differs from the validated session", async () => {
+    await seedCodexSession("shared-session-id");
+    const upstream = vi.fn();
+    const app = new Hono();
+    app.post("/memory-bridge/v3/atomic/search", createMemoryBridgeHandler(
+      bridgeConfig(),
+      { fetcher: upstream },
+    ));
+
+    const response = await app.request("/memory-bridge/v3/atomic/search", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-conversation-id": "shared-session-id",
+        "x-agent-source": "codex",
+        "x-tdai-service-id": "memory-other",
+      },
+      body: JSON.stringify({ query: "binding" }),
+    });
+
+    expect(response.status).toBe(403);
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it("does not expose dependency errors or credentials through bridge responses", async () => {
+    await seedCodexSession("shared-session-id");
+    const upstream: typeof fetch = vi.fn(async () => {
+      throw new Error("dependency exposed service-secret and user content");
+    });
+    const app = new Hono();
+    app.post("/memory-bridge/v3/atomic/query", createMemoryBridgeHandler(
+      bridgeConfig(),
+      { fetcher: upstream },
+    ));
+    app.post("/skill-bridge/v3/skill/list", createSkillBridgeHandler(
+      bridgeConfig(),
+      { fetcher: upstream },
+    ));
+    const request = {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-conversation-id": "shared-session-id",
+        "x-agent-source": "codex",
+        "x-tdai-service-id": "memory-1",
+      },
+      body: "{}",
+    };
+
+    for (const path of [
+      "/memory-bridge/v3/atomic/query",
+      "/skill-bridge/v3/skill/list",
+    ]) {
+      const response = await app.request(path, request);
+      const text = await response.text();
+      expect(response.status).toBe(502);
+      expect(text).toContain("upstream unavailable");
+      expect(text).not.toContain("service-secret");
+      expect(text).not.toContain("user content");
+    }
   });
 });

@@ -8,6 +8,7 @@ import {
   verifyUserKeyWithConfig,
 } from "../auth.js";
 import { handleChatCompletions } from "../handler.js";
+import { DEFAULT_CONFIG } from "../config.js";
 import type { ProxyConfig } from "../types.js";
 
 afterEach(() => {
@@ -21,7 +22,10 @@ function jsonResponse(data: unknown): Response {
 
 describe("user-key verifier extraction", () => {
   it("preserves the legacy verifier result and request contract", async () => {
-    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const fetcher: typeof fetch = vi.fn(async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
       expect(String(input)).toBe("https://auth.example/v3/meta/auth/verify");
       expect(new Headers(init?.headers).get("x-tdai-service-id")).toBe("memory-1");
       expect(new Headers(init?.headers).get("authorization")).toBeNull();
@@ -30,7 +34,7 @@ describe("user-key verifier extraction", () => {
         code: 0,
         data: { valid: true, user: { user_id: "user-1" } },
       });
-    }) as typeof fetch;
+    });
     vi.stubGlobal("fetch", fetcher);
     initAuth({ enabled: true, url: "https://auth.example/", timeoutMs: 5_000 });
 
@@ -64,9 +68,9 @@ describe("user-key verifier extraction", () => {
   });
 
   it("redacts credentials from verifier transport failures", async () => {
-    const fetcher = vi.fn(async () => {
+    const fetcher: typeof fetch = vi.fn(async () => {
       throw new Error("transport exposed user-key-secret and service-secret");
-    }) as typeof fetch;
+    });
 
     const result = await verifyUserKeyWithConfig(
       {
@@ -93,7 +97,7 @@ describe("user-key verifier extraction", () => {
     vi.stubGlobal("fetch", fetcher);
     initAuth({ enabled: true, url: "https://auth.example", timeoutMs: 5_000 });
     const app = new Hono();
-    const config = {} as ProxyConfig;
+    const config: ProxyConfig = { ...DEFAULT_CONFIG };
     app.post("/:source/:service/v1/chat/completions", (context) => (
       handleChatCompletions(context, config)
     ));

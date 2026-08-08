@@ -49,8 +49,38 @@ interface CredentialFile {
 function emptyCredentialFile(): CredentialFile {
   return {
     version: CONFIG_VERSION,
-    user_keys: Object.create(null) as Record<string, string>,
+    user_keys: {},
   };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function errorCode(error: unknown): string | undefined {
+  return isRecord(error) && typeof error.code === "string" ? error.code : undefined;
+}
+
+function setUserKey(
+  userKeys: Record<string, string>,
+  serviceId: string,
+  userKey: string,
+): void {
+  Object.defineProperty(userKeys, serviceId, {
+    configurable: true,
+    enumerable: true,
+    value: userKey,
+    writable: true,
+  });
+}
+
+async function syncPath(path: string): Promise<void> {
+  const handle = await open(path, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
 }
 
 export interface BindCodexProjectInput {
@@ -150,6 +180,17 @@ function validatedUrl(label: string, value: string): string {
   return url.toString().replace(/\/$/, "");
 }
 
+function validatedTimeout(value: number | undefined): number {
+  const timeoutMs = value ?? 5_000;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new CodexBindingError(
+      "invalid_configuration",
+      "Timeout must be a positive integer number of milliseconds",
+    );
+  }
+  return timeoutMs;
+}
+
 function classifyValidationFailure(error: unknown): string {
   const detail = error instanceof Error ? error.message : "";
   if (/malformed|unexpected (?:null|token|end|verify response)|JSON/i.test(detail)) {
@@ -193,11 +234,10 @@ function assertMetadataEntities(
   requiredFields: string[],
 ): void {
   const malformed = items.some((item) => (
-    !item ||
-    typeof item !== "object" ||
+    !isRecord(item) ||
     requiredFields.some((field) => (
-      typeof (item as Record<string, unknown>)[field] !== "string" ||
-      !(item as Record<string, string>)[field].trim()
+      typeof item[field] !== "string" ||
+      !item[field].trim()
     ))
   ));
   if (malformed) {
@@ -225,6 +265,8 @@ async function atomicWriteJson(path: string, value: unknown, mode: number): Prom
     await chmod(temporary, mode);
     await rename(temporary, path);
     await chmod(path, mode);
+    await syncPath(path);
+    await syncPath(parent);
   } catch (error) {
     await unlink(temporary).catch(() => undefined);
     throw error;
@@ -241,7 +283,7 @@ function processIsRunning(pid: number): boolean {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+    return errorCode(error) !== "ESRCH";
   }
 }
 
@@ -251,13 +293,13 @@ async function lockCanBeRemoved(lockPath: string): Promise<boolean> {
       readFile(lockPath, "utf8"),
       stat(lockPath),
     ]);
-    const owner = JSON.parse(text) as Partial<CredentialLockOwner>;
-    if (Number.isSafeInteger(owner.pid) && (owner.pid ?? 0) > 0) {
-      return !processIsRunning(owner.pid as number);
+    const parsed: unknown = JSON.parse(text);
+    if (isRecord(parsed) && Number.isSafeInteger(parsed.pid) && Number(parsed.pid) > 0) {
+      return !processIsRunning(Number(parsed.pid));
     }
     return Date.now() - lockStat.mtimeMs >= MALFORMED_LOCK_STALE_MS;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    if (errorCode(error) === "ENOENT") return true;
     return false;
   }
 }
@@ -283,7 +325,7 @@ async function withCredentialStoreLock<T>(
         handle = null;
         await unlink(lockPath).catch(() => undefined);
       }
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (errorCode(error) !== "EEXIST") throw error;
       if (await lockCanBeRemoved(lockPath)) {
         await unlink(lockPath).catch((unlinkError: NodeJS.ErrnoException) => {
           if (unlinkError.code !== "ENOENT") throw unlinkError;
@@ -305,27 +347,26 @@ async function withCredentialStoreLock<T>(
   } finally {
     await handle.close().catch(() => undefined);
     try {
-      const current = JSON.parse(await readFile(lockPath, "utf8")) as Partial<CredentialLockOwner>;
-      if (current.token === owner.token) await unlink(lockPath);
+      const current: unknown = JSON.parse(await readFile(lockPath, "utf8"));
+      if (isRecord(current) && current.token === owner.token) await unlink(lockPath);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if (errorCode(error) !== "ENOENT") throw error;
     }
   }
 }
 
 async function readCredentialFile(path: string): Promise<CredentialFile> {
   try {
-    const parsed = JSON.parse(await readFile(path, "utf8")) as Partial<CredentialFile>;
+    const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
     if (
+      !isRecord(parsed) ||
       parsed.version !== CONFIG_VERSION ||
-      !parsed.user_keys ||
-      typeof parsed.user_keys !== "object" ||
-      Array.isArray(parsed.user_keys) ||
+      !isRecord(parsed.user_keys) ||
       Object.keys(parsed).some((key) => !["version", "user_keys"].includes(key))
     ) {
       throw new Error("unsupported credential file format");
     }
-    const userKeys = Object.create(null) as Record<string, string>;
+    const userKeys: Record<string, string> = {};
     for (const [serviceId, userKey] of Object.entries(parsed.user_keys)) {
       if (
         !serviceId.trim() ||
@@ -335,11 +376,11 @@ async function readCredentialFile(path: string): Promise<CredentialFile> {
       ) {
         throw new Error("unsupported credential file format");
       }
-      userKeys[serviceId] = userKey;
+      setUserKey(userKeys, serviceId, userKey);
     }
     return { version: CONFIG_VERSION, user_keys: userKeys };
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+    if (errorCode(error) === "ENOENT") {
       return emptyCredentialFile();
     }
     throw new CodexBindingError(
@@ -404,7 +445,7 @@ async function canonicalizeProspectivePath(path: string): Promise<string> {
     try {
       return join(await realpath(cursor), ...missingSegments);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if (errorCode(error) !== "ENOENT") throw error;
       const parent = dirname(cursor);
       if (parent === cursor) return resolve(path);
       missingSegments.unshift(basename(cursor));
@@ -462,7 +503,11 @@ function parsePreferences(
   }
   const preferences: Record<string, string | number | boolean> = {};
   for (const [key, preference] of Object.entries(value)) {
-    if (!["string", "number", "boolean"].includes(typeof preference)) {
+    if (
+      typeof preference !== "string" &&
+      typeof preference !== "number" &&
+      typeof preference !== "boolean"
+    ) {
       throw new CodexBindingError(
         "invalid_project_binding",
         `Binding preference '${key}' must be a string, number, or boolean`,
@@ -474,13 +519,13 @@ function parsePreferences(
         `Binding preference '${key}' must be JSON-safe`,
       );
     }
-    preferences[key] = preference as string | number | boolean;
+    preferences[key] = preference;
   }
   return preferences;
 }
 
 function parseProjectBinding(value: unknown): CodexProjectBinding {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
+  if (!isRecord(value)) {
     throw new CodexBindingError("invalid_project_binding", "Project binding must be a JSON object");
   }
   const forbidden = findForbiddenSecretField(value);
@@ -490,7 +535,7 @@ function parseProjectBinding(value: unknown): CodexProjectBinding {
       `Project binding contains forbidden secret field '${forbidden}'`,
     );
   }
-  const record = value as Record<string, unknown>;
+  const record = value;
   const allowed = new Set([
     "version",
     "source",
@@ -531,7 +576,7 @@ export async function readCodexProjectBinding(projectDir: string): Promise<Codex
   try {
     return parseProjectBinding(JSON.parse(await readFile(resolveProjectBindingPath(projectDir), "utf8")));
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    if (errorCode(error) === "ENOENT") return null;
     if (error instanceof CodexBindingError) throw error;
     throw new CodexBindingError(
       "invalid_project_binding",
@@ -555,7 +600,7 @@ export async function bindCodexProject(
     : parsePreferences(input.preferences);
   const endpoint = validatedUrl("MemoryCore endpoint", input.endpoint);
   const authUrl = validatedUrl("Auth URL", input.authUrl ?? endpoint);
-  const timeoutMs = input.timeoutMs ?? 5_000;
+  const timeoutMs = validatedTimeout(input.timeoutMs);
   const fetcher = input.fetcher ?? globalThis.fetch.bind(globalThis);
   const credentialPath = resolveCredentialPath(input.userConfigDir);
 
@@ -631,7 +676,7 @@ export async function bindCodexProject(
   const projectConfigPath = resolveProjectBindingPath(input.projectDir);
   await withCredentialStoreLock(credentialPath, async () => {
     const credentials = await readCredentialFile(credentialPath);
-    credentials.user_keys[serviceId] = userKey;
+    setUserKey(credentials.user_keys, serviceId, userKey);
 
     // Serialize the two-file update so concurrent binds cannot lose a key or
     // leave the winning project binding paired with another writer's key.
@@ -652,7 +697,7 @@ export async function credentialFileMode(userConfigDir?: string): Promise<number
   try {
     return (await stat(resolveCredentialPath(userConfigDir))).mode & 0o777;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    if (errorCode(error) === "ENOENT") return null;
     throw error;
   }
 }
@@ -732,7 +777,7 @@ export async function doctorCodexBinding(
     credentialMode = (await stat(status.credentialPath)).mode & 0o777;
     directoryMode = (await stat(dirname(status.credentialPath))).mode & 0o777;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+    if (errorCode(error) !== "ENOENT") {
       checks.push({
         name: "credential_permissions",
         status: "fail",
@@ -776,11 +821,13 @@ export interface UnbindCodexProjectResult {
 
 async function removeProjectBindingFile(projectDir: string): Promise<boolean> {
   let removed = false;
-  await unlink(resolveProjectBindingPath(projectDir))
+  const projectBindingPath = resolveProjectBindingPath(projectDir);
+  await unlink(projectBindingPath)
     .then(() => { removed = true; })
     .catch((error: NodeJS.ErrnoException) => {
       if (error.code !== "ENOENT") throw error;
     });
+  if (removed) await syncPath(dirname(projectBindingPath));
   return removed;
 }
 
@@ -812,9 +859,13 @@ export async function unbindCodexProject(
         delete credentials.user_keys[binding.service_id];
         credentialRemoved = true;
         if (Object.keys(credentials.user_keys).length === 0) {
-          await unlink(credentialPath).catch((error: NodeJS.ErrnoException) => {
-            if (error.code !== "ENOENT") throw error;
-          });
+          let removedCredentialFile = false;
+          await unlink(credentialPath)
+            .then(() => { removedCredentialFile = true; })
+            .catch((error: NodeJS.ErrnoException) => {
+              if (error.code !== "ENOENT") throw error;
+            });
+          if (removedCredentialFile) await syncPath(dirname(credentialPath));
         } else {
           await atomicWriteJson(credentialPath, credentials, 0o600);
         }
