@@ -79,9 +79,10 @@ export class RuntimeHealth {
     const outboxReady = "state" in outbox || (!outbox.workerErrorKind && outbox.deadCount === 0);
     const listenersReady = Object.values(this.listeners)
       .every((listener) => !listener.enabled || listener.ready);
+    const connectivityPending = Object.values(this.connectivity).includes("pending");
     const connectivityDegraded = Object.values(this.connectivity).includes("failed");
     const durableStoreReady = !storageDegraded && outboxReady;
-    const status = !listenersReady
+    const status = !listenersReady || connectivityPending
       ? "starting"
       : !durableStoreReady || connectivityDegraded
         ? "degraded"
@@ -121,6 +122,12 @@ export class RuntimeHealth {
   }
 }
 
+export function runtimeHealthStatusCode(
+  snapshot: RuntimeHealthSnapshot,
+): 200 | 503 {
+  return snapshot.status === "ok" ? 200 : 503;
+}
+
 function initialConnectivity(
   config: ProxyConfig,
 ): Record<string, ConnectivityStatus> {
@@ -128,10 +135,14 @@ function initialConnectivity(
   return {
     upstream: forwarding && config.upstream.url ? "pending" : "disabled",
     creditReport: forwarding && config.creditReport.url ? "pending" : "disabled",
-    clickhouse: forwarding && config.clickhouse.enabled ? "pending" : "disabled",
-    opik: forwarding && config.opik.enabled ? "pending" : "disabled",
-    langfuse: forwarding && config.langfuse.enabled ? "pending" : "disabled",
-    auth: forwarding && config.auth.enabled ? "pending" : "disabled",
+    clickhouse: forwarding && config.clickhouse.enabled && config.clickhouse.url
+      ? "pending"
+      : "disabled",
+    opik: forwarding && config.opik.enabled && config.opik.url ? "pending" : "disabled",
+    langfuse: forwarding && config.langfuse.enabled && config.langfuse.host
+      ? "pending"
+      : "disabled",
+    auth: forwarding && config.auth.enabled && config.auth.url ? "pending" : "disabled",
     redis: config.redis.enabled ? "pending" : "disabled",
     memoryCore: config.coreSkill.endpoint && config.coreSkill.serviceToken
       ? "pending"

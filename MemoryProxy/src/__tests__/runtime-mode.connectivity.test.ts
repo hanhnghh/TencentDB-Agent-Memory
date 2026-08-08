@@ -23,7 +23,7 @@ describe("runtime mode connectivity", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
-  it("reports dependency status without exposing endpoint or response details", async () => {
+  it("treats an HTTP response as reachable without exposing endpoint or response details", async () => {
     const config: ProxyConfig = structuredClone(DEFAULT_CONFIG);
     config.runtime.mode = "proxy";
     config.upstream.url = "https://credential.example/private";
@@ -35,8 +35,20 @@ describe("runtime mode connectivity", () => {
 
     const result = await checkConnectivity(config);
 
-    expect(result).toMatchObject({ upstream: "failed", creditReport: "disabled" });
+    expect(result).toMatchObject({ upstream: "ok", creditReport: "disabled" });
     expect(JSON.stringify(result)).not.toContain("credential.example");
     expect(JSON.stringify(result)).not.toContain("secret dependency failure");
+  });
+
+  it("reports network failures as failed", async () => {
+    const config: ProxyConfig = structuredClone(DEFAULT_CONFIG);
+    config.creditReport.url = "";
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      throw new TypeError("connection refused");
+    }));
+
+    await expect(checkConnectivity(config)).resolves.toMatchObject({
+      upstream: "failed",
+    });
   });
 });

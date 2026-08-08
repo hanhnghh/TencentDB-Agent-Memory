@@ -1,22 +1,18 @@
 import { serve } from "@hono/node-server";
 import type { Hono } from "hono";
 
-import { initAuth } from "../auth.js";
-import { initClickHouse, shutdownClickHouse } from "../clickhouse.js";
 import { checkConnectivity } from "../connectivity.js";
-import { setExtensionDebug, shutdownGuard } from "../guard-adapter.js";
 import { createHookApp } from "../hook-server.js";
-import { initLangfuse, shutdownLangfuse } from "../langfuse.js";
+import { tryActivateRedis, tryActivateStorage } from "../injection/index.js";
 import { initLogger, log, shutdownLogger } from "../report/log.js";
-import { createApp } from "../server.js";
 import { initProxyStorage } from "../storage/factory.js";
-import { initSystemUsers } from "../systemUser.js";
 import type { ProxyConfig } from "../types.js";
 import { RuntimeHealth, type ListenerKind } from "./health.js";
 import { planRuntime } from "./mode.js";
 import {
   createMemoryRuntime,
   type ManagedMemoryRuntime,
+  type MemoryRuntimeProvider,
 } from "./production.js";
 
 export interface RuntimeListenerInput {
@@ -36,8 +32,21 @@ export interface RuntimeListenerAdapter {
   listen(input: RuntimeListenerInput): Promise<RunningListener>;
 }
 
+export interface ForwardingRuntime {
+  createApp(
+    config: ProxyConfig,
+    options: {
+      memoryRuntimeProvider?: MemoryRuntimeProvider;
+      runtimeHealth: RuntimeHealth;
+      storesActivated: true;
+    },
+  ): Hono;
+  shutdown(): Promise<void>;
+}
+
 export interface StartRuntimeOptions {
   listenerAdapter?: RuntimeListenerAdapter;
+  forwardingLoader?: (config: ProxyConfig) => Promise<ForwardingRuntime>;
 }
 
 export interface RunningRuntime {
@@ -53,8 +62,10 @@ export async function startRuntime(
 ): Promise<RunningRuntime> {
   const plan = planRuntime(config);
   const listenerAdapter = options.listenerAdapter ?? nodeListenerAdapter;
+  const forwardingLoader = options.forwardingLoader ?? loadForwardingRuntime;
   const listeners: RunningListener[] = [];
   let memoryRuntime: ManagedMemoryRuntime | undefined;
+  let forwardingRuntime: ForwardingRuntime | undefined;
   let stopped = false;
 
   initLogger({
@@ -66,21 +77,28 @@ export async function startRuntime(
 
   try {
     await initProxyStorage(config.storage);
+    if (!tryActivateStorage(config)) {
+      tryActivateRedis(config);
+    }
     if (plan.dependencies.memoryRuntime) {
       memoryRuntime = await createMemoryRuntime(config);
     }
 
     if (plan.dependencies.forwarding) {
-      initializeForwardingDependencies(config);
+      forwardingRuntime = await forwardingLoader(config);
     }
 
     const health = new RuntimeHealth(config, memoryRuntime?.provider);
     if (plan.listeners.proxy.enabled) {
+      if (!forwardingRuntime) {
+        throw new Error("forwarding runtime missing for active proxy listener");
+      }
       const listener = await listenerAdapter.listen({
         kind: "proxy",
-        app: createApp(config, {
+        app: forwardingRuntime.createApp(config, {
           memoryRuntimeProvider: memoryRuntime?.provider,
           runtimeHealth: health,
+          storesActivated: true,
         }),
         host: plan.listeners.proxy.host,
         port: plan.listeners.proxy.port,
@@ -130,38 +148,45 @@ export async function startRuntime(
         if (stopped) return;
         stopped = true;
         await closeListeners(listeners);
-        if (plan.dependencies.forwarding) {
-          await shutdownGuard();
-          await shutdownLangfuse();
-          await shutdownClickHouse();
-        }
+        await connectivityChecked;
+        await forwardingRuntime?.shutdown();
         await memoryRuntime?.shutdown();
         await shutdownLogger();
       },
     };
   } catch (error: unknown) {
     await closeListeners(listeners);
-    if (plan.dependencies.forwarding) {
-      await shutdownGuard();
-      await shutdownLangfuse();
-      await shutdownClickHouse();
-    }
+    await forwardingRuntime?.shutdown();
     await memoryRuntime?.shutdown();
     await shutdownLogger();
     throw error;
   }
 }
 
-function initializeForwardingDependencies(config: ProxyConfig): void {
-  setExtensionDebug(config.log.level === "debug");
-  initClickHouse(config.clickhouse);
-  void initLangfuse(config).catch((error: unknown) => {
-    log.warn("langfuse.init_error", {
-      errorType: error instanceof Error ? error.name : "unknown",
-    });
-  });
-  initAuth(config.auth);
-  initSystemUsers(config.systemUsers);
+/** Load and initialize forwarding-only modules only when proxy traffic is active. */
+async function loadForwardingRuntime(config: ProxyConfig): Promise<ForwardingRuntime> {
+  const [auth, clickhouse, guard, langfuse, server, systemUsers] = await Promise.all([
+    import("../auth.js"),
+    import("../clickhouse.js"),
+    import("../guard-adapter.js"),
+    import("../langfuse.js"),
+    import("../server.js"),
+    import("../systemUser.js"),
+  ]);
+  guard.setExtensionDebug(config.log.level === "debug");
+  clickhouse.initClickHouse(config.clickhouse);
+  await langfuse.initLangfuse(config);
+  auth.initAuth(config.auth);
+  systemUsers.initSystemUsers(config.systemUsers);
+
+  return {
+    createApp: server.createApp,
+    async shutdown(): Promise<void> {
+      await guard.shutdownGuard();
+      await langfuse.shutdownLangfuse();
+      await clickhouse.shutdownClickHouse();
+    },
+  };
 }
 
 async function closeListeners(listeners: RunningListener[]): Promise<void> {

@@ -135,7 +135,8 @@ cp config.example.yaml config.yaml
 
 至少需要确认这几项：
 
-- `upstream.url` / `upstream.apiKey` —— 上游 LLM 地址与凭据
+- `runtime.mode` —— `proxy`（默认）、`hooks` 或 `both`
+- `upstream.url` / `upstream.apiKey` —— 上游 LLM 地址与凭据（`hooks` 模式不需要）
 - `auth.url` / `tdai.endpoint` / `skill.endpoint` —— 指向你的 MemoryCore Gateway（默认 `http://127.0.0.1:8420`）
 
 > **本地无 Redis 快速跑通**：示例配置默认 `redis.enabled: true`，本机没起 Redis 时会持续刷 `ECONNREFUSED 127.0.0.1:6379`。纯本地开发建议改为 `redis.enabled: false` + `storage.enabled: true`（`storage.backend: sqlite`），会话/注入/Skill 状态改走本地 SQLite，启动即干净。
@@ -147,6 +148,10 @@ npm run start:config
 # 等价于：
 node --import tsx/esm src/index.ts --config config.yaml
 ```
+
+使用 `--mode hooks` 只启动 loopback hook sidecar；使用 `--mode both` 在同一进程中
+启动 public proxy 与本地 hook 两个 listener。Hook listener 默认监听
+`127.0.0.1:8097`，在 `runtime.hooks` 下配置，并拒绝非 loopback 地址。
 
 ### 4. 健康检查
 
@@ -160,7 +165,12 @@ curl http://127.0.0.1:8096/health
 {
   "status": "ok",
   "version": "0.2.0",
-  "upstream": "https://tokenhub.example.com/v1",
+  "mode": "both",
+  "upstream": "configured",
+  "listeners": {
+    "proxy": { "enabled": true, "ready": true, "host": "0.0.0.0", "port": 8096 },
+    "hooks": { "enabled": true, "ready": true, "host": "127.0.0.1", "port": 8097 }
+  },
   "storage": { "enabled": false, "requested": "sqlite", "effective": "sqlite", "degraded": false }
 }
 ```
@@ -242,6 +252,7 @@ Anthropic Messages 客户端：
 
 | 段 | 作用 |
 | --- | --- |
+| `runtime` | 进程模式（`proxy` / `hooks` / `both`）与 loopback hook listener |
 | `server` | 监听 host / port、上游转发超时 |
 | `upstream` | 默认上游 URL 与全局 `apiKey`（非空则替换转发请求鉴权） |
 | `log` | 日志目录、级别、后端与轮转策略 |

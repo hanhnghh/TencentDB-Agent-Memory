@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 
-import { RuntimeHealth } from "./runtime/health.js";
+import { RuntimeHealth, runtimeHealthStatusCode } from "./runtime/health.js";
 import type { MemoryRuntimeProvider } from "./runtime/production.js";
 import type { ProxyConfig } from "./types.js";
 
@@ -22,6 +22,9 @@ export function createHookApp(
   if (!options.runtimeHealth) {
     health.markListenerReady("hooks", config.runtime.hooks.host, config.runtime.hooks.port);
   }
-  app.get("/health", async (c) => c.json(await health.snapshot()));
+  app.get("/health", async (c) => {
+    const body = await health.snapshot();
+    return c.json(body, runtimeHealthStatusCode(body));
+  });
   return app;
 }

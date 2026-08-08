@@ -78,8 +78,12 @@ describe("runtime mode route isolation", () => {
     const proxyApp = createApp(config, { memoryRuntimeProvider: provider, runtimeHealth: health });
     const hookApp = createHookApp(config, { memoryRuntimeProvider: provider, runtimeHealth: health });
 
-    const proxyBody: unknown = await (await proxyApp.request("/health")).json();
-    const hookBody: unknown = await (await hookApp.request("/health")).json();
+    const proxyResponse = await proxyApp.request("/health");
+    const hookResponse = await hookApp.request("/health");
+    expect(proxyResponse.status).toBe(503);
+    expect(hookResponse.status).toBe(503);
+    const proxyBody: unknown = await proxyResponse.json();
+    const hookBody: unknown = await hookResponse.json();
 
     expect(hookBody).toEqual(proxyBody);
     expect(hookBody).toMatchObject({
@@ -107,6 +111,43 @@ describe("runtime mode route isolation", () => {
     expect(serialized).not.toContain("upstream.secret.example");
     expect(serialized).not.toContain("server-secret");
     expect(serialized).not.toContain("memory-secret");
+  });
+
+  it("keeps readiness unavailable while active connectivity checks are pending", async () => {
+    const config: ProxyConfig = structuredClone(DEFAULT_CONFIG);
+    const app = createApp(config);
+
+    const response = await app.request("/health");
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({ status: "starting" });
+  });
+
+  it("reports an unhealthy durable outbox as unavailable", async () => {
+    const config: ProxyConfig = structuredClone(DEFAULT_CONFIG);
+    config.runtime.mode = "hooks";
+    config.upstream.url = "";
+    const provider = {
+      forRequest: () => {
+        throw new Error("health must not create a request runtime");
+      },
+      health: async () => ({
+        pendingCount: 0,
+        inflightCount: 0,
+        retryingCount: 0,
+        deadCount: 1,
+        oldestPendingAgeMs: 0,
+      }),
+    };
+    const app = createHookApp(config, { memoryRuntimeProvider: provider });
+
+    const response = await app.request("/health");
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      status: "degraded",
+      durableStore: { ready: false, outbox: { deadCount: 1 } },
+    });
   });
 
   it.each([

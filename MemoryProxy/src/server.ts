@@ -15,11 +15,12 @@ import type { ProxyConfig } from "./types.js";
 import type {
   MemoryRuntimeProvider,
 } from "./runtime/production.js";
-import { RuntimeHealth } from "./runtime/health.js";
+import { RuntimeHealth, runtimeHealthStatusCode } from "./runtime/health.js";
 
 export interface CreateAppOptions {
   memoryRuntimeProvider?: MemoryRuntimeProvider;
   runtimeHealth?: RuntimeHealth;
+  storesActivated?: boolean;
 }
 
 export function createApp(config: ProxyConfig, options: CreateAppOptions = {}): Hono {
@@ -45,7 +46,7 @@ export function createApp(config: ProxyConfig, options: CreateAppOptions = {}): 
   // /v1/messages hits yet) can still recover session state via L2 fallthrough
   // (memory-bridge.ts / skill-bridge.ts §6.1 fix). Idempotent; the injection
   // pipeline will still call these later when the first main request lands.
-  if (!tryActivateStorage(config)) {
+  if (!options.storesActivated && !tryActivateStorage(config)) {
     tryActivateRedis(config);
   }
 
@@ -79,7 +80,7 @@ export function createApp(config: ProxyConfig, options: CreateAppOptions = {}): 
   // 文件也是不共享的。见 docs/design/2026-07-13-proxy-multinode-state-audit.md P0-2。
   app.get("/health", async (c) => {
     const body = await runtimeHealth.snapshot();
-    return c.json(body, body.durableStore.storage.degraded ? 503 : 200);
+    return c.json(body, runtimeHealthStatusCode(body));
   });
 
   // Whoami: resolve API key → key ID (plain text, easy to use with curl)

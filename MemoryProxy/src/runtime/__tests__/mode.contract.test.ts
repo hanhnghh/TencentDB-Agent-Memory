@@ -3,8 +3,14 @@ import { describe, expect, it } from "vitest";
 import { DEFAULT_CONFIG } from "../../config.js";
 import type { ProxyConfig, RuntimeMode } from "../../types.js";
 import { planRuntime } from "../mode.js";
+import { createMemoryRuntime } from "../production.js";
+import { createProxyMemoryRuntime } from "../proxy-production.js";
 
 describe("runtime mode startup contract", () => {
+  it("keeps the previous proxy production entry point as a compatibility alias", () => {
+    expect(createProxyMemoryRuntime).toBe(createMemoryRuntime);
+  });
+
   it.each([
     ["proxy", true, false, true],
     ["hooks", false, true, false],

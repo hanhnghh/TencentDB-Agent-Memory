@@ -138,7 +138,8 @@ cp config.example.yaml config.yaml
 
 At minimum confirm:
 
-- `upstream.url` / `upstream.apiKey` — upstream LLM address and credentials
+- `runtime.mode` — `proxy` (default), `hooks`, or `both`
+- `upstream.url` / `upstream.apiKey` — upstream LLM address and credentials (not required in `hooks` mode)
 - `auth.url` / `tdai.endpoint` / `skill.endpoint` — point to your MemoryCore Gateway (default `http://127.0.0.1:8420`)
 
 > **Run locally without Redis**: the example config defaults to `redis.enabled: true`, which spams `ECONNREFUSED 127.0.0.1:6379` when no Redis is running locally. For pure local development, set `redis.enabled: false` + `storage.enabled: true` (`storage.backend: sqlite`); session/injection/Skill state then goes to local SQLite and the process starts up cleanly.
@@ -150,6 +151,11 @@ npm run start:config
 # equivalent to:
 node --import tsx/esm src/index.ts --config config.yaml
 ```
+
+Use `--mode hooks` for a loopback-only hook sidecar, or `--mode both` for the
+public proxy and local hook listeners in one process. The hook listener defaults
+to `127.0.0.1:8097` and is configured under `runtime.hooks`; it cannot be bound
+to a non-loopback address.
 
 ### 4. Health check
 
@@ -163,7 +169,12 @@ Sample response (`storage.effective` is the observability anchor for the storage
 {
   "status": "ok",
   "version": "0.2.0",
-  "upstream": "https://tokenhub.example.com/v1",
+  "mode": "both",
+  "upstream": "configured",
+  "listeners": {
+    "proxy": { "enabled": true, "ready": true, "host": "0.0.0.0", "port": 8096 },
+    "hooks": { "enabled": true, "ready": true, "host": "127.0.0.1", "port": 8097 }
+  },
   "storage": { "enabled": false, "requested": "sqlite", "effective": "sqlite", "degraded": false }
 }
 ```
@@ -245,6 +256,7 @@ Config sections at a glance:
 
 | Section | Purpose |
 | --- | --- |
+| `runtime` | process mode (`proxy` / `hooks` / `both`) and loopback hook listener |
 | `server` | listen host / port, upstream forward timeout |
 | `upstream` | default upstream URL and global `apiKey` (replaces forward auth when non-empty) |
 | `log` | log directory, level, backend and rotation policy |
