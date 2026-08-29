@@ -20,6 +20,12 @@ test.afterEach(async () => {
   )));
 });
 
+test("shell variables adjacent to non-ASCII text use braced expansion", async () => {
+  const source = await readFile(join(deployDir, "start-memory-core.sh"), "utf8");
+
+  assert.doesNotMatch(source, /\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]/u);
+});
+
 test("hooks deployment starts without proxy upstream configuration and uses hook health", async () => {
   const fixture = await deploymentFixture(hooksOnlyOverrides);
 
@@ -45,6 +51,15 @@ test("full stack validation and launch remain hooks-aware", async () => {
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /MemoryProxy \(hooks\)/);
   assert.match(result.stdout, /Codex hooks: http:\/\/127\.0\.0\.1:8097/);
+});
+
+test("local hub supplies an instance key when the gateway bearer gate is disabled", async () => {
+  const fixture = await deploymentFixture({ MEMORY_CORE_GATEWAY_API_KEY: "" });
+
+  const result = await runScript("start-memory-hub.sh", fixture.env);
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(await readFile(fixture.dockerLog, "utf8"), /-e REMOTE_INSTANCE_KEY=local/);
 });
 
 test("source manager selects the active mode health listener", async () => {

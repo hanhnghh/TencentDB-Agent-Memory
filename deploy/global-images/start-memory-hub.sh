@@ -26,6 +26,10 @@ require_vars \
 
 # 与 memory-core 保持一致；显式空值表示本地部署关闭 Gateway Bearer gate。
 MEMORY_CORE_GATEWAY_API_KEY="${MEMORY_CORE_GATEWAY_API_KEY-}"
+# Combined image requires a non-empty registry value even when the local
+# Gateway Bearer gate is disabled. In that mode the value is only a harmless
+# placeholder; requests carrying it are accepted because the gate is off.
+MEMORY_HUB_INSTANCE_KEY="${MEMORY_CORE_GATEWAY_API_KEY:-local}"
 
 # Panel UI "客户端接入地址"卡片显示的 base URL（供 CodeBuddy / ClaudeCode 拷贝使用）。
 # 开源本地部署 core 和 proxy 分开跑，客户端要接的是 proxy，不是 core/gateway。
@@ -103,7 +107,7 @@ $DOCKER run -d --name "$CONTAINER" \
   -e REMOTE_INSTANCE_ID=default \
   -e REMOTE_INSTANCE_NAME=default \
   -e REMOTE_INSTANCE_URL="http://memory-core:8420" \
-  -e REMOTE_INSTANCE_KEY="$MEMORY_CORE_GATEWAY_API_KEY" \
+  -e REMOTE_INSTANCE_KEY="$MEMORY_HUB_INSTANCE_KEY" \
   -e REMOTE_INSTANCE_PROXY_URL="$MEMORY_HUB_PROXY_PUBLIC_URL" \
   -e LLM_MODE=custom \
   -e LLM_PROTOCOL="${MEMORY_LLM_PROTOCOL:-openai}" \
