@@ -23,7 +23,7 @@ import {
 import { SkillBufferStorage } from "./buffer-storage.js";
 import { SkillConversationAddHandler } from "./add-handler.js";
 import { SkillTriggerService } from "./trigger-service.js";
-import { wireConversationAdd } from "./wire.js";
+import { wireConversationAddHandler } from "./wire.js";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -152,6 +152,7 @@ class LeaseRedis implements RedisLike {
 }
 
 const baseInput = {
+  instance_id: "instance-1",
   session_id: "session-1",
   space_id: "space-1",
   user_id: "user-1",
@@ -164,7 +165,7 @@ function makeWired(
   backend = new MemoryBackend(),
   thresholds: Partial<{ toolCallThreshold: number; bytesThreshold: number; requestCompressThresholdBytes: number }> = {},
 ) {
-  const wired = wireConversationAdd({
+  const wired = wireConversationAddHandler({
     storage: new StorageAdapter(backend),
     queue: undefined,
     extractor: { extract: async () => ({ candidates: [] }) },
@@ -175,7 +176,6 @@ function makeWired(
       requestCompressThresholdBytes: 1_000_000,
       ...thresholds,
     },
-    skipWorker: true,
   });
   return { backend, wired };
 }

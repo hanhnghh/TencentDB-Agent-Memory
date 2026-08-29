@@ -1,7 +1,7 @@
-"""TencentDB Agent Memory v3 Skill SDK — 15 ``/v3/skill/*`` endpoints:
-``create / update / patch / delete / get / list / search / versions
-/ files/write / files/remove / files/read / listing / extract
-/ conversation/add / conversation/force-archive``.
+"""TencentDB Agent Memory v3 Skill SDK — 17 ``/v3/skill/*`` endpoints:
+``create / update / patch / delete / get / get-by-name / list / search
+/ versions / files/write / files/remove / files/read / export / listing
+/ extract / conversation/add / conversation/force-archive``.
 
 Design & auth
 -------------
@@ -108,6 +108,17 @@ def _validate_conversation_add_result(result: Any) -> Dict[str, Any]:
             retryable=False,
         )
     return result
+def _validate_force_archive(isolation: Dict[str, Any]) -> None:
+    """All five isolation fields (incl. ``space_id``) are required by
+    ``forceArchiveRequestSchema``."""
+    missing = [
+        field for field in ("session_id", "space_id", "user_id", "team_id", "agent_id")
+        if not isinstance(isolation.get(field), str) or not isolation[field].strip()
+    ]
+    if missing:
+        raise ParamError(
+            f"conversation_force_archive requires non-empty {', '.join(missing)}"
+        )
 
 
 class _SkillDefaults:
@@ -347,6 +358,48 @@ class SkillClient:
         })
         return self._stub.post(f"{_V3}/get", body)
 
+    def get_by_name(
+        self,
+        skill_name: str,
+        *,
+        team_id: str,
+        agent_id: str,
+        version: Optional[int] = None,
+        include_content: Optional[bool] = None,
+        include_manifest: Optional[bool] = None,
+        user_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """``POST /v3/skill/get-by-name`` — locate a skill by ``(team_id,
+        agent_id, skill_name)`` in a single call.
+
+        Unlike the CRUD endpoints, ``team_id`` and ``agent_id`` are
+        **required** here (``getByNameRequestSchema`` returns 40001 when
+        either is missing), so they are NOT merged in from the
+        constructor defaults — pass them explicitly. ``skill_name``
+        matches the ``<available_skills>`` block's ``- name:`` entry.
+
+        Returns the same shape as :meth:`get` (40401 when the name
+        doesn't exist for the agent).
+        """
+        body = _strip_none({
+            "team_id": team_id,
+            "agent_id": agent_id,
+            "skill_name": skill_name,
+            "version": version,
+            "include_content": include_content,
+            "include_manifest": include_manifest,
+            "user_id": user_id,
+            "task_id": task_id,
+        })
+        missing = [
+            field for field in ("team_id", "agent_id", "skill_name")
+            if not isinstance(body.get(field), str) or not body[field].strip()
+        ]
+        if missing:
+            raise ParamError(f"get_by_name requires non-empty {', '.join(missing)}")
+        return self._stub.post(f"{_V3}/get-by-name", body)
+
     def list(
         self,
         *,
@@ -469,6 +522,33 @@ class SkillClient:
         })
         return self._stub.post(f"{_V3}/files/read", body)
 
+    def export_skill(
+        self,
+        skill_id: str,
+        *,
+        version: Optional[int] = None,
+        format: Optional[str] = None,
+        team_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """``POST /v3/skill/export`` — download the skill (SKILL.md +
+        resources) as a ZIP.
+
+        Returns ``{zip_base64, filename, name, version, file_count,
+        total_bytes, warnings}``. Decode ``zip_base64`` (base64) into the
+        archive bytes yourself. ``format`` defaults to ``"zip"`` (the
+        only value the schema accepts).
+        """
+        body = _strip_none({
+            **self._defaults.merge(team_id, agent_id, user_id, task_id),
+            "skill_id": skill_id,
+            "version": version,
+            "format": format,
+        })
+        return self._stub.post(f"{_V3}/export", body)
+
     # ── listing / extract ─────────────────────────────────────────────
 
     def listing(
@@ -586,7 +666,7 @@ class SkillClient:
         user_id: str,
         team_id: str,
         agent_id: str,
-        space_id: Optional[str] = None,
+        space_id: str,
         reason: Optional[str] = None,
         task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -598,9 +678,10 @@ class SkillClient:
 
         Like :meth:`conversation_add`, ``session_id / user_id / team_id /
         agent_id`` are **required** kwargs, and this method does NOT
-        merge in constructor defaults. ``space_id`` follows the same
-        convention as :meth:`extract`: optional, server falls back to
-        ``auth.serviceId``. ``reason`` (≤ 2000 chars) is embedded in the
+        merge in constructor defaults. Unlike :meth:`conversation_add`
+        and :meth:`extract`, ``space_id`` is also **required** here —
+        ``forceArchiveRequestSchema`` declares it non-optional, so pass
+        it explicitly. ``reason`` (≤ 2000 chars) is embedded in the
         resulting archive; ``task_id`` is forwarded to
         ``archive.task.task_ref_id``.
 
@@ -622,6 +703,7 @@ class SkillClient:
             "reason": reason,
             "task_id": task_id,
         })
+        _validate_force_archive(body)
         return self._stub.post(f"{_V3}/conversation/force-archive", body)
 
     # ── lifecycle ─────────────────────────────────────────────────────
@@ -789,6 +871,44 @@ class AsyncSkillClient:
         })
         return await self._stub.post(f"{_V3}/get", body)
 
+    async def get_by_name(
+        self,
+        skill_name: str,
+        *,
+        team_id: str,
+        agent_id: str,
+        version: Optional[int] = None,
+        include_content: Optional[bool] = None,
+        include_manifest: Optional[bool] = None,
+        user_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """``POST /v3/skill/get-by-name`` — locate a skill by ``(team_id,
+        agent_id, skill_name)`` in a single call.
+
+        ``team_id`` and ``agent_id`` are **required** here (schema
+        returns 40001 when missing), so they are NOT merged in from the
+        constructor defaults — pass them explicitly. Returns the same
+        shape as :meth:`get`.
+        """
+        body = _strip_none({
+            "team_id": team_id,
+            "agent_id": agent_id,
+            "skill_name": skill_name,
+            "version": version,
+            "include_content": include_content,
+            "include_manifest": include_manifest,
+            "user_id": user_id,
+            "task_id": task_id,
+        })
+        missing = [
+            field for field in ("team_id", "agent_id", "skill_name")
+            if not isinstance(body.get(field), str) or not body[field].strip()
+        ]
+        if missing:
+            raise ParamError(f"get_by_name requires non-empty {', '.join(missing)}")
+        return await self._stub.post(f"{_V3}/get-by-name", body)
+
     async def list(
         self,
         *,
@@ -905,6 +1025,26 @@ class AsyncSkillClient:
         })
         return await self._stub.post(f"{_V3}/files/read", body)
 
+    async def export_skill(
+        self,
+        skill_id: str,
+        *,
+        version: Optional[int] = None,
+        format: Optional[str] = None,
+        team_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """See :meth:`SkillClient.export_skill` for the contract."""
+        body = _strip_none({
+            **self._defaults.merge(team_id, agent_id, user_id, task_id),
+            "skill_id": skill_id,
+            "version": version,
+            "format": format,
+        })
+        return await self._stub.post(f"{_V3}/export", body)
+
     # ── listing / extract ─────────────────────────────────────────────
 
     async def listing(
@@ -984,7 +1124,7 @@ class AsyncSkillClient:
         user_id: str,
         team_id: str,
         agent_id: str,
-        space_id: Optional[str] = None,
+        space_id: str,
         reason: Optional[str] = None,
         task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -998,6 +1138,7 @@ class AsyncSkillClient:
             "reason": reason,
             "task_id": task_id,
         })
+        _validate_force_archive(body)
         return await self._stub.post(f"{_V3}/conversation/force-archive", body)
 
     # ── lifecycle ─────────────────────────────────────────────────────

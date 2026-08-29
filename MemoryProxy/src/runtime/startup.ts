@@ -197,25 +197,42 @@ export async function startRuntime(
 
 /** Load and initialize forwarding-only modules only when proxy traffic is active. */
 async function loadForwardingRuntime(config: ProxyConfig): Promise<ForwardingRuntime> {
-  const [auth, clickhouse, guard, langfuse, server, systemUsers] = await Promise.all([
+  const [auth, clickhouse, guard, langfuse, requestPrepare, server, systemUsers, pendingWrites] = await Promise.all([
     import("../auth.js"),
     import("../clickhouse.js"),
     import("../guard-adapter.js"),
     import("../langfuse.js"),
+    import("../request-prepare-adapter.js"),
     import("../server.js"),
     import("../systemUser.js"),
+    import("../tdai/pending-writes.js"),
   ]);
   guard.setExtensionDebug(config.log.level === "debug");
   clickhouse.initClickHouse(config.clickhouse);
   await langfuse.initLangfuse(config);
   auth.initAuth(config.auth);
   systemUsers.initSystemUsers(config.systemUsers);
+  if (requestPrepare.isRequestPrepareActive(config)) {
+    requestPrepare.initRequestPrepare(config);
+  }
+  try {
+    await guard.startPrivateControlPlane(config);
+  } catch (error: unknown) {
+    log.warn("private_control_plane.start_failed", {
+      errorType: error instanceof Error ? error.name : "unknown",
+    });
+  }
 
   return {
     createApp: server.createApp,
     async shutdown(): Promise<void> {
+      if (pendingWrites.pendingWriteCount() > 0) {
+        await pendingWrites.flushPendingWrites(10_000);
+      }
       const results = await Promise.allSettled([
         guard.shutdownGuard(),
+        guard.shutdownPrivateControlPlane(),
+        requestPrepare.shutdownRequestPrepare(),
         langfuse.shutdownLangfuse(),
         clickhouse.shutdownClickHouse(),
       ]);

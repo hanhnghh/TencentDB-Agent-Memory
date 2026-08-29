@@ -140,6 +140,16 @@ class HttpStub(Stub):
         logger.debug("Response %s status=%s", path, resp.status_code)
         return _decode_response(resp)
 
+    def get(self, path: str, query: Optional[dict] = None, timeout: Optional[float] = None) -> dict:
+        resp = self.client.get(
+            url=f"{self.endpoint}{path}",
+            params=query or {},
+            headers=self.headers,
+            timeout=timeout or self.client.timeout,
+        )
+        logger.debug("Response %s %s", path, resp.text)
+        return _decode_response(resp)
+
     def close(self) -> None:
         if isinstance(self.client, httpx.Client):
             self.client.close()
@@ -182,6 +192,16 @@ class AsyncHttpStub:
         except httpx.RequestError as exc:
             raise TDAMTransportError("network", f"POST {path} network failure") from exc
         logger.debug("Response %s status=%s", path, resp.status_code)
+        return _decode_response(resp)
+
+    async def get(self, path: str, query: Optional[dict] = None, timeout: Optional[float] = None) -> dict:
+        resp = await self.client.get(
+            url=f"{self.endpoint}{path}",
+            params=query or {},
+            headers=self.headers,
+            timeout=timeout or self.client.timeout,
+        )
+        logger.debug("Response %s %s", path, resp.text)
         return _decode_response(resp)
 
     async def close(self) -> None:

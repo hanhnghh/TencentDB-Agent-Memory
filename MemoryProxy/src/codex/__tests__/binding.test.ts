@@ -340,6 +340,7 @@ describe("validated Codex project binding", () => {
     const root = await makeTempRoot();
     const projectDir = join(root, "project");
     await mkdir(projectDir);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const base = successfulApi();
     const fetcher: typeof fetch = vi.fn(async (
       input: RequestInfo | URL,
@@ -373,11 +374,16 @@ describe("validated Codex project binding", () => {
     } catch (error) {
       message = error instanceof Error ? error.message : String(error);
     }
+    const logs = logSpy.mock.calls.flat().join(" ");
+    logSpy.mockRestore();
 
     expect(message).toContain("Unable to validate Team");
     expect(message).not.toContain("internal backend trace");
     expect(message).not.toContain("user-key-secret");
     expect(message).not.toContain("service-secret");
+    expect(logs).not.toContain("internal backend trace");
+    expect(logs).not.toContain("user-key-secret");
+    expect(logs).not.toContain("service-secret");
   });
 
   it("rejects a malformed existing credential map without rewriting it", async () => {

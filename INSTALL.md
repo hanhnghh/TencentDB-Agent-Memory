@@ -33,8 +33,21 @@ $EDITOR .env
 ./verify.sh
 
 # 4) One-shot boot
+# 2) One-shot boot (interactive)
 ./start-all.sh
 ```
+
+`start-all.sh` is **interactive**. When run, it automatically:
+
+1. Copies `.env.example` to `.env` if `.env` doesn't exist
+2. Walks you through both LLM groups (press Enter to keep the current default):
+   - `memory` group: `MEMORY_LLM_BASE_URL` / `MEMORY_LLM_API_KEY` / `MEMORY_LLM_MODEL` (used internally by memory + hub)
+   - `proxy` group: `PROXY_UPSTREAM_URL` / `PROXY_UPSTREAM_API_KEY` / `PROXY_UPSTREAM_MODEL` (upstream the proxy forwards to; can reuse the memory group)
+3. **Immediately probes the LLM connectivity** after each group — if it fails, you're prompted to re-enter until it passes (or you abort)
+4. Writes the values back to `.env` for persistence
+5. Boots the three containers once everything passes
+
+> Dry-run validation (optional, checks without starting): `./verify.sh` (`--skip-llm` to skip the LLM probe).
 
 When it finishes, the script automatically:
 
@@ -97,9 +110,24 @@ npm run codex -- doctor
 
 ## After deploy: making it useful
 
-Starting the containers is just half the job. To make coding agents like
-Claude Code actually consume team memory, you also need to (a) create the
-org structure in the panel and (b) pick them from within a CC session.
+Starting the containers is just half the job. To make coding agents
+actually consume team memory, you also need to (a) create the
+org structure in the panel and (b) pick them from within an agent session.
+
+---
+
+> **⚠️ This section uses Claude Code as an example.** If you're using a different agent, jump to its doc directly:
+>
+> | Agent | Docs |
+> |-------|------|
+> | CodeBuddy | [`agents/codebuddy/`](./agents/codebuddy/) |
+> | WorkBuddy | [`agents/workbuddy/`](./agents/workbuddy/) |
+> | Codex | [`agents/codex/`](./agents/codex/) |
+> | DeepSeek Harness | [`agents/dsh/`](./agents/dsh/) |
+> | OpenCode | [`agents/opencode/`](./agents/opencode/) |
+> | Hermes / OpenClaw / Others | [`agents/README.md`](./agents/README.md) |
+
+---
 
 ### Step 1: Log into the panel
 
@@ -164,8 +192,6 @@ You'll want **at least 1 Team + 1 Agent** before you start; Task is optional.
 
 ### Step 3: Point Claude Code at the Proxy
 
-Use admin's or the business user's `user_key` (starting from 2.0.0 stable, admin can also own assets):
-
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8096/claude-code/default
 export ANTHROPIC_AUTH_TOKEN="<the sk-mem-... from Step 1.5>"
@@ -181,9 +207,6 @@ claude --model <whatever PROXY_UPSTREAM_MODEL is set to>
   up in the next step's picker
 - `--model` uses the upstream model name you configured in
   `PROXY_UPSTREAM_MODEL` (proxy forwards to `PROXY_UPSTREAM_URL`)
-
-> 💡 **You can also use CodeBuddy with the Proxy** — see the
-> [Using Proxy with CodeBuddy](#using-proxy-with-codebuddy) section below.
 
 ### Step 4: First CC turn — pick Team → Agent → Task
 
@@ -294,16 +317,22 @@ docker run -d --name tdai-memory-hub \
 
 Open [http://localhost:8125](http://localhost:8125).
 
-## Using Proxy with Claude Code
+## Using Proxy with Agents
 
-`start-all.sh` has already stored the admin user_key at
-`deploy/global-images/.admin-key`. Point Claude Code straight at the proxy:
+The Proxy supports 9 agent clients. **Full setup instructions, adaptation details, and FAQs** for each agent are in the [`agents/`](./agents/) directory:
 
-```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8096/claude-code/default
-export ANTHROPIC_AUTH_TOKEN="$(cat ./.admin-key)"
-claude --model <whatever PROXY_UPSTREAM_MODEL is set to>
-```
+| Agent | Config method | Docs |
+|-------|---------------|------|
+| **Claude Code** | env vars or `~/.claude/settings.json` | [`agents/claude-code/`](./agents/claude-code/) |
+| **CodeBuddy** | `~/.codebuddy/models.json` | [`agents/codebuddy/`](./agents/codebuddy/) |
+| **WorkBuddy** | `~/.workbuddy/models.json` | [`agents/workbuddy/`](./agents/workbuddy/) |
+| **Codex** | `~/.codex/config.toml` (⚠️ first turn requires Plan mode) | [`agents/codex/`](./agents/codex/) |
+| **DeepSeek Harness (dsh)** | `~/.dsh/settings.yaml` + `.credentials.yaml` | [`agents/dsh/`](./agents/dsh/) |
+| **OpenCode** | `~/.config/opencode/opencode.json` | [`agents/opencode/`](./agents/opencode/) |
+| **Hermes** | `~/.hermes/config.yaml` + header preselect | [`agents/hermes/`](./agents/hermes/) |
+| **OpenClaw** | `~/.openclaw/openclaw.json` + header preselect | [`agents/openclaw/`](./agents/openclaw/) |
+| **Pi** | `pi-plugin` extension (env vars) | [`MemoryCore/pi-plugin/`](./MemoryCore/pi-plugin/) |
+| **Other platforms** | Header preselect (generic) | [`agents/README.md`](./agents/README.md) |
 
 The proxy pipeline in order: `auth` (validates user_key) → `sessionInit`
 (interactive team/agent/task picker) → `injection` (L2/L3 memory + skill +
@@ -311,155 +340,199 @@ knowledge blended into the system prompt) → forward to the upstream LLM.
 
 Disable the full pipeline (passthrough only): `PROXY_FULL_STACK=0 ./start-proxy.sh`.
 
-## Using Proxy with CodeBuddy
+## Using Proxy with Pi
 
-[CodeBuddy](https://www.codebuddy.ai/) is Tencent's AI coding assistant IDE plugin. By configuring a custom model, you can route CodeBuddy's chat requests through the Proxy to get the same memory capabilities as Claude Code, directly within your IDE.
-
-### ⚠️ Version Restrictions
-
-> CodeBuddy versions **4.10.2, 4.10.3, and 4.10.4** have a known bug: these
-> versions do not send a `sessionId` in requests, preventing the Proxy from
-> completing session initialization.
->
-> **Use CodeBuddy ≥ 4.10.5 or ≤ 4.10.1.**
-
-### Configuration
-
-Create or edit `~/.codebuddy/models.json` on your development machine (replace the API key):
-
-```json
-{
-  "models": [
-    {
-      "id": "claude-sonnet-4-20250514",
-      "name": "proxy-memory-agent",
-      "vendor": "claude",
-      "apiKey": "<business user's sk-mem-... user_key>",
-      "maxInputTokens": 200000,
-      "url": "http://127.0.0.1:8096/codebuddy/default",
-      "supportsToolCall": true,
-      "supportsImages": true
-    }
-  ]
-}
-```
-
-- `id`: a model ID supported by the Proxy's upstream LLM (must match `PROXY_UPSTREAM_MODEL`
-  or one of the models in the upstream configuration, e.g. `claude-sonnet-4-20250514`)
-- `name`: display name shown in the CodeBuddy chat panel (can be customized freely, e.g. `proxy-memory-agent`)
-- `vendor`: model provider label, used only for UI display (e.g. `claude`, `openai`) — does not affect actual requests
-- `apiKey`: the **business user's** `user_key` (same one used as
-  `ANTHROPIC_AUTH_TOKEN` for Claude Code; using the admin key directly
-  is not recommended)
-- `url`: Proxy address + `/codebuddy/default` path (same port as Claude Code,
-  default `8096`); `default` is the memory instance ID
-
-Once configured, select the model name in CodeBuddy's chat panel and start chatting.
-The session init flow is the same as Claude Code (pick Team → Agent → Task).
-
-## Using Proxy with Hermes
-
-[Hermes](https://hermes-agent.nousresearch.com/docs/) is an open-source AI agent framework. By configuring extra headers, Hermes chat requests can be routed through the Proxy for team memory capabilities.
-
-### Configuration
-
-Edit `~/.hermes/config.yaml`:
-
-```yaml
-model:
-  default: gpt-5.5
-  provider: custom
-  base_url: http://<proxy-host>:<port>/hermes/<spaceId>
-  api_key: <API Key from admin panel>
-  extra_headers:
-    x-team-id: <team_id from admin panel>
-    x-agent-id: <agent_id from admin panel>
-    x-task-id: <task_id from admin panel>
-    x-conversation-id: <user-defined session identifier>
-```
-
-- `base_url`: Proxy address + `/hermes/<spaceId>` path. `<spaceId>` is the memory instance ID (from the admin panel, usually `default`)
-- `api_key`: user's `user_key` (from admin panel "API Key" page)
-- `x-team-id` / `x-agent-id`: obtained from the admin panel, same as CodeBuddy / Claude Code
-- `x-task-id`: obtained from admin panel "Task Management" page. **Required in the current version** — missing this field causes session registration to fail and memory features won't work (see [Known limitation: x-task-id](#known-limitation-x-task-id))
-- `x-conversation-id`: user-defined session identifier (see [Known limitation: x-conversation-id](#known-limitation-x-conversation-id))
-
-## Using Proxy with OpenClaw
-
-[OpenClaw](https://github.com/openclaw/openclaw) is an open-source AI coding agent. By configuring a custom provider, OpenClaw requests can be routed through the Proxy.
-
-### Configuration
-
-Edit `~/.openclaw/openclaw.json`, add a provider under `models.providers`:
-
-```jsonc
-{
-  "models": {
-    "mode": "merge",
-    "providers": {
-      "memory-proxy": {
-        "baseUrl": "http://<proxy-host>:<port>/openclaw/<spaceId>",
-        "apiKey": "<API Key from admin panel>",
-        "api": "openai-completions",
-        "headers": {
-          "x-team-id": "<team_id from admin panel>",
-          "x-agent-id": "<agent_id from admin panel>",
-          "x-task-id": "<task_id from admin panel>",
-          "x-conversation-id": "<user-defined session identifier>"
-        },
-        "request": {
-          "allowPrivateNetwork": true
-        },
-        "models": [
-          {
-            "id": "gpt-5.5",
-            "name": "GPT-5.5",
-            "reasoning": false,
-            "input": ["text"],
-            "contextWindow": 128000,
-            "maxTokens": 32000,
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
-          }
-        ]
-      }
-    }
-  }
-}
-```
-
-- `baseUrl`: Proxy address + `/openclaw/<spaceId>` path
-- `apiKey`: user's `user_key`
-- `headers`: must include `x-team-id`, `x-agent-id`, `x-task-id`, `x-conversation-id`. `x-task-id` is required in the current version (see [Known limitation: x-task-id](#known-limitation-x-task-id))
-- `models[].id`: must match the model ID configured in the Proxy upstream
-
-## Using Proxy with Other Platforms (Generic)
-
-Beyond ClaudeCode / CodeBuddy / Hermes / OpenClaw, any OpenAI-compatible platform or custom-built agent can connect to the Proxy to access team memory capabilities.
+[Pi](https://github.com/earendil-works/pi-coding-agent) is an open-source AI coding-agent harness. Pi is a first-class agent-source (`pi`) — its system prompts use a label-line format (`Available tools:`, `Guidelines:`) that is distinct from Claude Code (markdown headings) and CodeBuddy (XML tags), so the proxy ships a dedicated `PiProfile` parser. By installing the `pi-plugin` extension and pointing Pi at a custom `tdai` provider, Pi chat requests route through the Proxy for team memory — L3 persona, L2 scene index, L0 conversation capture, and on-demand L0/L1/L2 search.
 
 ### Connection
 
-Point the platform's API base URL at the Proxy:
+Point Pi at the Proxy via the `pi-plugin` extension:
 
 ```text
-http://<proxy-host>:<port>/<agent-source>/<spaceId>
+http://<proxy-host>:<port>/pi/<spaceId>/v1
 ```
 
-- `<agent-source>`: must be one of the Proxy-supported values: `claude-code`, `codebuddy`, `hermes`, `openclaw`. For other platforms, you can impersonate one of these (e.g. use `codebuddy` as the identifier)
+- `<agent-source>`: `pi` (first-class)
 - `<spaceId>`: memory instance ID (`default` for local deployments)
+- The `/v1` suffix is required in the base URL: the OpenAI-completions provider appends `/chat/completions` but does not insert `/v1`, so including `/v1` makes the request hit the Proxy's explicit `/:agent/:spaceId/v1/chat/completions` route.
 
-The request path is automatically appended: `/v1/chat/completions` (OpenAI protocol) or `/v1/messages` (Anthropic protocol).
+### Setup
+
+1. Install the pi-plugin (see [`MemoryCore/pi-plugin/README.md`](./MemoryCore/pi-plugin/README.md)).
+2. Set the env vars (no secrets in files): `TDAI_PROXY_URL`, `TDAI_SPACE_ID`, `TDAI_TEAM_ID`, `TDAI_AGENT_ID`, `TDAI_USER_KEY`, `TDAI_MODEL`, and optionally `TDAI_TASK_ID`.
+3. Load the extension: `pi -e /path/to/pi-plugin` (or auto-discover from `~/.pi/agent/extensions/`).
+4. Run: `pi --provider tdai --model <model>`.
 
 ### Required Headers
 
-| Header | Description |
-|--------|-------------|
-| `Authorization: Bearer <user_key>` | User's API key (from admin panel "API Key" page) |
-| `x-team-id` | Team ID |
-| `x-agent-id` | Agent ID |
-| `x-task-id` | Task ID (required in current version, see [Known limitation: x-task-id](#known-limitation-x-task-id)) |
-| `x-conversation-id` | Session identifier, managed by the client |
+Injected automatically by the `pi-plugin` extension:
 
-All headers are required — the Proxy uses them to complete session registration directly, bypassing the interactive form. Platforms that cannot provide these headers will trigger session bypass (no memory injection or conversation recording).
+| Header | Source |
+|---|---|
+| `Authorization: Bearer` | `TDAI_USER_KEY` (the user's API key, not the admin/gateway key) |
+| `x-team-id` / `x-agent-id` | env vars (static per host) |
+| `x-task-id` | `TDAI_TASK_ID` — **optional**. Omit for broad recall across the agent's memories; set to narrow recall to a task. A stale/unknown `task_id` is dropped (not a hard mismatch), so it never blocks registration. (See [`Known limitation: x-task-id`](#known-limitation-x-task-id) for the header preselect agents that still require it.) |
+| `x-conversation-id` | dynamic per Pi session (extension `before_provider_headers` hook) |
+
+Unlike the header-preselect agents (Hermes / OpenClaw), Pi does **not** require `x-task-id`: `task_id` is an optional business dimension in the kernel, and the proxy registers from `team + agent` alone (broad recall when the task is absent). If the required identity env vars (`TDAI_USER_KEY`, `TDAI_TEAM_ID`, `TDAI_AGENT_ID`) are missing, the plugin warns at load and skips registration so Pi still starts.
+
+## Optional: `sessionInit.defaultTaskId` (the "no task binding" option)
+
+**What it does.** By default, the Task pick in the session-init form
+only lists the Tasks the user actually created in the panel. If they
+haven't created any, or they simply don't want to bind this session to
+any Task, the form gets stuck / bypasses. Setting
+`sessionInit.defaultTaskId` fixes that: the proxy **prepends a virtual
+Task entry** — labeled `本次不关联任务` (*"Don't bind a task this
+time"*) — to the head of every team's task list. Picking it registers
+the session against that fallback `task_id`, so the flow completes
+cleanly without any real Task being attached.
+
+**When to enable it.** Turn it on when:
+
+- You have Agents but no Tasks yet, and want CC / CodeBuddy users to
+  finish the first-run picker without being blocked;
+- You want a "one-click skip Task" option on every session so users
+  don't have to type or arrow-nav out of the picker;
+- You're running L2/L3 memory + skill without needing the Task
+  dimension (Task is optional across the whole memory model — see
+  Step 2 above).
+
+**How it behaves.**
+
+- The virtual entry always appears **first** in the task list under
+  every team. Real Tasks follow after it.
+- Picking it binds this session to `task_id = <your defaultTaskId>`.
+  This ID does **not** need to exist in the control plane — the proxy
+  skips `getTask` for it and injects no `[Task]` block into the
+  system prompt. `team / agent` binding is still fully active, so
+  memory / skill / knowledge injection all work normally.
+- Not configured → the picker only shows real Tasks (unchanged
+  legacy behavior). Prior to this feature there was no
+  "don't-bind-a-task" option at all — the picker simply couldn't
+  produce a Task-less session through the standard form path.
+
+### Configuration
+
+Add `defaultTaskId` under the existing `sessionInit` block of your
+proxy `config.yaml` (`start-proxy.sh`'s generated config already has
+`sessionInit`; just append one line):
+
+```yaml
+sessionInit:
+  enabled: true
+  maxRetries: 3
+  injectAgentContext: true
+  injectTaskContext: true
+  defaultTaskId: "no-task"     # any stable string; not required to exist in the kernel
+  headerAutoSelect:
+    enabled: true
+    teamHeader: "x-team-id"
+    agentHeader: "x-agent-id"
+    taskHeader: "x-task-id"
+    onMismatch: "form"
+```
+
+Pick any short, stable value — `no-task`, `default`, or your own
+UUID all work. The value ends up recorded on session-init requests
+and in logs / telemetry, so if you look at traces later you'll see
+this ID marking sessions that opted out of Task binding.
+
+> 💡 Same regeneration caveat as the `/analyse` marker: if you rely on
+> `deploy/global-images/start-proxy.sh`, the generated `config.yaml`
+> is overwritten on every start — either patch the script's YAML
+> template to include `defaultTaskId`, or point `PROXY_CONFIG_DIR` at
+> a directory holding your own hand-edited `config.yaml`.
+
+## Optional: `/analyse` URL marker (asset injection effectiveness review)
+
+**What it does.** The Proxy ships a debug/evaluation feature called
+**asset reflection**. When enabled, any request whose URL contains an
+`/analyse/` path segment gets a `<asset_reflection>` block appended to
+the end of its system prompt. That block instructs the LLM, in its
+final reply, to add a short debrief calling out — for **each cloud
+asset tool it actually invoked this turn** (`<skill_tools>`,
+`<tdai_memory_tools>`, `<knowledge_tools>`) — whether the tool helped
+or not (what key info it got, what detour it avoided, or why the call
+missed). Tools that were **not** invoked are omitted; if nothing was
+invoked, the reply must still emit the fixed line
+`【资产反思】本轮未使用任何云端资产工具。`
+
+This is designed as an **internal effectiveness probe**: you point a
+subset of traffic (a benchmark run, an ad-hoc curl, a Team's staging
+CC session) at the `/analyse` URL and read back the model's own
+per-tool debrief, so you can measure whether the memory / skill /
+knowledge injections are earning their tokens. It is intentionally
+opt-in and **not** meant for production user traffic.
+
+### Path shape
+
+Insert `/analyse` as a segment between `/{agent}/{spaceId}` and the
+protocol tail. Structure is identical to `/cost-guard`. Examples:
+
+```text
+# Claude Code (Anthropic Messages)
+http://<proxy-host>:<port>/claude-code/<spaceId>/analyse/v1/messages
+
+# CodeBuddy (OpenAI Chat Completions)
+http://<proxy-host>:<port>/codebuddy/<spaceId>/analyse/v1/chat/completions
+
+# Codex (OpenAI Responses)
+http://<proxy-host>:<port>/codex/<spaceId>/analyse/v1/responses
+http://<proxy-host>:<port>/codex/<spaceId>/analyse/responses   # base_url without /v1
+
+# OpenCode (OpenAI Chat Completions, same protocol as CodeBuddy)
+http://<proxy-host>:<port>/opencode/<spaceId>/analyse/v1/chat/completions
+http://<proxy-host>:<port>/opencode/<spaceId>/analyse/chat/completions   # base_url without /v1
+```
+
+Non-`/analyse` requests are untouched — the injector emits nothing and
+the upstream KV-cache prefix stays byte-identical to normal traffic.
+
+### Enabling it (dual gate)
+
+**Gate 1 — config flag.** `injection.assetReflection.markerOptIn`
+**defaults to `true`** — `start-proxy.sh`'s generated config and
+`config.example.yaml` both set it to true, and dropping the key
+altogether still resolves to true. You only need to add the block below
+to the proxy `config.yaml` when you want to *explicitly disable* the
+marker:
+
+```yaml
+injection:
+  enabled: true
+  injectors:
+    - skill
+    - knowledge
+    - tdai-memory
+  assetReflection:
+    markerOptIn: false      # default true; set false to reject /analyse marker
+```
+
+When `markerOptIn` is explicitly set to `false`, any request carrying
+an `/analyse/` segment is rejected with `404 analyse_marker_disabled` —
+a safety net for deployments that don't want the reflection capability,
+so a client that "thinks" it enabled the marker can't silently fall
+through to plain forwarding.
+
+**Gate 2 — URL segment.** Even with `markerOptIn: true`, the reflection
+block is only appended when the request URL actually contains
+`/analyse/`. Plain `/claude-code/<spaceId>/v1/messages` traffic runs
+exactly as before.
+
+### Effective tag list
+
+The tags listed inside the reflection block are computed from the
+injectors actually registered on this node (`skill` / `tdai-memory` /
+`knowledge`). If none of these injectors is enabled, the block is empty
+(the injector short-circuits). This means the marker is only useful
+when at least one asset injector is on the pipeline.
+
+> 💡 If you're using `start-proxy.sh` from `deploy/global-images/`, the
+> generated `config.yaml` is regenerated on every launch. Either edit
+> `start-proxy.sh` to include the `assetReflection` block, or point
+> `PROXY_CONFIG_DIR` at a directory holding your own hand-edited
+> `config.yaml` and skip regeneration.
 
 ## Known limitation: `x-task-id`
 
@@ -495,7 +568,7 @@ All headers are required — the Proxy uses them to complete session registratio
 
 ## More
 
-Additional installation modes (OpenClaw, Hermes, CodeBuddy, SDK, running from source,
+Additional installation modes (OpenClaw, Hermes, CodeBuddy, WorkBuddy, SDK, running from source,
 K8s, platform notes) — see
 [`deploy/global-images/README.md`](./deploy/global-images/README.md) and
 [`MemoryCore/README.md`](./MemoryCore/README.md).

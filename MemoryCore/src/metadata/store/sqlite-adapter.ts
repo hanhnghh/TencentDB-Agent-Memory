@@ -59,6 +59,7 @@ import type {
 } from "../types.js";
 import { DEFAULT_PAGINATION } from "../pagination.js";
 import { buildChatMemoryAssetId } from "../utils/chat-memory-asset.js";
+import { DuplicateUserKeyError } from "./interface.js";
 
 const require = createRequire(import.meta.url);
 function requireNodeSqlite(): typeof import("node:sqlite") {
@@ -75,6 +76,12 @@ const PK_RETRY_LIMIT = 3;
 function isPkCollision(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return /UNIQUE constraint failed: meta_\w+\.(user_id|team_id|agent_id|task_id|asset_id|acl_id|key_id)\b/.test(msg);
+}
+
+/** Returns true if the error is a SQLite UNIQUE constraint failure on meta_user_keys.key_value. */
+function isUserKeyValueCollision(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /UNIQUE constraint failed: meta_user_keys\.key_value\b/.test(msg);
 }
 
 function isStorePkCollision(err: unknown): boolean {
@@ -485,6 +492,11 @@ export class SqliteMetadataStore implements IMetadataStore {
         });
         return this.getUserById(userId)!;
       } catch (err) {
+        // 调用方显式指定 default_key_value 时命中 UNIQUE：翻译为业务错(HTTP 409)。
+        // 不 retry：随机 key_value 生成场景下 192bit 熵不可能碰撞，能到这里的只有显式指定。
+        if (isUserKeyValueCollision(err)) {
+          throw new DuplicateUserKeyError(defaultKeyValue);
+        }
         if (isPkCollision(err) && !input.user_id) continue;
         throw err;
       }
@@ -1417,7 +1429,28 @@ export class SqliteMetadataStore implements IMetadataStore {
     );
   }
 
-  listAgentFixedAssets(agentId: string, pagination?: PaginationParams | null): ListPage<FixedAssetBindingEntity> {
+  listAgentFixedAssets(
+    agentId: string,
+    pagination?: PaginationParams | null,
+    filter?: { assetTypes?: readonly string[] },
+  ): ListPage<FixedAssetBindingEntity> {
+    const types = filter?.assetTypes ?? [];
+    if (types.length > 0) {
+      // JOIN meta_assets 做类型过滤，避免"分页在前、类型过滤在后"截断
+      const placeholders = types.map(() => "?").join(",");
+      const base = `FROM meta_agent_fixed_assets b
+        INNER JOIN meta_assets a ON a.asset_id = b.asset_id
+        WHERE b.agent_id = ? AND a.asset_type IN (${placeholders})`;
+      const params: SQLInputValue[] = [agentId, ...types];
+      return this.selectList(
+        `SELECT COUNT(*) AS c ${base}`,
+        params,
+        `SELECT b.* ${base} ORDER BY b.priority DESC, b.created_at DESC`,
+        params,
+        pagination,
+        (r) => r as unknown as FixedAssetBindingEntity,
+      );
+    }
     const base = "FROM meta_agent_fixed_assets WHERE agent_id = ?";
     return this.selectList(
       `SELECT COUNT(*) AS c ${base}`,

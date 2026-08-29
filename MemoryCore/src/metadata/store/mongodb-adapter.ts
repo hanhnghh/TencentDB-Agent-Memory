@@ -63,6 +63,7 @@ import type {
 } from "../types.js";
 import { DEFAULT_PAGINATION } from "../pagination.js";
 import { buildChatMemoryAssetId } from "../utils/chat-memory-asset.js";
+import { DuplicateUserKeyError } from "./interface.js";
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -81,6 +82,13 @@ function isPkCollision(err: unknown): boolean {
 
 function isStorePkCollision(err: unknown): boolean {
   return isPkCollision(err) || isMongoRelationIdCollision(err);
+}
+
+/** E11000 on meta_user_keys.key_value (调用方显式指定 default_key_value 时并发命中)。 */
+function isUserKeyValueCollision(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const e = err as { code?: number; keyPattern?: Record<string, unknown> };
+  return e.code === 11000 && !!e.keyPattern && "key_value" in e.keyPattern;
 }
 
 const PROJECT_NO_ID = { projection: { _id: 0 } } as const;
@@ -386,6 +394,10 @@ export class MongoMetadataStore implements IMetadataStore {
         });
         return doc;
       } catch (err) {
+        // 调用方显式指定 default_key_value 命中 UNIQUE:翻译业务错(HTTP 409),不 retry。
+        if (isUserKeyValueCollision(err)) {
+          throw new DuplicateUserKeyError(defaultKeyValue);
+        }
         if (isPkCollision(err) && !input.user_id) continue;
         throw err;
       }
@@ -1130,10 +1142,32 @@ export class MongoMetadataStore implements IMetadataStore {
     }
   }
 
-  async listAgentFixedAssets(agentId: string, pagination?: PaginationParams | null): Promise<ListPage<FixedAssetBindingEntity>> {
+  async listAgentFixedAssets(
+    agentId: string,
+    pagination?: PaginationParams | null,
+    filter?: { assetTypes?: readonly string[] },
+  ): Promise<ListPage<FixedAssetBindingEntity>> {
+    const types = filter?.assetTypes ?? [];
+    if (types.length === 0) {
+      return this.paginatedFind(
+        "meta_agent_fixed_assets",
+        { agent_id: agentId },
+        pagination,
+        { priority: -1, created_at: -1 },
+        (d) => d as FixedAssetBindingEntity,
+      );
+    }
+    // 类型过滤：先按 asset_type 拿 asset_id 集合，再用它过滤 binding。
+    const assetIds = await this.col("meta_assets")
+      .find({ asset_type: { $in: [...types] } } as Document, { projection: { asset_id: 1 } })
+      .map((d) => (d as { asset_id: string }).asset_id)
+      .toArray();
+    if (assetIds.length === 0) {
+      return { items: [], total: 0 };
+    }
     return this.paginatedFind(
       "meta_agent_fixed_assets",
-      { agent_id: agentId },
+      { agent_id: agentId, asset_id: { $in: assetIds } },
       pagination,
       { priority: -1, created_at: -1 },
       (d) => d as FixedAssetBindingEntity,

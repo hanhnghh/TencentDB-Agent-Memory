@@ -26,8 +26,7 @@
 ## 快速开始
 
 ```bash
-# 1) 准备 .env
-cp .env.example .env
+cd TencentDB-Agent-Memory/deploy/global-images
 
 # 2) 选择 PROXY_RUNTIME_MODE=proxy|hooks|both，再填写该 mode 需要的值
 #    - MEMORY_LLM_* 始终供 memory-core + memory-hub 内部使用
@@ -80,6 +79,32 @@ mode and `8096` otherwise. In a container, the actual hook listener remains on
 container loopback; a small signal-forwarding relay is published only as
 `127.0.0.1:${PROXY_HOOK_PORT}` on the host. The named `PROXY_VOLUME` persists
 the SQLite journal/outbox across container replacement.
+
+# 一条命令：自动复制 .env → 交互式填 LLM → 自动校验通路 → 拉起三件套
+./start-all.sh
+```
+
+`start-all.sh` 现在是**交互式**的，运行时会：
+
+1. `.env` 不存在时，自动从 `.env.example` 复制一份（无需手动 `cp`）
+2. 引导你填写两组 LLM（**回车 = 保留当前默认值**）：
+   - `memory 组`：`BASE_URL` / `API_KEY` / `MODEL`（协议默认 `openai`）
+   - `proxy 组`：先问「是否复用 memory 组配置」，复用则跳过
+3. 填完**立即检查 LLM 通路是否通**，不通会提示重新输入，直到通过
+4. 把填写值**写回 `.env`** 持久化（下次启动默认复用）
+5. 通过后一键拉起三件套
+
+> 想跳过交互、直接读 `.env` 也可以：手动 `cp .env.example .env` 并填好 LLM 后，
+> 运行 `./start-all.sh` 一路回车确认即可（默认值就是 `.env` 里的值）。
+
+### 干跑校验（可选）
+
+`verify.sh` 仍可单独使用，只检查环境不启动容器：
+
+```bash
+./verify.sh              # 默认全检（含 LLM 通路预检）
+./verify.sh --skip-llm   # 跳过 LLM 检查（离线环境）
+```
 
 ## LLM 通路预检
 

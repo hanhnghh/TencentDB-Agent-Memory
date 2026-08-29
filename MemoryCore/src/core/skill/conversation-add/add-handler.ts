@@ -66,6 +66,12 @@ const TOOL_PAIR_ROLES: ReadonlySet<CompressibleRole> = new Set(["tool_call", "to
 const ID_FORBIDDEN_CHAR = "|";
 
 export interface AddConversationInput {
+  /**
+   * 2026-07-30 新增：多租户实例 ID。透传到 AgentTuple 里让 worker pool
+   * 出队时能按 instance_id 动态解析对应 instance 的 CoS/VDB/LLM 资源。
+   * standalone 模式下由 gateway 兜底 "default"。缺失会在 validate 阶段拒绝。
+   */
+  instance_id: string;
   session_id: string;
   space_id: string;
   user_id: string;
@@ -163,6 +169,7 @@ export class SkillConversationAddHandler {
   async handle(input: AddConversationInput): Promise<AddConversationResult> {
     this.validate(input);
     const sess: SessionKey = {
+      instance_id: input.instance_id,
       space_id: input.space_id,
       user_id: input.user_id,
       team_id: input.team_id,
@@ -204,7 +211,9 @@ export class SkillConversationAddHandler {
     const rawBytes = totalMessagesBytes(input.messages);
     const useCompress = rawBytes >= this.thresholds.requestCompressThresholdBytes;
     obsLogger.info("skill.add_handler.read_buffer", {
-      req_id: rid ?? "", session_id: input.session_id,
+      req_id: rid ?? "",
+      session_id: input.session_id,
+      instance_id: input.instance_id,
       current_msgs: state.current.messages.length,
       raw_bytes: rawBytes,
       use_compress: useCompress,
@@ -222,7 +231,9 @@ export class SkillConversationAddHandler {
       },
     );
     obsLogger.info("skill.add_handler.prepare_archive", {
-      req_id: rid ?? "", session_id: input.session_id,
+      req_id: rid ?? "",
+      session_id: input.session_id,
+      instance_id: input.instance_id,
       dur_ms: Date.now() - t0Prep,
       msg_in: input.messages.length,
       msg_out: prepared.messages.length,
@@ -325,6 +336,7 @@ export class SkillConversationAddHandler {
     obsLogger.info("skill.add_handler.write_back", {
       req_id: rid ?? "",
       session_id: input.session_id,
+      instance_id: input.instance_id,
       dur_ms: Date.now() - t0Commit,
       archived: shouldArchive,
       state_version: committed.version,
@@ -394,7 +406,8 @@ export class SkillConversationAddHandler {
   }
 
   private validate(input: AddConversationInput): void {
-    const required: Array<"session_id" | "space_id" | "user_id" | "team_id" | "agent_id"> = [
+    const required: Array<keyof AddConversationInput> = [
+      "instance_id",
       "session_id",
       "space_id",
       "user_id",

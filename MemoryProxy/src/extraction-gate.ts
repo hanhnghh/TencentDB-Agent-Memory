@@ -26,6 +26,7 @@
  */
 
 import type { ProxyConfig } from "./types.js";
+import { log } from "./report/log.js";
 
 export function isExtractionAllowed(config: ProxyConfig, asset: string): boolean {
   const ext = config.extraction;
@@ -36,4 +37,14 @@ export function isExtractionAllowed(config: ProxyConfig, asset: string): boolean
   // so a partial or misconfigured yaml never silently disables writes.
   if (!Array.isArray(ext.extractors)) return true;
   return ext.extractors.includes(asset);
+}
+
+export function logExtractionSkipped(
+  config: ProxyConfig,
+  asset: string,
+  sessionKey: string | undefined,
+): void {
+  if (isExtractionAllowed(config, asset)) return;
+  const reason = config.extraction?.enabled === false ? "disabled" : "not-in-extractors";
+  log.debug("extraction.skipped", { asset, session: sessionKey || "-", reason });
 }

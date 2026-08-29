@@ -108,12 +108,11 @@ describe("memory parity: identity and binding", () => {
     const bindingRepo = new KvBindingRepo(storage);
     await bindingRepo.putBinding(
       PARITY_IDENTITY.spaceId,
-      PARITY_IDENTITY.userId,
-      PARITY_IDENTITY.agentSource,
       PARITY_IDENTITY.sessionId,
       {
         outcome: "initialized",
         userId: PARITY_IDENTITY.userId,
+        agentSource: PARITY_IDENTITY.agentSource,
         teamId: PARITY_IDENTITY.teamId,
         agentId: PARITY_IDENTITY.agentId,
         taskId: PARITY_IDENTITY.taskId,

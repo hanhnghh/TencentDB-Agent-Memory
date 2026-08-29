@@ -1,5 +1,13 @@
 /** Stable source identifiers used to isolate state belonging to agent clients. */
-export const AGENT_SOURCES = ["claude-code", "codebuddy", "codex"] as const;
+export const AGENT_SOURCES = [
+  "claude-code",
+  "codebuddy",
+  "codex",
+  "workbuddy",
+  "dsh",
+  "opencode",
+  "pi",
+] as const;
 
 export type KnownAgentSource = (typeof AGENT_SOURCES)[number];
 export type AgentSource = KnownAgentSource | "unknown";

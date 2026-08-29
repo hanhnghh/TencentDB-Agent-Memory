@@ -181,7 +181,11 @@ describe("Codex binding executable CLI", () => {
       "doctor",
       "--project", dirs.projectDir,
       "--user-config-dir", dirs.userConfigDir,
-    ], { MEMORY_CORE_ENDPOINT: "http://127.0.0.1:1" });
+      "--sidecar-url", "http://127.0.0.1:1",
+    ], {
+      CODEX_HOME: dirs.userConfigDir,
+      MEMORY_CORE_ENDPOINT: "http://127.0.0.1:1",
+    });
 
     expect(output.failed).toBe(true);
     expect(output.stdout).toContain("PASS project_binding");

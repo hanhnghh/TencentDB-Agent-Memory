@@ -1,5 +1,7 @@
 export { MemoryClient } from "./client.js";
 export { ParamError, TDAMError, TDAMResponseError, TDAMTransportError } from "../errors.js";
+export { MemoryPromptClient, type MemoryPromptClientConfig } from "./memory-prompt-client.js";
+export { MemoryGenerationLogClient } from "./memory-generation-log-client.js";
 export { SkillClient, type SkillClientConfig } from "./skill-client.js";
 export { SkillErrorCode, type SkillErrorCodeValue } from "./skill-types.js";
 export type {
@@ -13,6 +15,9 @@ export type {
   V3AtomicSearchRequest,
   V3AtomicUpdateData,
   V3AtomicUpdateRequest,
+  V3ChatMemoryClearData,
+  V3ChatMemoryClearItem,
+  V3ChatMemoryClearRequest,
   V3ConversationAddData,
   V3ConversationAddRequest,
   V3ConversationCountRequest,
@@ -41,6 +46,8 @@ export type {
   V3ScenarioWriteData,
   V3ScenarioWriteRequest,
 } from "./types.js";
+export type * from "./memory-prompt-types.js";
+export type * from "./memory-generation-log-types.js";
 export type {
   SkillClientDefaults,
   SkillConversationAddData,

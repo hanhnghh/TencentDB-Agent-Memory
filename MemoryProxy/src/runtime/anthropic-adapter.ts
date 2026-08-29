@@ -20,6 +20,7 @@ export interface AnthropicStreamSnapshot {
   messageStopped: boolean;
   stopReason: string | null;
   malformedEventCount: number;
+  toolCalls: Array<{ id: string; name: string; arguments: string }>;
 }
 
 /** Incrementally accumulates the canonical Anthropic SSE response state. */
@@ -32,6 +33,7 @@ export class AnthropicStreamAccumulator {
   private messageStopped = false;
   private stopReason: string | null = null;
   private malformedEventCount = 0;
+  private readonly toolCalls = new Map<number, { id: string; name: string; arguments: string }>();
 
   push(text: string): void {
     this.buffer += text;
@@ -55,6 +57,9 @@ export class AnthropicStreamAccumulator {
       messageStopped: this.messageStopped,
       stopReason: this.stopReason,
       malformedEventCount: this.malformedEventCount,
+      toolCalls: [...this.toolCalls.entries()]
+        .sort(([left], [right]) => left - right)
+        .map(([, call]) => ({ ...call })),
     };
   }
 
@@ -94,7 +99,15 @@ export class AnthropicStreamAccumulator {
     }
     if (event.type === "content_block_start") {
       const block = event.content_block as Record<string, unknown> | undefined;
-      if (block?.type === "tool_use") this.toolUseCount += 1;
+      if (block?.type === "tool_use") {
+        this.toolUseCount += 1;
+        const index = typeof event.index === "number" ? event.index : this.toolUseCount - 1;
+        this.toolCalls.set(index, {
+          id: typeof block.id === "string" ? block.id : "",
+          name: typeof block.name === "string" ? block.name : "",
+          arguments: "",
+        });
+      }
       if (block?.type === "text") {
         if (this.textBlockCount > 0) this.outputText += "\n";
         this.textBlockCount += 1;
@@ -106,6 +119,11 @@ export class AnthropicStreamAccumulator {
       const delta = event.delta as Record<string, unknown> | undefined;
       if (delta?.type === "text_delta" && typeof delta.text === "string") {
         this.outputText += delta.text;
+      }
+      if (delta?.type === "input_json_delta" && typeof delta.partial_json === "string") {
+        const index = typeof event.index === "number" ? event.index : undefined;
+        const call = index === undefined ? undefined : this.toolCalls.get(index);
+        if (call) call.arguments += delta.partial_json;
       }
     }
   }

@@ -66,6 +66,8 @@ export interface WorkerConfig {
 
 export interface CosExtraConfig {
   domain?: string;
+  /** Generation log retention in days. Default: 30. Set 0 to disable lifecycle management. */
+  generationLogRetentionDays: number;
 }
 
 export interface KafkaConfig {
@@ -455,6 +457,13 @@ export function loadGatewayConfig(overrides?: Partial<GatewayConfig>): GatewayCo
     proxy: {
       useMemorySystemUserKey: bool(llmProxyConfig, "useMemorySystemUserKey") ?? true,
     },
+    // env 存在时直接用 env 解析(可显式关闭 yaml);
+    // env 未设置才回退 yaml,与其他 LLM 字段语义一致。
+    stream: (() => {
+      const envVal = env("TDAI_LLM_STREAM");
+      if (envVal !== undefined) return envVal === "true";
+      return bool(llmConfig, "stream") ?? false;
+    })(),
   };
 
   // Memory config (reuse the plugin's parseConfig for full compatibility)
@@ -595,7 +604,13 @@ export function loadGatewayConfig(overrides?: Partial<GatewayConfig>): GatewayCo
   const cosConfig = obj(fileConfig, "cos");
   const cos: CosExtraConfig = {
     domain: env("COS_DOMAIN") ?? str(cosConfig, "domain"),
+    generationLogRetentionDays: envInt("COS_GENERATION_LOG_RETENTION_DAYS")
+      ?? num(cosConfig, "generationLogRetentionDays")
+      ?? 30,
   };
+  if (!Number.isInteger(cos.generationLogRetentionDays) || cos.generationLogRetentionDays < 0) {
+    throw new Error("cos.generationLogRetentionDays must be a non-negative integer");
+  }
 
   // Observability config (yaml: observability.{otel,clickhouse,kafka}, env 兜底)
   const observabilityConfig = obj(fileConfig, "observability");

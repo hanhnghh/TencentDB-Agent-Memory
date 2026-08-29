@@ -53,7 +53,6 @@ export class KvHookCacheRepo implements HookCacheRepo {
     });
     return operation;
   }
-
   async put(
     spaceId: string,
     userId: string,

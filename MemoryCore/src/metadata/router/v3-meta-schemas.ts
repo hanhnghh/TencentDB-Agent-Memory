@@ -1,5 +1,5 @@
 /**
- * v3 元数据 API 请求体 Zod schema（54 公开接口）。
+ * v3 元数据 API 请求体 Zod schema（55 公开接口）。
  *
  * 对应设计文档 §7.1。每个 schema 校验对应路由的请求体；
  * 路由 handler 用 `schema.safeParse(body)` 校验后再调用 MetadataService。
@@ -43,6 +43,14 @@ export const userCreateSchema = z.object({
   // 便于 proxy systemUsers 白名单按稳定 user_id 命中；不传则内核随机生成 usr-xxx。
   // 仅 system_admin 可调用本接口（见 v3-meta-router assertCanManageUsers）。
   user_id: z.string().min(1).optional(),
+});
+
+// /v3/meta/user/create 的姊妹接口：允许 system_admin 在建号时显式指定 user_key。
+// user_id 不接受入参（zod 默认 strip），由内核生成后返回；user_key 格式由调用方负责，
+// 内核只做非空校验 + DB 层 UNIQUE 兜底（重复抛 duplicate_user_key）。
+export const userCreateWithKeySchema = z.object({
+  username: nonEmpty,
+  user_key: nonEmpty,
 });
 export const initAdminSchema = z.object({
   username: nonEmpty,
@@ -286,6 +294,13 @@ export const fixedAssetListWithDetailSchema = z.object({
   agent_id: nonEmpty,
   apply_visibility_filter: z.boolean().optional(),
   touch_usage: z.boolean().optional(),
+  /**
+   * 可选类型过滤：只返回 asset_type 在该列表中的绑定。
+   * 传空数组或省略 = 不过滤（返回全部类型）。
+   * 用于 caller 明确只需要某几类资产（如 proxy knowledge-tools-injector
+   * 只需 llm_wiki + code_graph），避免在混合列表分页外的类型被截断。
+   */
+  asset_types: z.array(assetType).optional(),
 }).merge(paginationInputSchema);
 
 /** agent_ids 去重；1–100。 */
@@ -362,7 +377,7 @@ export const internalListUsersByInstanceSchema = z.object({
   user_ids: optionalUserIdsFilter,
 }).merge(paginationInputSchema);
 
-/** 路由 → schema 映射（54 公开接口）。 */
+/** 路由 → schema 映射（55 公开接口）。 */
 // ── ConfigParam（v3.2）──
 export const instanceQuotaGetSchema = z.object({});
 
@@ -380,6 +395,7 @@ export const configUserSetSchema = z.object({
 
 export const V3_SCHEMAS = {
   "/v3/meta/user/create": userCreateSchema,
+  "/v3/meta/user/create-with-key": userCreateWithKeySchema,
   "/v3/meta/user/get": userGetSchema,
   "/v3/meta/user/delete": userDeleteSchema,
   "/v3/meta/user/list": userListSchema,

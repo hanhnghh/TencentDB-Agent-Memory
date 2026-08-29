@@ -248,18 +248,18 @@ describe("Codex agent source registry", () => {
   });
 
   it.each(["codex", "claude-code", "codebuddy", "unknown"])(
-    "stores and reads a %s binding only in its matching namespace",
+    "stores and reads a %s source label in the flattened binding",
     async (source) => {
       const repo = new KvBindingRepo(new MemoryStorage());
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
       await repo.putBinding(
         "memory-1",
-        "user-1",
-        source,
         "shared-session-id",
         {
           outcome: "initialized",
+          userId: "user-1",
+          agentSource: source,
           teamId: "team-1",
           agentId: "agent-1",
           taskId: `task-${source}`,
@@ -268,8 +268,6 @@ describe("Codex agent source registry", () => {
 
       await expect(repo.getBinding(
         "memory-1",
-        "user-1",
-        source,
         "shared-session-id",
       )).resolves.toMatchObject({ taskId: `task-${source}` });
       errorSpy.mockRestore();
@@ -282,10 +280,8 @@ describe("Codex agent source registry", () => {
       const repo = new KvBindingRepo(new MemoryStorage());
       await repo.putBinding(
         "memory-1",
-        "user-1",
-        foreignSource,
         "shared-session-id",
-        { outcome: "bypassed" },
+        { outcome: "bypassed", userId: "user-1", agentSource: foreignSource },
       );
       const store = new SessionStore(undefined, undefined, repo);
 
@@ -306,10 +302,8 @@ describe("Codex agent source registry", () => {
     const repo = new KvBindingRepo(new MemoryStorage());
     await repo.putBinding(
       "memory-1",
-      "user-1",
-      "codex",
       "shared-session-id",
-      { outcome: "bypassed" },
+      { outcome: "bypassed", userId: "user-1", agentSource: "codex" },
     );
     const store = new SessionStore(undefined, undefined, repo);
 
