@@ -56,6 +56,9 @@ sdk/python/*.egg-info/
 # Vitest cache
 .vite/
 
+# Local Sandcastle automation
+.sandcastle/
+
 # Environment (already covered above, explicit for clarity)
 .env.*
 !.env.example
