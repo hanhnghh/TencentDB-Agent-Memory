@@ -22,7 +22,7 @@
             "command": "node \"${PLUGIN_ROOT}/scripts/memory-hook.mjs\"",
             "timeout": 5,
             "statusMessage": "Checking prompt-relevant memory",
-            "additionalContextLimit": 2500
+            "additionalContextLimit": 24000
           }
         ]
       }

@@ -163,7 +163,10 @@ describe("Codex lifecycle hook contract", () => {
   it("rejects undocumented hook fields at the HTTP boundary", async () => {
     const app = createHookApp(config(), {
       memoryRuntimeProvider: provider(runtimeWithContext()),
-      codexAccessResolver: resolver(),
+      codexAccessResolver: resolver({
+        ...access,
+        preferences: { dynamicRecall: false, contextLimit: 3 },
+      }),
       codexTurnStore: turnStore(),
     });
 
@@ -676,6 +679,55 @@ describe("Codex lifecycle hook contract", () => {
     expect(output).not.toHaveProperty("modifiedPrompt");
   });
 
+  it("injects the full prompt-relevant skill without dynamic memory recall or loopback access", async () => {
+    const recallPromptSkills = vi.fn(async () => [{
+      id: "skill-vehicle-commands",
+      sourceHookId: "codex-prompt-skill-recall",
+      kind: "skill" as const,
+      order: 200,
+      type: "text" as const,
+      content: [
+        "# vehicle-commands-json-binding-and-resolver",
+        "Resolve every command through vehicle-commands.json before dispatch.",
+        "Preserve capability-gate failures as typed domain errors.",
+      ].join("\n"),
+    }]);
+    const app = createHookApp(config(), {
+      memoryRuntimeProvider: provider(runtimeWithContext()),
+      codexAccessResolver: resolver(),
+      codexTurnStore: turnStore(),
+      promptSkillContext: { recall: recallPromptSkills },
+    });
+    const prompt = "How does vehicle-commands.json resolve a vehicle command?";
+
+    const response = await app.request("/hooks/user-prompt-submit", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        cwd: "/workspace/project",
+        hook_event_name: "UserPromptSubmit",
+        model: "gpt-5",
+        permission_mode: "default",
+        session_id: "session-1",
+        transcript_path: null,
+        turn_id: "turn-skill-recall",
+        prompt,
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(recallPromptSkills).toHaveBeenCalledWith({
+      identity,
+      prompt,
+      limit: access.preferences.contextLimit,
+    });
+    const output = await readHookContext(response);
+    expect(output.additionalContext).toContain("# vehicle-commands-json-binding-and-resolver");
+    expect(output.additionalContext).toContain("Resolve every command through vehicle-commands.json");
+    expect(output.additionalContext).not.toContain("127.0.0.1:8097");
+    expect(output.additionalContext).not.toContain("skill-bridge");
+  });
+
   it("selects complete context blocks deterministically at the configured limit", async () => {
     const limitedAccess: CodexHookAccess = {
       ...access,
@@ -770,7 +822,7 @@ describe("Codex lifecycle hook contract", () => {
             kind: "memory",
             order: 100,
             type: "text",
-            content: `OVERSIZED_PROMPT:${"y".repeat(3_000)}`,
+            content: `OVERSIZED_PROMPT:${"y".repeat(25_000)}`,
           },
           {
             id: "bounded-prompt-recall",
@@ -812,7 +864,7 @@ describe("Codex lifecycle hook contract", () => {
     });
     const output = await readHookContext(response);
 
-    expect(output.additionalContext.length).toBeLessThanOrEqual(2_500);
+    expect(output.additionalContext.length).toBeLessThanOrEqual(24_000);
     expect(output.additionalContext).not.toContain("OVERSIZED_PROMPT:");
     expect(output.additionalContext).toContain("Complete prompt recall block.");
   });

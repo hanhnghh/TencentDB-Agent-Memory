@@ -35,6 +35,24 @@ const TAG = "[memory-tdai] [standalone-runner]";
 // Max iterations in the tool-call loop to prevent infinite loops
 const MAX_TOOL_ITERATIONS = 20;
 
+/**
+ * OpenAI-compatible Chat Completions providers commonly default recognised
+ * reasoning models to a non-zero reasoning effort. Some of them reject that
+ * default when function tools are present, even though both features work
+ * independently. Keep tool-driven extraction on the broadly compatible
+ * non-reasoning path; text-only calls retain the provider default.
+ */
+function isOpenAIReasoningModel(model: string): boolean {
+  if (/^o\d+(?:-|$)/.test(model)) return true;
+
+  const gptMatch = /^gpt-(\d+)(?:\.\d+)?(?:-(.+))?$/.exec(model);
+  if (!gptMatch) return false;
+
+  const major = Number(gptMatch[1]);
+  const variant = gptMatch[2];
+  return major >= 5 && !variant?.startsWith("chat");
+}
+
 // ============================
 // experimental_telemetry.metadata 组装
 // ============================
@@ -345,6 +363,9 @@ export class StandaloneLLMRunner implements LLMRunner {
         // backends emit spurious tool calls on pure-text tasks.
         ...(tools && Object.keys(tools).length > 0
           ? { tools, stopWhen: stepCountIs(maxIterations) }
+          : {}),
+        ...(tools && Object.keys(tools).length > 0 && isOpenAIReasoningModel(this.model)
+          ? { providerOptions: { openai: { reasoningEffort: "none" } } }
           : {}),
         maxOutputTokens: maxTokens,
         abortSignal: combinedSignal,

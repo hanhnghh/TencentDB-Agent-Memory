@@ -81,6 +81,21 @@ export interface SearchSkillsResult {
   items: SearchHit[];
 }
 
+export interface GetSkillInput extends IdFields {
+  skill_id: string;
+  version?: number;
+  include_content?: boolean;
+  include_manifest?: boolean;
+}
+
+export interface SkillDetail extends SkillSummary {
+  content: string;
+  script_paths?: string[];
+  manifest?: unknown;
+  content_hash?: string;
+  storage_dir?: string;
+}
+
 export interface ExtractMessage {
   role: "user" | "assistant" | "tool_call" | "tool_result";
   content: string;
@@ -283,6 +298,13 @@ export class CoreSkillClient {
     opts: CoreSkillRequestOptions = {},
   ): Promise<SearchSkillsResult> {
     return this.post<SearchSkillsResult>("/v3/skill/search", input, opts);
+  }
+
+  async getSkill(
+    input: GetSkillInput,
+    opts: CoreSkillRequestOptions = {},
+  ): Promise<SkillDetail> {
+    return this.post<SkillDetail>("/v3/skill/get", input, opts);
   }
 
   async extractSkill(

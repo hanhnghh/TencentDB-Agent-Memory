@@ -14,6 +14,10 @@ import {
   createCodexManagementHandler,
   type CodexManagementHandlerDeps,
 } from "./codex/management-handler.js";
+import {
+  CorePromptSkillContext,
+  type PromptSkillContext,
+} from "./codex/prompt-skill-context.js";
 
 export interface CreateHookAppOptions {
   memoryRuntimeProvider?: MemoryRuntimeProvider;
@@ -23,6 +27,7 @@ export interface CreateHookAppOptions {
   bridgeFetcher?: typeof fetch;
   bridgeSessions?: BridgeSessionAccessRegistry;
   managementDeps?: Pick<CodexManagementHandlerDeps, "refresh" | "forceArchive">;
+  promptSkillContext?: PromptSkillContext;
 }
 
 /** Build the loopback listener app. Lifecycle routes are added by hook adapters. */
@@ -46,6 +51,7 @@ export function createHookApp(
         accessResolver: options.codexAccessResolver,
         turnStore: options.codexTurnStore,
         bridgeSessions,
+        promptSkillContext: options.promptSkillContext ?? new CorePromptSkillContext(config.coreSkill),
       })
     : undefined;
   app.get("/health", async (c) => {

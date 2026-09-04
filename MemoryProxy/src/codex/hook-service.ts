@@ -24,6 +24,7 @@ import {
   normalizeCodexToolInput,
   normalizeCodexToolResponse,
 } from "./round-normalizer.js";
+import type { PromptSkillContext } from "./prompt-skill-context.js";
 
 type SessionStartSource = "startup" | "resume" | "clear" | "compact";
 type PermissionMode = "default" | "acceptEdits" | "plan" | "dontAsk" | "bypassPermissions";
@@ -108,13 +109,14 @@ export interface CodexHookServiceOptions {
   accessResolver: CodexHookAccessResolver;
   turnStore: CodexTurnStore;
   bridgeSessions?: BridgeSessionAccessRegistry;
+  promptSkillContext?: PromptSkillContext;
 }
 
 // These are the same limits declared in plugins/tencentdb-agent-memory/hooks.json.
 // Keep the sidecar output within the host budget so Codex never truncates a block.
 export const CODEX_HOOK_CONTEXT_LIMITS = {
   SessionStart: 5_000,
-  UserPromptSubmit: 2_500,
+  UserPromptSubmit: 24_000,
 } as const;
 const DEFAULT_CONTEXT_BLOCK_LIMIT = 25;
 const MAX_CONTEXT_BLOCK_LIMIT = 50;
@@ -253,14 +255,6 @@ export class CodexHookService {
       return error(cause instanceof CodexTurnConflictError ? 409 : 503, "prompt_persistence_failed");
     }
 
-    if (access.preferences.dynamicRecall !== true) {
-      log.info("codex_hook.prompt_persisted", {
-        sessionId: input.session_id,
-        turnId: input.turn_id,
-        dynamicRecall: false,
-      });
-      return success("UserPromptSubmit");
-    }
     const runtime = this.options.memoryRuntimeProvider.forRequest({
       userKey: access.userKey,
       bindingCacheKey: access.bindingCacheKey,
@@ -268,12 +262,24 @@ export class CodexHookService {
     try {
       const prepared = await runtime.prepareContext({
         identity: access.identity,
-        query: input.prompt,
+        ...(access.preferences.dynamicRecall === true ? { query: input.prompt } : {}),
         readOnly: false,
       });
+      const skillBlocks = prepared.capabilities.skill.enabled
+        ? await this.options.promptSkillContext?.recall({
+            identity: access.identity,
+            prompt: input.prompt,
+            limit: contextBlockLimit(access),
+          }) ?? []
+        : [];
       const promptPrepared: PrepareContextResult = {
         ...prepared,
-        blocks: prepared.blocks.filter((block) => block.sourceHookId === PROMPT_RECALL_HOOK),
+        blocks: [
+          ...prepared.blocks.filter((block) => (
+            access.preferences.dynamicRecall === true && block.sourceHookId === PROMPT_RECALL_HOOK
+          )),
+          ...skillBlocks,
+        ],
       };
       const additionalContext = renderAdditionalContext(promptPrepared, {
         includeSession: false,
