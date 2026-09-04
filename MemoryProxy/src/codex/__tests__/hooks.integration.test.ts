@@ -163,10 +163,7 @@ describe("Codex lifecycle hook contract", () => {
   it("rejects undocumented hook fields at the HTTP boundary", async () => {
     const app = createHookApp(config(), {
       memoryRuntimeProvider: provider(runtimeWithContext()),
-      codexAccessResolver: resolver({
-        ...access,
-        preferences: { dynamicRecall: false, contextLimit: 3 },
-      }),
+      codexAccessResolver: resolver(),
       codexTurnStore: turnStore(),
     });
 
@@ -694,7 +691,10 @@ describe("Codex lifecycle hook contract", () => {
     }]);
     const app = createHookApp(config(), {
       memoryRuntimeProvider: provider(runtimeWithContext()),
-      codexAccessResolver: resolver(),
+      codexAccessResolver: resolver({
+        ...access,
+        preferences: { dynamicRecall: false, contextLimit: 3 },
+      }),
       codexTurnStore: turnStore(),
       promptSkillContext: { recall: recallPromptSkills },
     });
